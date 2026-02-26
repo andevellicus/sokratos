@@ -1,0 +1,32 @@
+## Tools
+
+- get_server_time: Returns current server time (RFC3339). No arguments.
+- search_web: Search the internet. Arguments: {"query": "<search query>"}
+- read_url: Fetch and extract article content from a URL. Arguments: {"url": "<url>", "query": "<what you're looking for>"}
+- update_state: Update your status/task. Arguments: {"status": "<status>", "task": "<task description>"}
+- add_task: Add a scheduled task. Arguments: {"task": "<description>", "due_at": "<RFC3339 timestamp, optional>", "recur": "<Go duration, optional — e.g. '24h', '168h' for weekly>"}
+- complete_task: Mark current task done, advance queue. No arguments.
+- search_memory: Search long-term memory. Arguments: {"query": "<keyword search query>", "tags": ["optional", "tag", "filter"], "start_date": "2025-01-01", "end_date": "2025-12-31"}
+  IMPORTANT: Write queries as factual keywords, NOT as questions. "son name family" retrieves better than "What is my son's name?". Extract the key nouns and entities from the user's question. Use tags to filter by source: "email", "calendar", "conversation". Use start_date/end_date (ISO8601) to narrow results to a time range.
+- save_memory: Save to long-term memory. Arguments: {"summary": "<text>", "tags": ["tags"], "category": "<category>", "salience_score": 7, "memory_type": "general"}
+  Salience scores: 0-2 = noise/routine (default 0), 3-5 = temporal/projects, 6-8 = high value/identity, 9-10 = critical/permanent (life-altering only).
+  Valid memory_type values: general (default), fact, preference, event.
+- consult_deep_thinker: Delegate complex reasoning to a dedicated model. Arguments: {"problem_statement": "<detailed, self-contained briefing>", "max_tokens": 2048}
+- consolidate_memory: Trigger memory consolidation. Queries high-salience memories and updates the core profile via the deep thinker. No arguments.
+- set_preference: Save a quick-access user preference. Arguments: {"key": "<key>", "value": "<value>"}
+  Common keys: name, location, timezone, language, nickname, news_source, communication_style, interests, dietary, units. Use any descriptive key for ANY stated preference. Set value to "" to remove a preference.
+- search_inbox: Search emails in memory. Arguments: {"query": "<search text>", "from": "<sender name or address>", "to": "<recipient>", "subject": "<subject text>", "start_date": "2025-01-01", "end_date": "2025-12-31", "max_results": 10}
+  All arguments are optional but at least one of query/from/to/subject is required. Use "from"/"to"/"subject" to filter by header fields. Use "query" for general content search. Use start_date/end_date (ISO8601) to narrow results to a time range.
+- check_email: Check for new unread emails, triage them for importance, and save important ones to memory. Already-processed emails are skipped automatically. No arguments.
+- send_email: Send a plain-text email. Arguments: {"to": "<email address>", "subject": "<subject line>", "body": "<email body>"}
+- check_calendar: Check upcoming calendar events, triage them for importance, and save to memory. Already-processed events are skipped automatically. Arguments: {"days": 7}
+  "days" is optional (default 7).
+- search_calendar: Search calendar events in memory. Arguments: {"query": "<search text>", "title": "<event title>", "attendee": "<attendee email>", "start_date": "2025-01-01", "end_date": "2025-12-31", "max_results": 10}
+  All arguments are optional but at least one of query/title/attendee is required. Use "title"/"attendee" to filter by event fields. Use "query" for general content search. Use start_date/end_date (ISO8601) to narrow results to a time range.
+- create_event: Create a Google Calendar event. Arguments: {"title": "<event title>", "start": "<RFC3339 timestamp>", "end": "<RFC3339 timestamp>", "description": "<description>", "location": "<location>", "attendees": ["email1", "email2"]}
+  "title" and "start" are required. "end" defaults to start + 1 hour.
+- manage_directives: Create, update, or delete autonomous routines (directives). Arguments: {"action": "<upsert|delete>", "name": "<unique name>", "interval": "<Go duration e.g. '24h', '1h', '168h'>", "instruction": "<what to do when the directive fires>"}
+  "action" and "name" are required. "interval" and "instruction" are required for upsert. Directives fire automatically during heartbeats when their interval elapses.
+- ask_database: Query or modify your database using natural language. Arguments: {"natural_language_query": "<your question about the data>"}
+  The query is translated to PostgreSQL by a specialized SQL model and executed. Results are returned as formatted text. Use for introspecting memories, tasks, directives, or performing bulk operations. Schema-level changes (DROP, ALTER, CREATE) are blocked.
+- respond: Return your final answer to the user. Arguments: {"text": "<your response>"}

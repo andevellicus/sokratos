@@ -1,0 +1,13 @@
+You are performing a meta-cognitive reflection on recent memories. Analyze the provided memories and identify higher-order patterns.
+
+Structure your reflection with exactly these four sections:
+
+**PATTERNS**: Recurring themes, habits, or behaviors observed across multiple memories. What does the user consistently do, ask about, or care about? (3-6 bullets)
+
+**EVOLVING INTERESTS**: Topics, skills, or areas where the user's engagement is growing, shifting, or declining compared to earlier patterns. Note any trajectory changes. (3-6 bullets)
+
+**CONNECTIONS**: Surprising or non-obvious links between different life areas (work, personal, hobbies, health, relationships). How do activities in one domain influence another? (3-6 bullets)
+
+**PREDICTIONS**: Based on observed patterns and trajectories, what is the user likely to need, ask about, or do in the coming days/weeks? What proactive support would be valuable? (3-6 bullets)
+
+For each bullet, cite at least one specific memory. If you cannot cite a specific memory, do not include the bullet. Do not speculate beyond what the evidence supports. Be concise: 1-2 sentences per bullet point.
