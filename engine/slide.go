@@ -2,17 +2,27 @@ package engine
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/prompts"
+	"sokratos/textutil"
 )
+
+// ArchiveDeps groups dependencies for context archival (embedding + memory save).
+type ArchiveDeps struct {
+	DB            *pgxpool.Pool
+	EmbedEndpoint string
+	EmbedModel    string
+	SubagentFn    memory.SubagentFunc
+}
 
 // SlideAndArchiveContext trims old messages from the StateManager's
 // conversation context while archiving them to long-term memory via pgvector.
@@ -22,9 +32,7 @@ func SlideAndArchiveContext(
 	ctx context.Context,
 	sm *StateManager,
 	maxMessages int,
-	db *pgxpool.Pool,
-	embedEndpoint string,
-	embedModel string,
+	deps ArchiveDeps,
 ) {
 	// Step 1 — Early exit if under limit.
 	if sm.MessageCount() <= maxMessages {
@@ -70,7 +78,11 @@ func SlideAndArchiveContext(
 		if m.Role == "assistant" && isToolCallContent(m.Content) {
 			continue
 		}
-		content := strings.TrimSpace(stripAgentState(m.Content))
+		content := m.Content
+		content = stripAgentState(content)
+		content = textutil.StripThinkTags(content)
+		content = textutil.StripToolIntentTags(content)
+		content = strings.TrimSpace(content)
 		if content == "" {
 			continue
 		}
@@ -81,35 +93,12 @@ func SlideAndArchiveContext(
 
 	// Step 4 — Async archive (only if there's something to save).
 	if archiveText != "" {
-		memory.SaveToMemoryAsync(db, embedEndpoint, embedModel, "conversation_archive", archiveText)
+		go distillAndSaveArchive(deps, archiveText)
 	}
 
-	// Step 5 — State mutation under write lock with precondition checks.
+	// Step 5 — Atomic state mutation via StateManager.
 	snapshotFP := fingerprintMessages(msgs[1:safeIndex])
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	// Precondition 1: messages haven't shrunk below safeIndex.
-	if len(sm.messages) <= safeIndex {
-		logger.Log.Warnf("[slide] messages changed (len=%d, safeIndex=%d); aborting", len(sm.messages), safeIndex)
-		return
-	}
-
-	// Precondition 2: fingerprint of the region we plan to remove still matches.
-	currentFP := fingerprintMessages(sm.messages[1:safeIndex])
-	if snapshotFP != currentFP {
-		logger.Log.Warnf("[slide] fingerprint mismatch; aborting slide")
-		return
-	}
-
-	// Slide: keep messages[0] (system prompt) + messages[safeIndex:].
-	kept := make([]llm.Message, 0, 1+len(sm.messages)-safeIndex)
-	kept = append(kept, sm.messages[0])
-	kept = append(kept, sm.messages[safeIndex:]...)
-	sm.messages = kept
-
-	logger.Log.Infof("[slide] removed %d messages (kept %d)", safeIndex-1, len(sm.messages))
+	sm.SlideMessages(safeIndex, snapshotFP)
 }
 
 // stripAgentState removes the "[Current Agent State]" block that gets
@@ -161,9 +150,57 @@ func isToolCallContent(content string) bool {
 	return hasName
 }
 
-// fingerprintMessages returns a SHA-256 hash of the JSON-serialized messages.
-func fingerprintMessages(msgs []llm.Message) [32]byte {
-	data, _ := json.Marshal(msgs)
-	return sha256.Sum256(data)
+// distilledFact matches the JSON output format of distill_conversation.txt.
+type distilledFact struct {
+	Text     string   `json:"text"`
+	Salience float64  `json:"salience"`
+	Tags     []string `json:"tags"`
 }
 
+// distillAndSaveArchive runs the cleaned archive text through a subagent to
+// extract lasting facts, then saves each fact individually. Falls back to
+// saving the raw cleaned archive if SubagentFn is nil.
+func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
+	if deps.SubagentFn == nil {
+		memory.SaveToMemoryAsync(deps.DB, deps.EmbedEndpoint, deps.EmbedModel, "conversation_archive", archiveText)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	raw, err := deps.SubagentFn(ctx, strings.TrimSpace(prompts.DistillConversation), archiveText)
+	if err != nil {
+		logger.Log.Warnf("[slide] conversation distillation failed: %v; discarding archive", err)
+		return
+	}
+
+	cleaned := textutil.CleanLLMJSON(raw)
+	var result struct {
+		Facts []distilledFact `json:"facts"`
+	}
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		logger.Log.Warnf("[slide] conversation distillation parse failed: %v; discarding archive", err)
+		return
+	}
+
+	if len(result.Facts) == 0 {
+		logger.Log.Debug("[slide] conversation distillation produced 0 facts; discarding archive")
+		return
+	}
+
+	for _, fact := range result.Facts {
+		if strings.TrimSpace(fact.Text) == "" || fact.Salience < 5 {
+			continue
+		}
+		memory.SaveToMemoryWithSalienceAsync(deps.DB, memory.MemoryWriteRequest{
+			Summary:       fact.Text,
+			Tags:          fact.Tags,
+			Salience:      fact.Salience,
+			Source:        "conversation",
+			EmbedEndpoint: deps.EmbedEndpoint,
+			EmbedModel:    deps.EmbedModel,
+		}, deps.SubagentFn)
+	}
+	logger.Log.Infof("[slide] distilled %d facts from conversation archive", len(result.Facts))
+}

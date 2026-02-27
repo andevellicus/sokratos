@@ -17,6 +17,13 @@ type consultDeepThinkerArgs struct {
 
 var deepThinkerSystemPrompt = strings.TrimSpace(prompts.DeepThinker)
 
+// NewConsultDeepThinker returns a ToolFunc that closes over the given DeepThinkerClient.
+func NewConsultDeepThinker(dtc *DeepThinkerClient) ToolFunc {
+	return func(ctx context.Context, args json.RawMessage) (string, error) {
+		return ConsultDeepThinker(ctx, args, dtc)
+	}
+}
+
 // ConsultDeepThinker sends a problem statement to a separate deep-reasoning LLM
 // and returns its response. On any failure it returns a formatted unavailability
 // message rather than a Go error, so the MoE can handle it as a tool result.

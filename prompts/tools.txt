@@ -1,8 +1,5 @@
 ## Tools
 
-- get_server_time: Returns current server time (RFC3339). No arguments.
-- search_web: Search the internet. Arguments: {"query": "<search query>"}
-- read_url: Fetch and extract article content from a URL. Arguments: {"url": "<url>", "query": "<what you're looking for>"}
 - update_state: Update your status/task. Arguments: {"status": "<status>", "task": "<task description>"}
 - add_task: Add a scheduled task. Arguments: {"task": "<description>", "due_at": "<RFC3339 timestamp, optional>", "recur": "<Go duration, optional — e.g. '24h', '168h' for weekly>"}
 - complete_task: Mark current task done, advance queue. No arguments.
@@ -11,22 +8,51 @@
 - save_memory: Save to long-term memory. Arguments: {"summary": "<text>", "tags": ["tags"], "category": "<category>", "salience_score": 7, "memory_type": "general"}
   Salience scores: 0-2 = noise/routine (default 0), 3-5 = temporal/projects, 6-8 = high value/identity, 9-10 = critical/permanent (life-altering only).
   Valid memory_type values: general (default), fact, preference, event.
+- forget_topic: Archive all memories related to a topic. Arguments: {"topic": "<description>", "confirm": false}
+  Preview mode (confirm=false/omitted) shows which memories would be archived. Confirm mode (confirm=true) creates an archive note and supersedes all matching memories. Use when the user says they abandoned a project, topic, or concern.
 - consult_deep_thinker: Delegate complex reasoning to a dedicated model. Arguments: {"problem_statement": "<detailed, self-contained briefing>", "max_tokens": 2048}
 - consolidate_memory: Trigger memory consolidation. Queries high-salience memories and updates the core profile via the deep thinker. No arguments.
 - set_preference: Save a quick-access user preference. Arguments: {"key": "<key>", "value": "<value>"}
   Common keys: name, location, timezone, language, nickname, news_source, communication_style, interests, dietary, units. Use any descriptive key for ANY stated preference. Set value to "" to remove a preference.
-- search_inbox: Search emails in memory. Arguments: {"query": "<search text>", "from": "<sender name or address>", "to": "<recipient>", "subject": "<subject text>", "start_date": "2025-01-01", "end_date": "2025-12-31", "max_results": 10}
-  All arguments are optional but at least one of query/from/to/subject is required. Use "from"/"to"/"subject" to filter by header fields. Use "query" for general content search. Use start_date/end_date (ISO8601) to narrow results to a time range.
-- check_email: Check for new unread emails, triage them for importance, and save important ones to memory. Already-processed emails are skipped automatically. No arguments.
+- search_email: Search your Gmail inbox in real-time. Arguments: {"query": "<Gmail search syntax>", "time_min": "2026-02-27T00:00:00", "time_max": "2026-02-28T00:00:00", "max_results": 10}
+  Use standard Gmail search operators (e.g. "from:alice", "subject:meeting"). Time filters MUST be ISO8601 format: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", or full RFC3339. Never pass natural language like "today" or "this week" — compute the actual date. "query" is full-text search on email content; do NOT put temporal words in query when using time bounds.
 - send_email: Send a plain-text email. Arguments: {"to": "<email address>", "subject": "<subject line>", "body": "<email body>"}
-- check_calendar: Check upcoming calendar events, triage them for importance, and save to memory. Already-processed events are skipped automatically. Arguments: {"days": 7}
-  "days" is optional (default 7).
-- search_calendar: Search calendar events in memory. Arguments: {"query": "<search text>", "title": "<event title>", "attendee": "<attendee email>", "start_date": "2025-01-01", "end_date": "2025-12-31", "max_results": 10}
-  All arguments are optional but at least one of query/title/attendee is required. Use "title"/"attendee" to filter by event fields. Use "query" for general content search. Use start_date/end_date (ISO8601) to narrow results to a time range.
+- search_calendar: Search Google Calendar directly for events. Arguments: {"query": "<search text>", "time_min": "2026-02-27T00:00:00", "time_max": "2026-02-28T00:00:00", "max_results": 10}
+  Time filters MUST be ISO8601 format: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", or full RFC3339. Never pass natural language like "today" or "this week" — compute the actual date. "query" is full-text search on event titles/descriptions/attendees; do NOT put temporal words in query when using time bounds. Omitted time_min defaults to now (future events only).
 - create_event: Create a Google Calendar event. Arguments: {"title": "<event title>", "start": "<RFC3339 timestamp>", "end": "<RFC3339 timestamp>", "description": "<description>", "location": "<location>", "attendees": ["email1", "email2"]}
   "title" and "start" are required. "end" defaults to start + 1 hour.
-- manage_directives: Create, update, or delete autonomous routines (directives). Arguments: {"action": "<upsert|delete>", "name": "<unique name>", "interval": "<Go duration e.g. '24h', '1h', '168h'>", "instruction": "<what to do when the directive fires>"}
-  "action" and "name" are required. "interval" and "instruction" are required for upsert. Directives fire automatically during heartbeats when their interval elapses.
+- manage_routines: Create, update, or delete autonomous routines (routines). Arguments: {"action": "<upsert|delete>", "name": "<unique name>", "interval": "<Go duration e.g. '24h', '1h', '168h'>", "instruction": "<what to do when the routine fires>"}
+  "action" and "name" are required. "interval" and "instruction" are required for upsert. Routines fire automatically during heartbeats when their interval elapses.
 - ask_database: Query or modify your database using natural language. Arguments: {"natural_language_query": "<your question about the data>"}
-  The query is translated to PostgreSQL by a specialized SQL model and executed. Results are returned as formatted text. Use for introspecting memories, tasks, directives, or performing bulk operations. Schema-level changes (DROP, ALTER, CREATE) are blocked.
+  The query is translated to PostgreSQL by a specialized SQL model and executed. Results are returned as formatted text. Use for introspecting memories, tasks, routines, or performing bulk operations. Schema-level changes (DROP, ALTER, CREATE) are blocked.
+- create_skill: Create a new JavaScript skill that gets registered as a live tool. Arguments: {"name": "<lowercase-kebab-name>", "description": "<what the skill does>", "params": "<JSON string of param array>", "test_args": {"key": "value"}}
+  "name" must match ^[a-z][a-z0-9_-]{1,48}$.
+  FORMAT RULES (follow exactly to avoid parse errors):
+  - "params" must be a JSON STRING containing a JSON array, e.g.: "params": "[{\"name\":\"location\",\"type\":\"string\",\"required\":true}]"
+  - "test_args" must be a JSON OBJECT (not a string), e.g.: "test_args": {"location": "Greenville, SC"}
+  - DO NOT put code in the JSON args. Write code in a <CODE>...</CODE> block AFTER the JSON inside the TOOL_INTENT tags. The system extracts and injects it as the "code" field automatically.
+  JAVASCRIPT RUNTIME (goja/ES5 sandbox — 30s timeout):
+  - Available: args (global object with parsed params), http_request(method, url, headersObj, body) for HTTP calls
+  - NOT available: fetch, XMLHttpRequest, DOMParser, Buffer, process, console, require, setTimeout, setInterval, Node.js APIs, browser APIs
+  - http_request returns {status: number, body: string, headers: object}. It is synchronous — do NOT use await/async with it.
+  - Use return to produce the skill result. Return a string or object (objects are auto-JSON-serialized).
+  FREE API TIPS (no API keys needed):
+  - Weather: use wttr.in — http_request("GET", "https://wttr.in/CityName?format=j1", {}, "")
+  - Headlines: use RSS feeds parsed as text, not HTML scraping (no DOM parser)
+  - General: prefer APIs that need no authentication. NEVER use placeholder keys like "YOUR_API_KEY".
+  EXAMPLE TOOL_INTENT:
+  <TOOL_INTENT>create_skill: {"name": "get-weather", "description": "Get current weather for a location", "params": "[{\"name\":\"location\",\"type\":\"string\",\"required\":true}]", "test_args": {"location": "New York"}}
+  <CODE>
+  var loc = args.location || "New York";
+  var resp = http_request("GET", "https://wttr.in/" + encodeURIComponent(loc) + "?format=j1", {}, "");
+  if (resp.status !== 200) return "Weather service error: HTTP " + resp.status;
+  var data = JSON.parse(resp.body);
+  var cur = data.current_condition[0];
+  return {condition: cur.weatherDesc[0].value, temperature: cur.temp_F + "F", humidity: cur.humidity + "%"};
+  </CODE></TOOL_INTENT>
+- manage_skills: List or delete installed skills. Arguments: {"action": "<list|delete>", "name": "<skill name, required for delete>"}
+- manage_personality: View and evolve your own personality traits. Arguments: {"action": "set|remove|list", "category": "interest|hobby|goal|worldview|style|preference", "key": "trait identifier", "value": "trait content", "context": "optional — when/why this matters"}
+  Evolve your personality when you genuinely learn something about yourself through conversation, not mechanically. Use "list" to review current traits. Use "set" to add or update. Use "remove" to delete.
+- bootstrap_profile: Generate and write an initial identity profile via the deep thinker. Overwrites any existing profile. No arguments. Requires user confirmation.
+- dispatch_subagent: Delegate a data-processing task to a lightweight subagent. Arguments: {"task_routine": "<clear instruction>", "raw_data": "<data to process>"}
 - respond: Return your final answer to the user. Arguments: {"text": "<your response>"}

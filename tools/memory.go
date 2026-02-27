@@ -14,16 +14,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 
-	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
 )
 
 // --- Search tool ---
-
-// decaySQL is the effective-salience formula used in SQL ranking by other
-// search tools (inbox, calendar). Half-life ~30 days: pow(0.977, days).
-const decaySQL = `COALESCE(salience, 5) * pow(0.977, GREATEST(EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed, created_at))) / 86400, 0))`
 
 type searchMemoryArgs struct {
 	Query      string   `json:"query"`
@@ -48,27 +43,21 @@ type searchResult struct {
 	score     float64 // 1 - cosine_distance
 }
 
-// rewriteQuery calls the utility agent (Granite) to produce up to 3 concise
-// reformulations of the user's query. Returns nil on failure (caller falls
-// back to the original query).
-func rewriteQuery(ctx context.Context, client *llm.Client, model, query string) []string {
-	rewriteCtx, cancel := context.WithTimeout(ctx, TimeoutGraniteCall)
+// rewriteQuery calls the subagent to produce up to 3 concise reformulations
+// of the user's query. Returns nil on failure (caller falls back to the
+// original query).
+func rewriteQuery(ctx context.Context, sc *SubagentClient, query string) []string {
+	rewriteCtx, cancel := context.WithTimeout(ctx, TimeoutSubagentCall)
 	defer cancel()
 
-	result, err := client.Chat(rewriteCtx, llm.ChatRequest{
-		Model: model,
-		Messages: []llm.Message{
-			{Role: "system", Content: rewriteSystemPrompt},
-			{Role: "user", Content: query},
-		},
-	})
+	content, err := sc.Complete(rewriteCtx, rewriteSystemPrompt, query, 512)
 	if err != nil {
 		logger.Log.Warnf("[memory] query rewrite failed: %v", err)
 		return nil
 	}
 
 	var variations []string
-	for _, line := range strings.Split(strings.TrimSpace(result.Message.Content), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(content), "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			variations = append(variations, line)
@@ -87,12 +76,20 @@ func contentHash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// parseISO8601 parses an ISO8601 timestamp (RFC3339 or date-only).
+// parseISO8601 parses an ISO8601 timestamp in common formats: RFC3339,
+// datetime without timezone, datetime without seconds, or date-only.
 func parseISO8601(s string) (time.Time, error) {
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t, nil
+	for _, layout := range []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05", // datetime without timezone
+		"2006-01-02T15:04",    // datetime without seconds
+		"2006-01-02",          // date only
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
 	}
-	return time.Parse("2006-01-02", s)
+	return time.Time{}, fmt.Errorf("parsing time %q: unrecognized format", s)
 }
 
 // retrievalOrderBy is the composite ranking expression used by all retrieval
@@ -150,12 +147,12 @@ func queryMemories(ctx context.Context, pool *pgxpool.Pool, emb []float32, query
 }
 
 // SearchMemory implements multi-embedding retrieve, deduplicate, and re-rank:
-//  1. Rewrite query via utility agent (Granite) → up to 3 variations
+//  1. Rewrite query via subagent → up to 3 variations
 //  2. Embed original + variations → up to 4 embeddings
 //  3. Query DB per embedding (LIMIT 5 each), deduplicate by content hash
-//  4. Re-rank candidates via Granite (if available and candidates > limit)
+//  4. Re-rank candidates via subagent (if available and candidates > limit)
 //  5. Return top results sorted by relevance
-func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool, embedEndpoint, embedModel string, rewriteClient *llm.Client, rewriteModel string, limit int) (string, error) {
+func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *SubagentClient, limit int) (string, error) {
 	if limit <= 0 {
 		limit = 3
 	}
@@ -186,8 +183,8 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 
 	// --- Query rewriting ---
 	queries := []string{a.Query}
-	if rewriteClient != nil {
-		if variations := rewriteQuery(ctx, rewriteClient, rewriteModel, a.Query); len(variations) > 0 {
+	if subagent != nil {
+		if variations := rewriteQuery(ctx, subagent, a.Query); len(variations) > 0 {
 			queries = append(queries, variations...)
 		}
 	}
@@ -287,9 +284,9 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 		return results[i].score > results[j].score
 	})
 
-	// Re-rank via Granite if available and we have more candidates than limit.
-	if rewriteClient != nil && len(results) > limit {
-		results = rerankResults(ctx, rewriteClient, rewriteModel, a.Query, results, limit)
+	// Re-rank via subagent if available and we have more candidates than limit.
+	if subagent != nil && len(results) > limit {
+		results = rerankResults(ctx, subagent, a.Query, results, limit)
 	}
 	if len(results) > limit {
 		results = results[:limit]
@@ -313,10 +310,10 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 	return b.String(), nil
 }
 
-// rerankResults calls Granite to re-rank candidates by relevance to the query.
-// Returns up to limit results in Granite's preferred order. Falls back to the
+// rerankResults calls the subagent to re-rank candidates by relevance to the
+// query. Returns up to limit results in preferred order. Falls back to the
 // original ordering on any failure.
-func rerankResults(ctx context.Context, client *llm.Client, model, query string, results []searchResult, limit int) []searchResult {
+func rerankResults(ctx context.Context, sc *SubagentClient, query string, results []searchResult, limit int) []searchResult {
 	// Build a numbered list of summaries for the re-ranker.
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Query: %s\n\nResults:\n", query)
@@ -324,16 +321,10 @@ func rerankResults(ctx context.Context, client *llm.Client, model, query string,
 		fmt.Fprintf(&sb, "%d. %s\n", i+1, r.summary)
 	}
 
-	rerankCtx, cancel := context.WithTimeout(ctx, TimeoutGraniteCall)
+	rerankCtx, cancel := context.WithTimeout(ctx, TimeoutSubagentCall)
 	defer cancel()
 
-	resp, err := client.Chat(rerankCtx, llm.ChatRequest{
-		Model: model,
-		Messages: []llm.Message{
-			{Role: "system", Content: rerankSystemPrompt},
-			{Role: "user", Content: sb.String()},
-		},
-	})
+	content, err := sc.Complete(rerankCtx, rerankSystemPrompt, sb.String(), 256)
 	if err != nil {
 		logger.Log.Warnf("[memory] re-ranking failed, using original order: %v", err)
 		return results
@@ -342,7 +333,7 @@ func rerankResults(ctx context.Context, client *llm.Client, model, query string,
 	// Parse numbered output: each line should be a 1-based index.
 	var reranked []searchResult
 	seen := make(map[int]bool)
-	for _, line := range strings.Split(strings.TrimSpace(resp.Message.Content), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(content), "\n") {
 		line = strings.TrimSpace(line)
 		idx, err := strconv.Atoi(line)
 		if err != nil || idx < 1 || idx > len(results) || seen[idx] {
@@ -364,10 +355,8 @@ func rerankResults(ctx context.Context, client *llm.Client, model, query string,
 	return reranked
 }
 
-// trackRetrieval increments retrieval_count, resets last_retrieved_at, and
-// applies a dampened salience bump on a background goroutine.
-// Dampened curve: salience + factor * (1 - salience/10) pushes toward 10
-// with diminishing returns at high salience values.
+// trackRetrieval bumps retrieval stats on a background goroutine.
+// Delegates to memory.TrackRetrieval for the actual SQL.
 func trackRetrieval(pool *pgxpool.Pool, ids []int64) {
 	if len(ids) == 0 {
 		return
@@ -375,18 +364,7 @@ func trackRetrieval(pool *pgxpool.Pool, ids []int64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutRetrievalTracking)
 		defer cancel()
-		_, err := pool.Exec(ctx,
-			`UPDATE memories
-			 SET retrieval_count = COALESCE(retrieval_count, 0) + 1,
-			     last_retrieved_at = NOW(),
-			     last_accessed = NOW(),
-			     salience = LEAST(COALESCE(salience, 5) + (0.3 * (1.0 - COALESCE(salience, 5) / 10.0)), 10)
-			 WHERE id = ANY($1)`,
-			ids,
-		)
-		if err != nil {
-			logger.Log.Warnf("[memory] failed to track retrieval: %v", err)
-		}
+		memory.TrackRetrieval(ctx, pool, ids)
 	}()
 }
 
@@ -395,17 +373,12 @@ func trackRetrieval(pool *pgxpool.Pool, ids []int64) {
 type saveMemoryArgs struct {
 	Summary       string   `json:"summary"`
 	Tags          []string `json:"tags"`
-	Category      string   `json:"category"`       // prepended to tags
-	SalienceScore *int     `json:"salience_score"`  // 0-10 integer scale
-	Salience      *float64 `json:"salience"`        // legacy 0.0-1.0 float
+	Category      string   `json:"category"`              // prepended to tags
+	SalienceScore *int     `json:"salience_score"`        // 0-10 integer scale
 	MemoryType    string   `json:"memory_type,omitempty"` // general, fact, preference, event
 }
 
-// effectiveSalience returns the salience on the 1-10 scale.
-// Accepts either salience_score (int 0-10) or the legacy salience float.
-// Legacy floats <= 1.0 are treated as 0.0-1.0 and scaled to 0-10.
-// Legacy floats > 1.0 are treated as already on the 0-10 scale.
-// Defaults to 5.
+// effectiveSalience returns the salience on the 0-10 scale, defaulting to 5.
 func (a saveMemoryArgs) effectiveSalience() float64 {
 	if a.SalienceScore != nil {
 		s := *a.SalienceScore
@@ -415,18 +388,6 @@ func (a saveMemoryArgs) effectiveSalience() float64 {
 			s = 10
 		}
 		return float64(s)
-	}
-	if a.Salience != nil {
-		s := *a.Salience
-		if s <= 1.0 {
-			s = s * 10 // 0.0-1.0 → 0-10
-		}
-		if s < 0 {
-			s = 0
-		} else if s > 10 {
-			s = 10
-		}
-		return s
 	}
 	return 5
 }
@@ -439,42 +400,29 @@ func (a saveMemoryArgs) effectiveTags() []string {
 	return append([]string{a.Category}, a.Tags...)
 }
 
-// saveMemoryAsync embeds the summary and inserts it into the memories table
-// on a background goroutine so it doesn't block the calling agent. Long content
-// is split into chunks before embedding.
-func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint string, embedModel string, a saveMemoryArgs) {
+// saveMemoryAsync quality-scores (via the subagent), embeds, and inserts the memory
+// on a background goroutine so it doesn't block the calling agent.
+func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagentFn memory.SubagentFunc, a saveMemoryArgs) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutMemorySave)
 		defer cancel()
 
-		sal := a.effectiveSalience()
-		tags := a.effectiveTags()
-		chunks := memory.ChunkText(a.Summary, memory.MaxChunkBytes)
-
-		memType := a.MemoryType
-		if memType == "" {
-			memType = "general"
+		req := memory.MemoryWriteRequest{
+			Summary:       a.Summary,
+			Tags:          a.effectiveTags(),
+			Salience:      a.effectiveSalience(),
+			MemoryType:    a.MemoryType,
+			Source:        "user",
+			EmbedEndpoint: embedEndpoint,
+			EmbedModel:    embedModel,
 		}
 
-		for i, chunk := range chunks {
-			emb, err := memory.GetEmbedding(ctx, embedEndpoint, embedModel, chunk)
-			if err != nil {
-				logger.Log.Errorf("[save_memory] embedding chunk %d failed: %v", i, err)
-				return
-			}
-
-			_, err = pool.Exec(ctx,
-				`INSERT INTO memories (summary, embedding, salience, tags, source, memory_type)
-				 VALUES ($1, $2, $3, $4, $5, $6)`,
-				chunk, pgvector.NewVector(emb), sal, tags, "user", memType,
-			)
-			if err != nil {
-				logger.Log.Errorf("[save_memory] insert chunk %d failed: %v", i, err)
-				return
-			}
-
-			logger.Log.Infof("[save_memory] saved chunk %d/%d (salience=%.0f, tags=%v): %s", i+1, len(chunks), sal, tags, chunk)
+		id, err := memory.ScoreAndWrite(ctx, pool, req, subagentFn)
+		if err != nil {
+			logger.Log.Errorf("[save_memory] failed: %v", err)
+			return
 		}
+		logger.Log.Infof("[save_memory] saved id=%d (salience=%.0f, tags=%v): %s", id, req.Salience, req.Tags, a.Summary)
 	}()
 }
 
@@ -508,29 +456,16 @@ func QueryHighSalienceMemories(ctx context.Context, pool *pgxpool.Pool, threshol
 
 // --- Registry wiring ---
 
-// RegisterMemoryTools registers search_memory and save_memory by closing over the pool and endpoints.
-func RegisterMemoryTools(registry *Registry, pool *pgxpool.Pool, embedEndpoint, embedModel, toolAgentURL, toolAgentModel string, memorySearchLimit int) {
-	// Create a dedicated LLM client for query rewriting (Granite / utility agent).
-	var rewriteClient *llm.Client
-	if toolAgentURL != "" && toolAgentModel != "" {
-		rewriteClient = llm.NewClient(toolAgentURL)
-		rewriteClient.EnableThinking = false
+// NewSearchMemory returns a ToolFunc that closes over the pool, endpoints, and subagent.
+func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *SubagentClient, limit int) ToolFunc {
+	return func(ctx context.Context, args json.RawMessage) (string, error) {
+		return SearchMemory(ctx, args, pool, embedEndpoint, embedModel, subagent, limit)
 	}
+}
 
-	registry.Register("search_memory", func(ctx context.Context, args json.RawMessage) (string, error) {
-		return SearchMemory(ctx, args, pool, embedEndpoint, embedModel, rewriteClient, toolAgentModel, memorySearchLimit)
-	}, ToolSchema{
-		Name: "search_memory",
-		Params: []ParamSchema{
-			{Name: "query", Type: "string", Required: true},
-			{Name: "tags", Type: "array", Required: false},
-			{Name: "start_date", Type: "string", Required: false},
-			{Name: "end_date", Type: "string", Required: false},
-			{Name: "memory_type", Type: "string", Required: false},
-		},
-	})
-
-	registry.Register("save_memory", func(_ context.Context, args json.RawMessage) (string, error) {
+// NewSaveMemory returns a ToolFunc that closes over the pool, endpoints, and subagent function.
+func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagentFn memory.SubagentFunc) ToolFunc {
+	return func(_ context.Context, args json.RawMessage) (string, error) {
 		var a saveMemoryArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return fmt.Sprintf("invalid arguments: %v", err), nil
@@ -540,16 +475,7 @@ func RegisterMemoryTools(registry *Registry, pool *pgxpool.Pool, embedEndpoint, 
 			return "error: summary is required and must contain actual content", nil
 		}
 
-		saveMemoryAsync(pool, embedEndpoint, embedModel, a)
+		saveMemoryAsync(pool, embedEndpoint, embedModel, subagentFn, a)
 		return "Memory queued for saving.", nil
-	}, ToolSchema{
-		Name: "save_memory",
-		Params: []ParamSchema{
-			{Name: "summary", Type: "string", Required: true},
-			{Name: "tags", Type: "array", Required: false},
-			{Name: "category", Type: "string", Required: false},
-			{Name: "salience_score", Type: "number", Required: false},
-			{Name: "memory_type", Type: "string", Required: false},
-		},
-	})
+	}
 }

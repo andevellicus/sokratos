@@ -37,13 +37,16 @@ type MemorySearchConfig struct {
 }
 
 // SearchMemoriesByDomain runs a vector+BM25 hybrid search over memories tagged
-// with the given domain, applying optional regex filters.
+// with the given domain, applying optional regex filters. Uses the shared
+// memory.RankingOrderBy expression for consistent ranking across all search paths.
 func SearchMemoriesByDomain(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, cfg MemorySearchConfig) (string, error) {
-	// Build dynamic WHERE clause.
-	where := []string{fmt.Sprintf("'%s' = ANY(tags)", cfg.DomainTag)}
-	// $1 = embedding, $2 = query text, $3 = max_results
+	// Fixed params: $1 = embedding, $2 = query text. Dynamic filters start at $3.
+	where := []string{
+		fmt.Sprintf("'%s' = ANY(tags)", cfg.DomainTag),
+		"superseded_by IS NULL",
+	}
 	var extraArgs []interface{}
-	nextParam := 4
+	nextParam := 3
 
 	// Date filtering uses COALESCE(source_date, created_at) so older memories
 	// without source_date fall back to ingestion time.
@@ -58,12 +61,6 @@ func SearchMemoriesByDomain(ctx context.Context, pool *pgxpool.Pool, embedEndpoi
 		nextParam++
 	}
 
-	for _, f := range cfg.Filters {
-		where = append(where, fmt.Sprintf("summary ~* $%d", nextParam))
-		extraArgs = append(extraArgs, f.FieldPrefix+`.*`+regexp.QuoteMeta(f.Value))
-		nextParam++
-	}
-
 	queryText := cfg.QueryText
 	if queryText == "" {
 		queryText = strings.Join(cfg.FallbackParts, " ")
@@ -74,22 +71,27 @@ func SearchMemoriesByDomain(ctx context.Context, pool *pgxpool.Pool, embedEndpoi
 		return fmt.Sprintf("Failed to embed query: %v", err), nil
 	}
 
+	// Build ranking with optional regex boost signals.
+	// Matching filters subtract 0.5 from the score (lower = better rank),
+	// so rows with matching headers rank higher without excluding non-matches.
+	orderBy := memory.RankingOrderBy(1, 2)
+	for _, f := range cfg.Filters {
+		orderBy += fmt.Sprintf("\n\t- (CASE WHEN summary ~* $%d THEN 0.5 ELSE 0 END)", nextParam)
+		extraArgs = append(extraArgs, f.FieldPrefix+`.*`+regexp.QuoteMeta(f.Value))
+		nextParam++
+	}
+
 	sql := fmt.Sprintf(
 		`SELECT id, summary FROM memories
 		 WHERE %s
-		 ORDER BY
-		     (embedding <=> $1) / GREATEST(
-		         %s * (1 + ts_rank(
-		             to_tsvector('english', summary),
-		             websearch_to_tsquery('english', regexp_replace($2, '\s+', ' or ', 'g'))
-		         ) * 20),
-		         1)
-		 LIMIT $3`,
+		 ORDER BY %s
+		 LIMIT %d`,
 		strings.Join(where, " AND "),
-		decaySQL,
+		orderBy,
+		cfg.MaxResults,
 	)
 
-	allArgs := []interface{}{pgvector.NewVector(emb), queryText, cfg.MaxResults}
+	allArgs := []interface{}{pgvector.NewVector(emb), queryText}
 	allArgs = append(allArgs, extraArgs...)
 
 	rows, err := pool.Query(ctx, sql, allArgs...)

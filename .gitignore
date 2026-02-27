@@ -7,3 +7,4 @@ settings.yml
 .credentials/
 CLAUDE.md
 docker/docker-compose.yml
+sokratos

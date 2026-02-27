@@ -2,96 +2,148 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/timeouts"
 )
+
+// GatekeeperClient is the interface for fast gatekeeper calls. Satisfied by
+// *tools.SubagentClient — defined as an interface here to avoid a circular
+// import between engine and tools.
+type GatekeeperClient interface {
+	CompleteWithGrammar(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error)
+}
+
+// LLMConfig groups model and orchestrator-related fields.
+type LLMConfig struct {
+	Client           *llm.Client
+	Model            string
+	Grammar          string               // GBNF grammar for tool-call constraint
+	ToolAgent        *llm.ToolAgentConfig // when set, enables the supervisor pattern
+	MaxToolResultLen int                  // max chars per tool result (0 = default 2000)
+	MaxWebSources    int                  // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
+}
+
+// CognitiveConfig groups event-driven cognitive processing fields.
+type CognitiveConfig struct {
+	BufferThreshold           int                                                                     // min unreflected memories to trigger cognitive processing (default 20)
+	LullDuration              time.Duration                                                           // min user idle time before cognitive processing (default 20min)
+	Ceiling                   time.Duration                                                           // max time between cognitive runs (default 4h)
+	ConsolidateFunc           func(ctx context.Context) (int, error)                                  // wraps tools.ConsolidateCore; nil = skip
+	ReflectionMemoryThreshold int                                                                     // run reflection after this many new memories (default 50, 0 = disabled)
+	ReflectionPrompt          string                                                                  // system prompt for reflection synthesis
+	SynthesizeFunc            func(ctx context.Context, systemPrompt, content string) (string, error) // LLM call for synthesis
+}
 
 // Engine holds all dependencies for the heartbeat loop.
 type Engine struct {
-	Client                *llm.Client
-	Model                 string
-	ToolExec              func(context.Context, json.RawMessage) (string, error)
-	Mu                    *sync.Mutex
-	Interval              time.Duration
-	ConsolidationInterval time.Duration // how often to inject the consolidation tick (default 1h)
-	SM                    *StateManager
-	DB                    *pgxpool.Pool // nil when running without database
-	EmbedEndpoint         string        // empty when embeddings unavailable
-	EmbedModel            string        // model name for embedding endpoint
-	MaxMessages           int           // context window cap for slide (e.g. 20)
-	Grammar               string        // GBNF grammar for tool-call constraint
-	ProfileContent        string        // identity profile JSON for system prompt injection
-	MaxToolResultLen      int           // max chars per tool result (0 = default 2000)
-	MaxWebSources         int           // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
-	ToolAgent             *llm.ToolAgentConfig // when set, enables the supervisor pattern
-	MemoryStalenessDays       int               // prune stale memories older than this many days (0 = disabled)
-	SendFunc                  func(text string) // sends a message to the user via Telegram
-	InterruptChan             chan struct{}      // signals the task scheduler to recalculate
-	EpisodeSynthesisInterval    time.Duration                                                                         // how often to run episode synthesis (default 6h)
-	ReflectionMemoryThreshold  int                                                                                    // run reflection after this many new memories (default 50, 0 = disabled)
-	ReflectionPrompt           string                                                                                // system prompt for reflection synthesis
-	SynthesizeFunc             func(ctx context.Context, systemPrompt, content string) (string, error) // LLM call for synthesis
+	LLM                LLMConfig
+	Cognitive          CognitiveConfig
+	ToolExec           func(context.Context, json.RawMessage) (string, error)
+	Mu                 *sync.Mutex
+	Interval           time.Duration
+	SM                 *StateManager
+	DB                 *pgxpool.Pool // nil when running without database
+	EmbedEndpoint      string        // empty when embeddings unavailable
+	EmbedModel         string        // model name for embedding endpoint
+	MaxMessages        int           // context window cap for slide (e.g. 20)
+	PersonalityContent string        // personality traits markdown for system prompt injection
+	ProfileContent     string        // identity profile JSON for system prompt injection
+
+	MemoryStalenessDays int                  // prune stale memories older than this many days (0 = disabled)
+	SendFunc            func(text string)    // sends a message to the user via Telegram
+	InterruptChan       chan struct{}        // signals the task scheduler to recalculate
+	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
+	SubagentFunc        memory.SubagentFunc  // for conversation archive distillation (nil = skip distillation)
+
+	// Internal timers (not configured externally).
+	lastCognitiveRun   time.Time
+	lastMaintenanceRun time.Time
+	lastHeartbeatHash  [32]byte // SHA-256 of last proactive heartbeat reply (dedup guard)
+}
+
+// withOrchestratorLock runs fn while holding the orchestrator mutex.
+func (e *Engine) withOrchestratorLock(fn func()) {
+	e.Mu.Lock()
+	defer e.Mu.Unlock()
+	fn()
+}
+
+// baseOrchestratorOpts returns the common QueryOrchestratorOpts shared across
+// all orchestrator call sites (heartbeat, routines, scheduled tasks).
+func (e *Engine) baseOrchestratorOpts() *llm.QueryOrchestratorOpts {
+	return &llm.QueryOrchestratorOpts{
+		Grammar:            e.LLM.Grammar,
+		PersonalityContent: e.PersonalityContent,
+		ProfileContent:     e.ProfileContent,
+		MaxToolResultLen:   e.LLM.MaxToolResultLen,
+		MaxWebSources:      e.LLM.MaxWebSources,
+		ToolAgent:          e.LLM.ToolAgent,
+	}
+}
+
+// sendDeduped sends text via SendFunc, suppressing consecutive identical messages.
+// Returns true if the message was delivered, false if suppressed as a duplicate.
+func (e *Engine) sendDeduped(text, logLabel string) bool {
+	h := sha256.Sum256([]byte(text))
+	if h == e.lastHeartbeatHash {
+		logger.Log.Infof("heartbeat: suppressed duplicate %s", logLabel)
+		return false
+	}
+	e.lastHeartbeatHash = h
+	if e.SendFunc != nil {
+		e.SendFunc(text)
+	}
+	logger.Log.Infof("heartbeat: %s delivered", logLabel)
+	return true
+}
+
+// archiveDeps returns the ArchiveDeps for context sliding/archival.
+func (e *Engine) archiveDeps() ArchiveDeps {
+	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, SubagentFn: e.SubagentFunc}
 }
 
 // Run starts a blocking loop that fires at the given interval. Each tick, it
 // reads the current agent state, builds a heartbeat prompt with the state
-// in Markdown, and sends it to the LLM orchestrator. A separate hourly ticker
-// injects silent consolidation events. It serializes LLM access through Mu.
-// After each LLM call it attempts to slide and archive old context.
+// in Markdown, and sends it to the LLM orchestrator. Maintenance (decay,
+// pruning) and cognitive processing (reflection, episode synthesis, profile
+// consolidation) are evaluated within each heartbeat tick using volume + lull
+// triggers. It serializes LLM access through Mu.
 // If a database is available, it starts a PostgreSQL-backed task scheduler
 // goroutine alongside the heartbeat loop.
 // Intended to be called as a goroutine.
 func (e *Engine) Run() {
-	// Load identity profile from DB on startup.
+	// Load identity profile and personality traits from DB on startup.
 	e.RefreshProfile()
+	e.RefreshPersonality()
 
 	// Start the DB-backed task scheduler.
 	if e.DB != nil && e.InterruptChan != nil {
 		go e.runTaskScheduler()
 	}
 
+	e.lastCognitiveRun = time.Now()
+	e.lastMaintenanceRun = time.Now()
+
 	heartbeat := time.NewTicker(e.Interval)
 	defer heartbeat.Stop()
 
-	// Consolidation ticker defaults to 1 hour if not set.
-	consolidationInterval := e.ConsolidationInterval
-	if consolidationInterval <= 0 {
-		consolidationInterval = 1 * time.Hour
-	}
-	consolidation := time.NewTicker(consolidationInterval)
-	defer consolidation.Stop()
-
-	// Episode synthesis ticker defaults to 6 hours.
-	episodeInterval := e.EpisodeSynthesisInterval
-	if episodeInterval <= 0 {
-		episodeInterval = 6 * time.Hour
-	}
-	episodeTicker := time.NewTicker(episodeInterval)
-	defer episodeTicker.Stop()
-
-	logger.Log.Infof("[engine] heartbeat started (interval: %s, consolidation: %s, episodes: %s, reflection threshold: %d memories)",
-		e.Interval, consolidationInterval, episodeInterval, e.ReflectionMemoryThreshold)
+	logger.Log.Infof("[engine] heartbeat started (interval: %s, buffer: %d, lull: %s, ceiling: %s)",
+		e.Interval, e.Cognitive.BufferThreshold, e.Cognitive.LullDuration, e.Cognitive.Ceiling)
 
 	for {
-		select {
-		case <-heartbeat.C:
-			e.heartbeatTick()
-		case <-consolidation.C:
-			e.consolidationTick()
-		case <-episodeTicker.C:
-			e.episodeSynthesisTick()
-		}
+		<-heartbeat.C
+		e.heartbeatTick()
 	}
 }
 
@@ -101,7 +153,7 @@ func (e *Engine) RefreshProfile() {
 	if e.DB == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutDBQuery)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 	defer cancel()
 	content, err := memory.GetIdentityProfile(ctx, e.DB)
 	if err != nil {
@@ -109,6 +161,22 @@ func (e *Engine) RefreshProfile() {
 		return
 	}
 	e.ProfileContent = content
+}
+
+// RefreshPersonality loads personality traits from the database into the engine's
+// PersonalityContent field. Called on startup and after personality mutations.
+func (e *Engine) RefreshPersonality() {
+	if e.DB == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
+	defer cancel()
+	content, err := memory.FormatPersonalityForPrompt(ctx, e.DB)
+	if err != nil {
+		logger.Log.Warnf("[engine] failed to refresh personality: %v", err)
+		return
+	}
+	e.PersonalityContent = content
 }
 
 // heartbeatPrefetch embeds the current task and retrieves semantically similar
@@ -120,7 +188,7 @@ func (e *Engine) heartbeatPrefetch(ctx context.Context) *llm.Message {
 		return nil
 	}
 
-	embedCtx, cancel := context.WithTimeout(ctx, TimeoutEmbedding)
+	embedCtx, cancel := context.WithTimeout(ctx, timeouts.Embedding)
 	defer cancel()
 
 	pf := memory.Prefetch(embedCtx, e.DB, e.EmbedEndpoint, e.EmbedModel, task, task, 3)
@@ -130,25 +198,17 @@ func (e *Engine) heartbeatPrefetch(ctx context.Context) *llm.Message {
 
 	// Bump retrieval stats in background.
 	go func() {
-		bCtx, bCancel := context.WithTimeout(context.Background(), TimeoutDBQuery)
+		bCtx, bCancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 		defer bCancel()
-		_, _ = e.DB.Exec(bCtx,
-			`UPDATE memories
-			 SET retrieval_count = COALESCE(retrieval_count, 0) + 1,
-			     last_retrieved_at = NOW(),
-			     last_accessed = NOW(),
-			     salience = LEAST(COALESCE(salience, 5) + (0.3 * (1.0 - COALESCE(salience, 5) / 10.0)), 10)
-			 WHERE id = ANY($1)`,
-			pf.IDs,
-		)
+		memory.TrackRetrieval(bCtx, e.DB, pf.IDs)
 	}()
 
 	logger.Log.Infof("[engine] heartbeat prefetch injected %d memories", len(pf.IDs))
-	return &llm.Message{Role: "system", Content: pf.Content}
+	return &llm.Message{Role: "user", Content: pf.Content}
 }
 
-// dueDirective represents a single directive row that's due for execution.
-type dueDirective struct {
+// dueRoutine represents a single routine row that's due for execution.
+type dueRoutine struct {
 	ID          int
 	Name        string
 	Instruction string
@@ -169,19 +229,29 @@ type heartbeatMemory struct {
 
 // heartbeatContext holds working memory gathered from Postgres for Phase 2.
 type heartbeatContext struct {
-	currentTime string
-	tasks       []heartbeatTask
-	memories    []heartbeatMemory
+	currentTime      string
+	currentObjective string // from e.SM.GetState().CurrentTask
+	userLastActive   string // RFC3339 timestamp of last user message
+	tasks            []heartbeatTask
+	memories         []heartbeatMemory
 }
 
-// executivePrompt is injected as a system message between the standard system
-// prompt and the heartbeat context XML for Phase 2 contextual reasoning.
-const executivePrompt = `You are running your autonomous background loop. Directives have already been executed for this tick. Review the <heartbeat_context> and determine if any proactive action is required.
+// executivePromptBase is the template for the Phase 2 system message.
+// It contains a %s placeholder for staleness context (populated per-tick).
+const executivePromptBase = `You are running your autonomous background loop. Routines have already been executed for this tick. Review the <heartbeat_context> and determine if any proactive action is required.
+
+%s
 
 Priority order:
 1. Pending tasks that are overdue or due within 24 hours — take action if you can make progress without user input.
 2. If recent memories suggest something time-sensitive needs attention (upcoming travel, an open promise to follow up, an approaching deadline), address it.
 3. Only message the user if there is something they need to know or decide RIGHT NOW. Do not message the user to report that background tasks completed silently.
+
+ABSOLUTE RULES:
+- Do NOT continue, revisit, or follow up on previous conversations. The conversation is NOT your concern here.
+- Do NOT repeat information you have already told the user.
+- Do NOT summarize what happened in previous conversations.
+- Do NOT offer unsolicited help ("Would you like me to...", "I can also...").
 
 CRITICAL: You MUST respond with exactly ONE of these two formats — anything else will be sent directly to the user as a Telegram message:
 - If no action is needed: <NO_ACTION_REQUIRED>
@@ -189,8 +259,45 @@ CRITICAL: You MUST respond with exactly ONE of these two formats — anything el
 
 Do NOT output status words like "idle", acknowledgements, or commentary. Your entire response must be one of the two tags above.`
 
+// gatekeeperGrammar is a GBNF grammar constraining gatekeeper output to one of
+// three JSON decision shapes: no action, tool intent, or direct message.
+const gatekeeperGrammar = `root ::= none | tool | message
+none ::= "{" ws "\"action\":" ws "\"none\"" ws "}"
+tool ::= "{" ws "\"action\":" ws "\"tool\"" ws "," ws "\"intent\":" ws string ws "}"
+message ::= "{" ws "\"action\":" ws "\"message\"" ws "," ws "\"text\":" ws string ws "}"
+string ::= "\"" chars "\""
+chars ::= char*
+char ::= [^"\\] | "\\" escape
+escape ::= ["\\nrt/]
+ws ::= [ \t\n]*`
+
+// gatekeeperPromptBase is the system prompt for the fast gatekeeper.
+// It contains a %s placeholder for staleness context.
+const gatekeeperPromptBase = `You are a background heartbeat gatekeeper. Your job is to evaluate the provided context and decide whether proactive action is needed.
+
+%s
+
+Respond with exactly ONE JSON object:
+- {"action": "none"} — no action needed (the default; use this ~90%% of the time).
+- {"action": "tool", "intent": "..."} — a tool-based action is needed. Describe the intent concisely.
+- {"action": "message", "text": "..."} — send a short message directly to the user (only for truly urgent, time-sensitive items).
+
+Rules:
+- Do NOT continue, revisit, or follow up on previous conversations.
+- Do NOT repeat information the user already knows.
+- Do NOT offer unsolicited help.
+- Prefer "none" unless there is a clear, actionable, time-sensitive reason to act.
+- A pending task is only actionable if it is overdue or due within the next hour AND you can make progress without user input.`
+
+// gatekeeperDecision represents the parsed gatekeeper JSON output.
+type gatekeeperDecision struct {
+	Action string `json:"action"`
+	Intent string `json:"intent,omitempty"`
+	Text   string `json:"text,omitempty"`
+}
+
 // heartbeatTick handles a single heartbeat using a two-phase approach:
-// Phase 1 executes due directives deterministically, then Phase 2 runs
+// Phase 1 executes due routines deterministically, then Phase 2 runs
 // contextual orchestrator reasoning over working memory.
 func (e *Engine) heartbeatTick() {
 	defer func() {
@@ -199,7 +306,7 @@ func (e *Engine) heartbeatTick() {
 		}
 	}()
 
-	if e.Client == nil {
+	if e.LLM.Client == nil {
 		logger.Log.Warn("heartbeat: llm.Client is nil, skipping tick")
 		return
 	}
@@ -207,57 +314,171 @@ func (e *Engine) heartbeatTick() {
 	// Refresh user preferences from DB (picks up externally added prefs).
 	e.SM.RefreshPrefs()
 
-	// === PHASE 1: Deterministic Directive Execution ===
-	directivesFired := 0
+	// === PHASE 1: Deterministic Routine Execution ===
+	routinesFired := 0
 	if e.DB != nil {
-		directivesFired = e.executeDueDirectives()
+		routinesFired = e.executeDueRoutines()
 	}
 
-	// === PHASE 2: Contextual Orchestrator Reasoning ===
+	// === PHASE 2: Contextual Reasoning ===
 	hbCtx := e.gatherHeartbeatContext()
 	contextXML := hbCtx.toXML()
 
-	// Build history: conversation history + executive prompt injection.
-	// The executive prompt is a system message placed after conversation
-	// history and before the user message (heartbeat context XML).
-	trimFn := func(msgs []llm.Message) []llm.Message {
-		return TrimMessages(msgs, 12)
+	// Staleness detection: if the user hasn't sent a message recently,
+	// exclude conversation history to prevent the model from trying to
+	// continue or rehash stale conversations.
+	lastActivity := e.SM.LastUserActivity()
+	staleThreshold := 2 * e.Interval
+	if staleThreshold < 10*time.Minute {
+		staleThreshold = 10 * time.Minute
 	}
+	conversationStale := !lastActivity.IsZero() && time.Since(lastActivity) > staleThreshold
+
+	// Build staleness context.
+	var stalenessNote string
+	if lastActivity.IsZero() {
+		stalenessNote = "The user has not sent any messages this session. Do NOT initiate conversation."
+	} else if conversationStale {
+		stalenessNote = fmt.Sprintf("The user has been inactive for %s. The conversation is STALE — do NOT continue, revisit, or follow up on it.", time.Since(lastActivity).Truncate(time.Minute))
+	} else {
+		stalenessNote = "The user is actively chatting. Only take proactive action if truly urgent."
+	}
+
+	if e.Gatekeeper != nil {
+		e.heartbeatPhase2Gatekeeper(contextXML, stalenessNote, conversationStale)
+	} else {
+		e.heartbeatPhase2Orchestrator(contextXML, stalenessNote, conversationStale)
+	}
+
+	if e.DB != nil && e.EmbedEndpoint != "" {
+		SlideAndArchiveContext(context.Background(), e.SM, e.MaxMessages, e.archiveDeps())
+	}
+
+	// Phase 3: Periodic maintenance (decay + pruning).
+	e.runMaintenanceIfDue()
+
+	// Phase 4: Event-driven cognitive processing.
+	e.runCognitiveIfTriggered()
+
+	logger.Log.Infof("heartbeat: tick complete, routines_fired=%d", routinesFired)
+}
+
+// heartbeatPhase2Gatekeeper runs Phase 2 via the fast gatekeeper (subagent/Flash).
+// Only escalates to the orchestrator when the gatekeeper decides action is needed.
+// Falls back to the orchestrator path on any gatekeeper error.
+func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, conversationStale bool) {
+	prompt := fmt.Sprintf(gatekeeperPromptBase, stalenessNote)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, contextXML, gatekeeperGrammar, 256)
+	if err != nil {
+		logger.Log.Warnf("heartbeat: gatekeeper error, falling back to orchestrator: %v", err)
+		e.heartbeatPhase2Orchestrator(contextXML, stalenessNote, conversationStale)
+		return
+	}
+
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		logger.Log.Info("heartbeat: gatekeeper returned empty response, treating as no action")
+		return
+	}
+
+	var decision gatekeeperDecision
+	if err := json.Unmarshal([]byte(raw), &decision); err != nil {
+		logger.Log.Warnf("heartbeat: gatekeeper parse error, falling back to orchestrator: %v (raw: %s)", err, raw)
+		e.heartbeatPhase2Orchestrator(contextXML, stalenessNote, conversationStale)
+		return
+	}
+
+	switch decision.Action {
+	case "none":
+		logger.Log.Info("heartbeat: gatekeeper decided no action required")
+
+	case "tool":
+		logger.Log.Infof("heartbeat: gatekeeper requested tool action, routing to orchestrator: %s", decision.Intent)
+		toolPrompt := fmt.Sprintf(
+			"%s\n\nROUTINE: %s\nExecute this action now. Use your tools to complete it.\n"+
+				"Do not message the user unless the action explicitly requires it.",
+			contextXML, decision.Intent,
+		)
+
+		var reply string
+		var msgs []llm.Message
+		var orchestratorErr error
+		e.withOrchestratorLock(func() {
+			opts := e.baseOrchestratorOpts()
+			if !conversationStale {
+				opts.History = e.SM.ReadMessages()
+			}
+			reply, msgs, orchestratorErr = llm.QueryOrchestrator(
+				context.Background(), e.LLM.Client, e.LLM.Model, toolPrompt,
+				e.ToolExec, DefaultTrimFn, opts,
+			)
+		})
+
+		if !conversationStale {
+			for _, m := range msgs {
+				e.SM.AppendMessage(m)
+			}
+		}
+
+		if orchestratorErr != nil {
+			logger.Log.Errorf("heartbeat: orchestrator error (gatekeeper-routed): %v", orchestratorErr)
+		} else if reply = strings.TrimSpace(reply); reply != "" && !strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
+			e.sendDeduped(reply, "proactive response (gatekeeper-routed)")
+		}
+
+	case "message":
+		text := strings.TrimSpace(decision.Text)
+		if text == "" {
+			logger.Log.Debug("heartbeat: gatekeeper returned empty message, ignoring")
+			break
+		}
+		e.sendDeduped(text, "gatekeeper message")
+
+	default:
+		logger.Log.Warnf("heartbeat: gatekeeper returned unknown action %q, ignoring", decision.Action)
+	}
+}
+
+// heartbeatPhase2Orchestrator runs Phase 2 via the full orchestrator (original path).
+func (e *Engine) heartbeatPhase2Orchestrator(contextXML, stalenessNote string, conversationStale bool) {
+	executivePrompt := fmt.Sprintf(executivePromptBase, stalenessNote)
 
 	var reply string
 	var msgs []llm.Message
 	var err error
-	func() {
-		e.Mu.Lock()
-		defer e.Mu.Unlock()
-
-		convHistory := e.SM.ReadMessages()
-		history := make([]llm.Message, 0, len(convHistory)+1)
-		history = append(history, convHistory...)
+	e.withOrchestratorLock(func() {
+		var history []llm.Message
+		if !conversationStale {
+			convHistory := e.SM.ReadMessages()
+			history = make([]llm.Message, 0, len(convHistory)+1)
+			history = append(history, convHistory...)
+		} else {
+			history = make([]llm.Message, 0, 1)
+		}
 		history = append(history, llm.Message{
-			Role:    "system",
-			Content: executivePrompt,
+			Role:    "user",
+			Content: "[EXECUTIVE ROUTINE]\n" + executivePrompt,
 		})
 
+		opts := e.baseOrchestratorOpts()
+		opts.History = history
 		reply, msgs, err = llm.QueryOrchestrator(
-			context.Background(), e.Client, e.Model, contextXML,
-			e.ToolExec, trimFn, &llm.QueryOrchestratorOpts{
-				History:          history,
-				Grammar:          e.Grammar,
-				ProfileContent:   e.ProfileContent,
-				MaxToolResultLen: e.MaxToolResultLen,
-				MaxWebSources:    e.MaxWebSources,
-				ToolAgent:        e.ToolAgent,
-			},
+			context.Background(), e.LLM.Client, e.LLM.Model, contextXML,
+			e.ToolExec, DefaultTrimFn, opts,
 		)
-	}()
+	})
 
-	// Persist Phase 2 messages for conversation continuity.
-	for _, m := range msgs {
-		e.SM.AppendMessage(m)
+	// Only persist Phase 2 messages when the conversation is active.
+	if !conversationStale {
+		for _, m := range msgs {
+			e.SM.AppendMessage(m)
+		}
 	}
 
-	// Route the orchestrator's response.
 	switch {
 	case err != nil:
 		if strings.Contains(err.Error(), "too many tool call rounds") {
@@ -271,112 +492,10 @@ func (e *Engine) heartbeatTick() {
 	case strings.Contains(reply, "<NO_ACTION_REQUIRED>"):
 		logger.Log.Info("heartbeat: no action required")
 	case strings.TrimSpace(reply) != "":
-		// Orchestrator produced a proactive response — deliver to user.
-		if e.SendFunc != nil {
-			e.SendFunc(reply)
-		}
-		logger.Log.Infof("heartbeat: proactive response delivered")
+		e.sendDeduped(strings.TrimSpace(reply), "proactive response")
 	default:
 		logger.Log.Debug("heartbeat: orchestrator produced unexpected output")
 	}
-
-	if e.DB != nil && e.EmbedEndpoint != "" {
-		SlideAndArchiveContext(context.Background(), e.SM, e.MaxMessages, e.DB, e.EmbedEndpoint, e.EmbedModel)
-	}
-
-	logger.Log.Infof("heartbeat: tick complete, directives_fired=%d", directivesFired)
-}
-
-// executeDueDirectives queries all directives whose interval has elapsed and
-// executes each one independently through the orchestrator. Returns the count
-// of directives fired.
-func (e *Engine) executeDueDirectives() int {
-	queryCtx, cancel := context.WithTimeout(context.Background(), TimeoutDBQuery)
-	defer cancel()
-
-	rows, err := e.DB.Query(queryCtx,
-		`SELECT id, name, instruction
-		 FROM directives
-		 WHERE last_executed + interval_duration <= NOW()
-		 ORDER BY (last_executed + interval_duration) ASC`)
-	if err != nil {
-		logger.Log.Warnf("heartbeat: failed to query due directives: %v", err)
-		return 0
-	}
-
-	var directives []dueDirective
-	for rows.Next() {
-		var d dueDirective
-		if err := rows.Scan(&d.ID, &d.Name, &d.Instruction); err != nil {
-			logger.Log.Warnf("heartbeat: failed to scan directive row: %v", err)
-			continue
-		}
-		directives = append(directives, d)
-	}
-	rows.Close()
-
-	if rows.Err() != nil {
-		logger.Log.Warnf("heartbeat: directive iteration error: %v", rows.Err())
-	}
-
-	for _, d := range directives {
-		e.executeSingleDirective(d)
-	}
-
-	return len(directives)
-}
-
-// executeSingleDirective advances the directive's timer and runs it through
-// the full orchestrator/supervisor loop. Recovers from panics so a single
-// failed directive never crashes the heartbeat goroutine.
-func (e *Engine) executeSingleDirective(d dueDirective) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Log.Errorf("heartbeat: directive panic, name=%s, err=%v", d.Name, r)
-		}
-	}()
-
-	// Advance timer BEFORE execution to prevent double-fire on crash.
-	advCtx, advCancel := context.WithTimeout(context.Background(), TimeoutDBQuery)
-	defer advCancel()
-	if _, err := e.DB.Exec(advCtx,
-		`UPDATE directives SET last_executed = NOW() WHERE id = $1`, d.ID); err != nil {
-		logger.Log.Warnf("heartbeat: failed to advance directive timer, name=%s, err=%v", d.Name, err)
-		return
-	}
-
-	prompt := fmt.Sprintf(
-		"DIRECTIVE: %s\nExecute this directive now. Use your tools to complete it.\n"+
-			"Do not message the user unless the directive explicitly requires it.",
-		d.Instruction,
-	)
-
-	trimFn := func(msgs []llm.Message) []llm.Message {
-		return TrimMessages(msgs, 12)
-	}
-
-	var err error
-	func() {
-		e.Mu.Lock()
-		defer e.Mu.Unlock()
-		_, _, err = llm.QueryOrchestrator(
-			context.Background(), e.Client, e.Model, prompt,
-			e.ToolExec, trimFn, &llm.QueryOrchestratorOpts{
-				Grammar:          e.Grammar,
-				ProfileContent:   e.ProfileContent,
-				MaxToolResultLen: e.MaxToolResultLen,
-				MaxWebSources:    e.MaxWebSources,
-				ToolAgent:        e.ToolAgent,
-			},
-		)
-	}()
-
-	if err != nil {
-		logger.Log.Warnf("heartbeat: directive failed, name=%s, err=%v", d.Name, err)
-		return
-	}
-
-	logger.Log.Infof("heartbeat: directive executed, name=%s", d.Name)
 }
 
 // gatherHeartbeatContext queries Postgres for pending tasks and recent salient
@@ -384,14 +503,18 @@ func (e *Engine) executeSingleDirective(d dueDirective) {
 // affected section is left empty — the orchestrator still runs with partial context.
 func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	hc := heartbeatContext{
-		currentTime: time.Now().Format(time.RFC3339),
+		currentTime:      time.Now().Format(time.RFC3339),
+		currentObjective: e.SM.GetState().CurrentTask,
+	}
+	if la := e.SM.LastUserActivity(); !la.IsZero() {
+		hc.userLastActive = la.Format(time.RFC3339)
 	}
 
 	if e.DB == nil {
 		return hc
 	}
 
-	queryCtx, cancel := context.WithTimeout(context.Background(), TimeoutDBQuery)
+	queryCtx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 	defer cancel()
 
 	// Query 1: Pending tasks.
@@ -439,14 +562,6 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 		memRows.Close()
 	}
 
-	// Query 3: Upcoming calendar events.
-	// TODO: implement when local calendar cache table exists.
-	// Expected query:
-	//   SELECT title, start_time, location
-	//   FROM calendar_cache
-	//   WHERE start_time BETWEEN NOW() AND NOW() + INTERVAL '48 hours'
-	//   ORDER BY start_time ASC LIMIT 5
-
 	return hc
 }
 
@@ -457,6 +572,18 @@ func (hc heartbeatContext) toXML() string {
 	var b strings.Builder
 	b.WriteString("<heartbeat_context>\n")
 	fmt.Fprintf(&b, "  <current_time>%s</current_time>\n", hc.currentTime)
+
+	objective := hc.currentObjective
+	if objective == "" {
+		objective = "none"
+	}
+	fmt.Fprintf(&b, "  <current_objective>%s</current_objective>\n", objective)
+
+	lastActive := hc.userLastActive
+	if lastActive == "" {
+		lastActive = "never"
+	}
+	fmt.Fprintf(&b, "  <user_last_active>%s</user_last_active>\n", lastActive)
 
 	// Recent salient memories.
 	if len(hc.memories) == 0 {
@@ -486,290 +613,7 @@ func (hc heartbeatContext) toXML() string {
 		b.WriteString("  </pending_tasks>\n")
 	}
 
-	// Upcoming calendar (TODO).
-	b.WriteString("  <upcoming_calendar>none</upcoming_calendar>\n")
-
 	b.WriteString("</heartbeat_context>")
 	return b.String()
 }
 
-// consolidationTick injects a silent system event into the sliding window and
-// runs the LLM orchestrator so it can assess whether memory consolidation is
-// needed. The event message is never sent to Telegram — only the LLM sees it.
-func (e *Engine) consolidationTick() {
-	currentTime := time.Now().Format("Monday, January 2, 2006 at 3:04 PM")
-	prompt := fmt.Sprintf(
-		"<system_event>1 hour has passed. Current Time: %s. Assess if memory consolidation is required.</system_event>",
-		currentTime,
-	)
-
-	logger.Log.Info("[engine] consolidation tick fired")
-
-	// Materialize salience decay before the LLM assesses consolidation.
-	if e.DB != nil {
-		if n, err := memory.MaterializeDecay(context.Background(), e.DB); err != nil {
-			logger.Log.Warnf("[engine] salience decay failed: %v", err)
-		} else if n > 0 {
-			logger.Log.Infof("[engine] decayed salience for %d memories", n)
-		}
-
-		// Prune stale memories that have decayed beyond recovery.
-		if e.MemoryStalenessDays > 0 {
-			if n, err := memory.PruneStaleMemories(context.Background(), e.DB, e.MemoryStalenessDays); err != nil {
-				logger.Log.Warnf("[engine] memory pruning failed: %v", err)
-			} else if n > 0 {
-				logger.Log.Infof("[engine] pruned %d stale memories", n)
-			}
-		}
-	}
-
-	// Check if enough new memories have accumulated to trigger reflection.
-	if e.SynthesizeFunc != nil && e.ReflectionPrompt != "" && e.ReflectionMemoryThreshold > 0 && e.DB != nil {
-		count, err := memory.CountMemoriesSinceLastReflection(context.Background(), e.DB)
-		if err != nil {
-			logger.Log.Warnf("[engine] reflection count check failed: %v", err)
-		} else if count >= e.ReflectionMemoryThreshold {
-			logger.Log.Infof("[engine] reflection threshold reached (%d >= %d), triggering reflection", count, e.ReflectionMemoryThreshold)
-			e.triggerReflection()
-		}
-	}
-
-	e.Mu.Lock()
-	trimFn := func(msgs []llm.Message) []llm.Message {
-		return TrimMessages(msgs, 12)
-	}
-	history := e.SM.ReadMessages()
-	reply, msgs, err := llm.QueryOrchestrator(context.Background(), e.Client, e.Model, prompt, e.ToolExec, trimFn, &llm.QueryOrchestratorOpts{History: history, Grammar: e.Grammar, ProfileContent: e.ProfileContent, MaxToolResultLen: e.MaxToolResultLen, MaxWebSources: e.MaxWebSources, ToolAgent: e.ToolAgent})
-	e.Mu.Unlock()
-
-	for _, m := range msgs {
-		e.SM.AppendMessage(m)
-	}
-
-	if err != nil {
-		logger.Log.Errorf("[engine] consolidation tick error: %v", err)
-	} else {
-		logger.Log.Infof("[engine] consolidation: %s", reply)
-	}
-
-	// Refresh profile after consolidation in case it was updated.
-	e.RefreshProfile()
-
-	if e.DB != nil && e.EmbedEndpoint != "" {
-		SlideAndArchiveContext(context.Background(), e.SM, e.MaxMessages, e.DB, e.EmbedEndpoint, e.EmbedModel)
-	}
-}
-
-// episodeSynthesisTick clusters recent semantically-similar memories and
-// synthesizes them into episodic memories. Skipped if prerequisites are missing.
-func (e *Engine) episodeSynthesisTick() {
-	if e.DB == nil || e.EmbedEndpoint == "" || e.SynthesizeFunc == nil {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutSynthesis)
-	defer cancel()
-
-	n, err := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.SynthesizeFunc)
-	if err != nil {
-		logger.Log.Warnf("[engine] episode synthesis failed: %v", err)
-	} else if n > 0 {
-		logger.Log.Infof("[engine] synthesized %d episodes", n)
-	}
-}
-
-// triggerReflection performs a meta-cognitive reflection over memories since
-// the last reflection, identifying patterns and predictions. Called when the
-// memory count threshold is reached during consolidationTick.
-func (e *Engine) triggerReflection() {
-	if e.DB == nil || e.EmbedEndpoint == "" || e.SynthesizeFunc == nil || e.ReflectionPrompt == "" {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutSynthesis)
-	defer cancel()
-
-	// Determine the window: since the last reflection, or 7 days if none exists.
-	since := time.Now().AddDate(0, 0, -7)
-	var lastReflection *time.Time
-	err := e.DB.QueryRow(ctx,
-		`SELECT MAX(created_at) FROM memories WHERE memory_type = 'reflection'`,
-	).Scan(&lastReflection)
-	if err == nil && lastReflection != nil && !lastReflection.IsZero() {
-		since = *lastReflection
-	}
-
-	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.ReflectionPrompt, e.SynthesizeFunc, since)
-	if err != nil {
-		logger.Log.Warnf("[engine] reflection failed: %v", err)
-	} else if id > 0 {
-		logger.Log.Infof("[engine] reflection saved as memory id=%d", id)
-	}
-}
-
-// runTaskScheduler is a long-running goroutine that queries the database for
-// the next pending scheduled task and waits until it's due before executing it.
-// It uses a select block to handle both timer expiry and interrupt signals from
-// new task insertions or completions.
-func (e *Engine) runTaskScheduler() {
-	logger.Log.Info("[scheduler] task scheduler started")
-	for {
-		task, err := e.fetchNextPendingTask()
-		if err != nil {
-			logger.Log.Errorf("[scheduler] query error: %v", err)
-			time.Sleep(10 * time.Second)
-			continue
-		}
-
-		if task == nil {
-			// No pending scheduled tasks; block until one is added.
-			<-e.InterruptChan
-			continue
-		}
-
-		delay := time.Until(*task.DueAt)
-		if delay <= 0 {
-			// Task is already past due — execute immediately.
-			e.executeTask(*task)
-			continue
-		}
-
-		logger.Log.Infof("[scheduler] next task %q (#%d) due in %s", task.Description, task.ID, delay)
-		timer := time.NewTimer(delay)
-
-		select {
-		case <-timer.C:
-			e.executeTask(*task)
-		case <-e.InterruptChan:
-			timer.Stop()
-			// Recalculate — a new task may be due sooner.
-		}
-	}
-}
-
-// fetchNextPendingTask returns the earliest pending task with a due_at, or nil
-// if no scheduled tasks are pending.
-func (e *Engine) fetchNextPendingTask() (*Task, error) {
-	row := e.DB.QueryRow(context.Background(),
-		`SELECT id, description, due_at, recurrence, status
-		 FROM tasks
-		 WHERE status = 'pending' AND due_at IS NOT NULL
-		 ORDER BY due_at ASC
-		 LIMIT 1`)
-
-	var t Task
-	var recurrenceNs int64
-	err := row.Scan(&t.ID, &t.Description, &t.DueAt, &recurrenceNs, &t.Status)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	t.Recurrence = time.Duration(recurrenceNs)
-	return &t, nil
-}
-
-// executeTask prompts the LLM with the due task, sends the reply to the user,
-// marks the task as completed in the database, and handles recurrence by
-// inserting a new pending row for the next occurrence.
-func (e *Engine) executeTask(task Task) {
-	// Verify the task is still pending (it may have been completed externally).
-	var status string
-	err := e.DB.QueryRow(context.Background(),
-		`SELECT status FROM tasks WHERE id = $1`, task.ID).Scan(&status)
-	if err != nil || status != "pending" {
-		logger.Log.Infof("[scheduler] task #%d no longer pending, skipping", task.ID)
-		return
-	}
-
-	logger.Log.Infof("[scheduler] executing task #%d: %s", task.ID, task.Description)
-
-	prompt := fmt.Sprintf(
-		"[SCHEDULED TASK DUE] The following task is now due: %q. "+
-			"Respond directly to the user with a short message fulfilling this task. "+
-			"Do NOT call complete_task, update_state, add_task, or save_memory — the system handles task lifecycle automatically. "+
-			"Current time: %s",
-		task.Description, time.Now().Format(time.RFC3339),
-	)
-
-	e.Mu.Lock()
-	trimFn := func(msgs []llm.Message) []llm.Message {
-		return TrimMessages(msgs, 12)
-	}
-	history := e.SM.ReadMessages()
-	reply, msgs, err := llm.QueryOrchestrator(context.Background(), e.Client, e.Model, prompt, e.ToolExec, trimFn, &llm.QueryOrchestratorOpts{History: history, Grammar: e.Grammar, ProfileContent: e.ProfileContent, MaxToolResultLen: e.MaxToolResultLen, MaxWebSources: e.MaxWebSources, ToolAgent: e.ToolAgent})
-	e.Mu.Unlock()
-
-	for _, m := range msgs {
-		e.SM.AppendMessage(m)
-	}
-
-	if err != nil {
-		logger.Log.Errorf("[scheduler] task #%d LLM error: %v", task.ID, err)
-		reply = fmt.Sprintf("(Scheduled task %q fired but LLM error occurred: %v)", task.Description, err)
-	}
-
-	if e.SendFunc != nil && reply != "" {
-		e.SendFunc(reply)
-	}
-
-	// Mark task as completed.
-	if _, dbErr := e.DB.Exec(context.Background(),
-		`UPDATE tasks SET status = 'completed' WHERE id = $1`, task.ID); dbErr != nil {
-		logger.Log.Errorf("[scheduler] failed to mark task #%d completed: %v", task.ID, dbErr)
-	}
-
-	// Handle recurrence: insert a new pending row for the next occurrence.
-	if task.Recurrence > 0 && task.DueAt != nil {
-		nextDue := task.DueAt.Add(task.Recurrence)
-		if _, dbErr := e.DB.Exec(context.Background(),
-			`INSERT INTO tasks (description, due_at, recurrence, status) VALUES ($1, $2, $3, 'pending')`,
-			task.Description, nextDue, int64(task.Recurrence)); dbErr != nil {
-			logger.Log.Errorf("[scheduler] failed to insert recurring task: %v", dbErr)
-		} else {
-			logger.Log.Infof("[scheduler] recurring task %q rescheduled for %s", task.Description, nextDue.Format(time.RFC3339))
-		}
-	}
-}
-
-
-// FetchPendingTasksMarkdown queries the database for all pending tasks and
-// returns a Markdown-formatted summary suitable for inclusion in prompts.
-func FetchPendingTasksMarkdown(ctx context.Context, pool *pgxpool.Pool) string {
-	rows, err := pool.Query(ctx,
-		`SELECT id, description, due_at, recurrence FROM tasks WHERE status = 'pending' ORDER BY due_at ASC NULLS LAST`)
-	if err != nil {
-		return "**Task Queue:** (error fetching tasks)\n"
-	}
-	defer rows.Close()
-
-	var b strings.Builder
-	b.WriteString("**Task Queue:**\n")
-	count := 0
-	for rows.Next() {
-		var id int64
-		var desc string
-		var dueAt *time.Time
-		var recurrenceNs int64
-		if err := rows.Scan(&id, &desc, &dueAt, &recurrenceNs); err != nil {
-			continue
-		}
-		recurrence := time.Duration(recurrenceNs)
-		count++
-		switch {
-		case dueAt != nil && recurrence > 0:
-			fmt.Fprintf(&b, "- [%d] %s (due: %s, every %s)\n", id, desc, dueAt.Format(time.RFC3339), recurrence)
-		case dueAt != nil:
-			fmt.Fprintf(&b, "- [%d] %s (due: %s)\n", id, desc, dueAt.Format(time.RFC3339))
-		case recurrence > 0:
-			fmt.Fprintf(&b, "- [%d] %s (every %s)\n", id, desc, recurrence)
-		default:
-			fmt.Fprintf(&b, "- [%d] %s\n", id, desc)
-		}
-	}
-	if count == 0 {
-		b.WriteString("- (empty)\n")
-	}
-	return b.String()
-}

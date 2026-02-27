@@ -25,3 +25,18 @@ var CalendarTriage string
 
 //go:embed reflection.txt
 var Reflection string
+
+//go:embed distill_conversation.txt
+var DistillConversation string
+
+//go:embed extract_tasks.txt
+var ExtractTasks string
+
+//go:embed bootstrap.txt
+var Bootstrap string
+
+//go:embed subagent.txt
+var Subagent string
+
+//go:embed transition.txt
+var Transition string

@@ -32,6 +32,21 @@ func StripCodeFences(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// toolIntentTagRe matches <TOOL_INTENT>...</TOOL_INTENT> blocks, including
+// nested <CODE>...</CODE> blocks used by create_skill.
+var toolIntentTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>.*?</TOOL_INTENT>`)
+
+// StripToolIntentTags removes <TOOL_INTENT>...</TOOL_INTENT> blocks from text.
+func StripToolIntentTags(s string) string {
+	return strings.TrimSpace(toolIntentTagRe.ReplaceAllString(s, ""))
+}
+
+// CleanLLMJSON applies the standard cleanup pipeline for LLM-generated JSON:
+// strip think tags → strip code fences → extract JSON object.
+func CleanLLMJSON(s string) string {
+	return ExtractJSON(StripCodeFences(StripThinkTags(s)))
+}
+
 // ExtractJSON finds the first top-level JSON object in s by locating the first
 // '{' and its matching '}'. Handles the common case where a thinking model
 // outputs free-form reasoning before/after the JSON.

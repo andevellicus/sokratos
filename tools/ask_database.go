@@ -42,7 +42,7 @@ type text2sqlResponse struct {
 // into PostgreSQL via the Arctic-Text2SQL model, executes it, and returns the
 // results. The database schema is fetched dynamically from information_schema
 // so the SQL model always sees the current table definitions.
-func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL string, onAccess func()) ToolFunc {
+func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL string) ToolFunc {
 	httpClient := &http.Client{Timeout: TimeoutText2SQL}
 
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
@@ -80,10 +80,6 @@ func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL string, onAccess func()) Too
 			return fmt.Sprintf("failed to marshal request: %v", err), nil
 		}
 
-		if onAccess != nil {
-			onAccess()
-		}
-
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, text2sqlURL+"/v1/chat/completions", bytes.NewReader(body))
 		if err != nil {
 			return fmt.Sprintf("failed to create request: %v", err), nil
@@ -117,21 +113,26 @@ func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL string, onAccess func()) Too
 			return "Text2SQL model returned empty SQL.", nil
 		}
 
+		// Validate that the output actually looks like SQL (not prose).
+		if !looksLikeSQL(sql) {
+			preview := sql
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			return fmt.Sprintf("Text2SQL model returned non-SQL output: %s", preview), nil
+		}
+
 		logger.Log.Infof("[ask_database] generated SQL: %s", sql)
 
-		// Block destructive schema-level statements.
+		// Block all mutation and DDL statements — ask_database is read-only.
 		upper := strings.ToUpper(strings.TrimSpace(sql))
-		for _, prefix := range []string{"DROP ", "TRUNCATE ", "ALTER ", "CREATE ", "GRANT ", "REVOKE "} {
+		for _, prefix := range []string{"DROP ", "TRUNCATE ", "ALTER ", "CREATE ", "GRANT ", "REVOKE ", "INSERT ", "UPDATE ", "DELETE "} {
 			if strings.HasPrefix(upper, prefix) {
-				return fmt.Sprintf("Blocked: %sstatements are not allowed via ask_database.", prefix), nil
+				return fmt.Sprintf("Blocked: %sstatements are not allowed via ask_database (read-only).", prefix), nil
 			}
 		}
 
-		// SELECT/WITH → query with rows; everything else → exec.
-		if strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "WITH") {
-			return executeQuery(ctx, pool, sql)
-		}
-		return executeMutation(ctx, pool, sql)
+		return executeQuery(ctx, pool, sql)
 	}
 }
 
@@ -193,6 +194,18 @@ func fetchSchemaDDL(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 	}
 
 	return b.String(), nil
+}
+
+// looksLikeSQL returns true if the string starts with a recognized SQL keyword.
+// Used to catch the failure mode where the Text2SQL model generates prose instead of SQL.
+func looksLikeSQL(s string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	for _, kw := range []string{"SELECT ", "WITH ", "EXPLAIN "} {
+		if strings.HasPrefix(upper, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func stripSQLFences(s string) string {
@@ -261,10 +274,3 @@ func executeQuery(ctx context.Context, pool *pgxpool.Pool, sql string) (string, 
 	return b.String(), nil
 }
 
-func executeMutation(ctx context.Context, pool *pgxpool.Pool, sql string) (string, error) {
-	tag, err := pool.Exec(ctx, sql)
-	if err != nil {
-		return fmt.Sprintf("SQL error: %v\nSQL: %s", err, sql), nil
-	}
-	return fmt.Sprintf("OK — %d rows affected.\nSQL: %s", tag.RowsAffected(), sql), nil
-}

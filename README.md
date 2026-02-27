@@ -4,16 +4,17 @@ An autonomous AI assistant with long-term memory, powered by a multi-model archi
 
 ## Architecture
 
-Sokratos uses a **two-model supervisor pattern** where a vision-capable orchestrator produces free-form text with tool intent tags, and a dedicated tool agent translates those intents into structured JSON constrained by GBNF grammar. Four llama-server instances run on a separate Mac (M3 Ultra):
+Sokratos uses a **single-model supervisor pattern** where a vision-capable orchestrator produces free-form text with tool intent tags parsed via regex. Five llama-server instances run on a separate Mac (M3 Ultra):
 
 | Service | Port | Model | Purpose |
 |---------|------|-------|---------|
-| Orchestrator | 11434 | Qwen3-VL-30B-A3B | Vision-capable reasoning, free-form text |
-| On-demand router | 11435 | GLM-Z1-32B + Arctic-Text2SQL-7B | Deep thinking & SQL generation (loaded/unloaded dynamically) |
-| Tool agent | 11436 | Granite 3.3 8B | Structured JSON tool calls via GBNF grammar |
+| Orchestrator | 11434 | Qwen3.5-VL-35B-A3B (Q4_K_XL) | Vision-capable MoE reasoning, free-form text + `<TOOL_INTENT>` tags |
+| Deep thinker | 11435 | GLM-Z1-32B (Q6_K_XL) | Always-on heavy reasoning, consolidation, triage fallback |
+| Subagent | 11436 | GLM-4.7-Flash (Q4_K_XL) | Always-on structured tasks: triage, rewriting, re-ranking |
+| On-demand router | 11437 | Arctic-Text2SQL-7B | SQL generation (loaded/unloaded dynamically) |
 | Embedding | 8081 | BGE-large-en-v1.5 | 1024-dim vectors for pgvector |
 
-The orchestrator runs without grammar constraints. When it wants a tool, it emits `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. The tool agent receives the intent and produces structured JSON. The tool executes, the result is injected back, and the loop repeats (max 15 rounds).
+The orchestrator runs without grammar constraints. When it wants a tool, it emits `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds).
 
 ### Model Lineage Diversity
 
@@ -45,7 +46,7 @@ On your inference machine (e.g., Mac with M3 Ultra):
 cd models && ./start.sh
 ```
 
-This launches all four llama-server instances.
+This launches all five llama-server instances.
 
 ### 3. Configure environment
 
@@ -60,12 +61,12 @@ LLM_URL=http://your-mac:11434
 LLM_MODEL=Qwen3-VL-30B-A3B-Instruct-UD-Q6_K_XL
 
 DEEP_THINKER_URL=http://your-mac:11435
-DEEP_THINKER_MODEL=GLM-Z1-32B-0414-Q4_K_M
+DEEP_THINKER_MODEL=GLM-Z1-32B-0414-UD-Q6_K_XL
 
-TEXT2SQL_URL=http://your-mac:11435
+TEXT2SQL_URL=http://your-mac:11437
 
-TOOL_AGENT_URL=http://your-mac:11436
-TOOL_AGENT_MODEL=granite-3.3-8b-instruct-Q8_0
+SUBAGENT_URL=http://your-mac:11436
+SUBAGENT_MODEL=GLM-4.7-9B-Flash-UD-Q4_K_XL
 
 EMBEDDING_URL=http://your-mac:8081
 EMBEDDING_MODEL=bge-large-en-v1.5-q8_0
@@ -91,56 +92,66 @@ go build -o sokratos ./...
 | `LLM_MODEL` | (required) | Orchestrator model name |
 | `DEEP_THINKER_URL` | (empty) | Deep thinker endpoint |
 | `DEEP_THINKER_MODEL` | (empty) | Deep thinker model (no .gguf suffix) |
-| `TEXT2SQL_URL` | (empty) | Text2SQL endpoint |
-| `TOOL_AGENT_URL` | (empty) | Tool agent endpoint |
-| `TOOL_AGENT_MODEL` | (empty) | Tool agent model name |
+| `TEXT2SQL_URL` | (empty) | Text2SQL on-demand router endpoint |
+| `SUBAGENT_URL` | (empty) | Subagent endpoint |
+| `SUBAGENT_MODEL` | (empty) | Subagent model name |
+| `SUBAGENT_SLOTS` | `2` | Concurrent slots for Flash subagent |
+| `BACKGROUND_SUBAGENT_SLOTS` | `1` | Concurrent slots for Z1 overflow subagent |
 | `EMBEDDING_URL` | (empty) | Embedding endpoint |
 | `EMBEDDING_MODEL` | (empty) | Embedding model name |
 | `SEARXNG_URL` | (empty) | SearXNG instance URL |
 | `HEARTBEAT_INTERVAL` | `5m` | Autonomous heartbeat tick |
-| `CONSOLIDATION_INTERVAL` | `1h` | Memory consolidation tick |
-| `EPISODE_SYNTHESIS_INTERVAL` | `6h` | Episodic memory synthesis tick |
+| `COGNITIVE_BUFFER_THRESHOLD` | `20` | Min unreflected memories to trigger cognitive processing |
+| `LULL_DURATION` | `20m` | Min user idle time before cognitive processing |
+| `COGNITIVE_CEILING` | `4h` | Max time between cognitive runs |
 | `REFLECTION_MEMORY_THRESHOLD` | `50` | Trigger reflection after this many new memories |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max results from search_memory |
 | `MEMORY_STALENESS_DAYS` | `90` | Prune decayed memories older than this |
 | `CONSOLIDATION_MEMORY_LIMIT` | `50` | Max memories per consolidation pass |
 | `MAX_TOOL_RESULT_LEN` | `2000` | Truncate tool results beyond this |
 | `MAX_WEB_SOURCES` | `2` | Max web pages to read per query |
-| `VRAM_PRESSURE_THRESHOLD` | `15.0` | Evict models when available memory % drops below this |
 | `GMAIL_CREDENTIALS_PATH` | `.credentials/credentials.json` | OAuth credentials file |
 | `GMAIL_TOKEN_PATH` | `.credentials/token.json` | Gmail OAuth token |
 | `CALENDAR_TOKEN_PATH` | `.credentials/calendar_token.json` | Calendar OAuth token |
 
 ## Tools
 
-The orchestrator has access to the following tools:
+The orchestrator has access to the following built-in tools:
 
 | Tool | Description |
 |------|-------------|
 | `search_memory` | Semantic search over long-term memory with query rewriting, multi-embedding retrieval, entity graph hops, and re-ranking |
 | `save_memory` | Persist a fact or preference to long-term memory |
-| `search_web` | Web search via SearXNG |
-| `read_url` | Fetch and summarize a web page |
-| `consult_deep_thinker` | Route complex reasoning to GLM-Z1-32B with full chain-of-thought |
-| `ask_database` | Natural language queries against the PostgreSQL database via Text2SQL |
-| `check_email` | Fetch, triage, and memorize new emails |
-| `send_email` | Send an email (requires Telegram confirmation) |
-| `search_inbox` | Search memorized emails by vector similarity |
-| `check_calendar` | Fetch, triage, and memorize upcoming events |
-| `create_event` | Create a calendar event (requires Telegram confirmation) |
-| `search_calendar` | Search memorized calendar events |
+| `forget_topic` | Delete memories related to a topic by semantic similarity |
 | `consolidate_memory` | Synthesize high-salience memories into the core profile |
+| `bootstrap_profile` | Generate initial identity profile from conversation context |
+| `consult_deep_thinker` | Route complex reasoning to GLM-Z1-32B with full chain-of-thought |
+| `dispatch_subagent` | Delegate structured data processing tasks to GLM-4.7-Flash |
+| `ask_database` | Natural language queries against the PostgreSQL database via Text2SQL |
+| `search_email` | Search Gmail with time bounds and query filters |
+| `send_email` | Send an email (requires Telegram confirmation) |
+| `search_calendar` | Search Google Calendar events with time bounds |
+| `create_event` | Create a calendar event (requires Telegram confirmation) |
 | `add_task` / `complete_task` | Manage scheduled tasks with recurrence |
-| `manage_directives` | Create persistent background habits (e.g., "check email every 2h") |
+| `manage_routines` | Create persistent background habits (e.g., "check email every 2h") |
+| `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
+| `create_skill` / `manage_skills` | Create or manage user-defined JavaScript tools |
+
+**Skills** (user-created JavaScript tools, loaded from `skills/` on startup):
+
+| Skill | Description |
+|-------|-------------|
 | `get_server_time` | Get the current server time |
+| `search_web` | Web search via SearXNG |
+| `read_url` | Fetch and summarize a web page |
 
 ## Memory System
 
 See [docs/memory-system.md](docs/memory-system.md) for the full technical reference.
 
-In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (HNSW index). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a ~30-day half-life and are pruned when stale. Higher-order synthesis layers create episodic memories (6h) and meta-cognitive reflections (7d).
+In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (HNSW index). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a ~30-day half-life and are pruned when stale. Higher-order synthesis layers (consolidation, episodic synthesis, reflection) are triggered by event-driven cognitive processing based on memory volume and user activity lulls.
 
 ## Project Structure
 
@@ -148,34 +159,50 @@ In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (H
 sokratos/
   main.go              # Telegram bot, message loop, prefetch, wiring
   config.go            # Environment variable helpers
+  confirm.go           # Telegram confirmation gate for sensitive tools
+  prefetch.go          # Subconscious memory prefetch for message loop
+  telegram.go          # Telegram helpers (photo download, typing indicator)
   format.go            # Markdown-to-Telegram HTML converter
   db/                  # PostgreSQL connection and schema auto-apply
-    schema.sql         # memories, tasks, directives, processed_* tables
+    schema.sql         # memories, tasks, routines, personality_traits, etc.
   engine/              # Heartbeat loop, context sliding, VRAM auditor, state
-    engine.go          # Tickers: heartbeat, consolidation, episodes, reflection
-    slide.go           # Context window management and archival
-    state.go           # Thread-safe disk-backed agent state
-    vram_auditor.go    # Idle eviction and memory pressure detection
+    engine.go          # Heartbeat: phase 1 routines, phase 2 contextual reasoning
+    cognitive.go       # Event-driven cognitive processing (consolidation, episodes, reflection)
+    routines.go        # Persistent background routine execution
+    scheduler.go       # PostgreSQL-backed task scheduler
+    slide.go           # Context window management and archival (ArchiveDeps)
+    state.go           # Thread-safe in-memory agent state with DB-backed prefs
   llm/                 # LLM client, supervisor pattern, tool intent extraction
     client.go          # Chat API, thinking mode, grammar constraints
+    supervisor.go      # Supervisor loop with regex-based tool parsing
   memory/              # Embedding, storage, scoring, decay, synthesis
-    memory.go          # Core: embed, chunk, save, score, contradict, synthesize
+    save.go            # SaveToMemoryAsync, SaveToMemoryWithSalienceAsync, identity profile
+    embedding.go       # Embed + chunk helpers
+    scoring.go         # Quality scoring (entities, confidence, contradiction detection)
     ranking.go         # Shared SQL ranking formula (RankingOrderBy)
     bm25.go            # Client-side BM25 utilities
+    decay.go           # Salience decay and usefulness regression
+    episodes.go        # Episodic memory synthesis
+    reflection.go      # Meta-cognitive reflection and retrieval tracking
+    personality.go     # Personality traits (DB read/write, prompt formatting)
+    prefetch.go        # Shared prefetch logic for message loop and heartbeat
   tools/               # Tool implementations and registry
-    memory.go          # search_memory, save_memory, entity graph, retrieval tracking
-    deep_thinker_client.go  # Shared HTTP client with think/no-think modes
+    memory.go          # search_memory, save_memory, retrieval tracking
+    triage_conversation.go  # Conversation triage and save (TriageConfig)
     consolidate_memory.go   # Profile synthesis pipeline
-    triage_conversation.go  # Conversation triage and save
-    check_items.go     # Shared email/calendar triage pipeline
-    backfill.go        # Historical email/calendar import
+    deep_thinker_client.go  # Shared HTTP client with think/no-think modes
+    subagent_client.go # Concurrency-limited subagent client
+    base_client.go     # Shared HTTP base for DTC and subagent
+    skills.go          # Skill loader, executor, and registry integration
+    create_skill.go    # create_skill tool (JS validation, test, persist)
+    personality.go     # manage_personality tool
+    transition.go      # Paradigm shift transition memory generation
+    routines.go        # manage_routines tool
+  googleauth/          # OAuth2 helpers for Gmail/Calendar via Telegram
   grammar/             # GBNF grammar builder from tool schemas
-  prompts/             # Embedded prompt templates
-    system.txt         # Main orchestrator system prompt
-    tools.txt          # Tool descriptions for the orchestrator
-    reflection.txt     # Meta-cognitive reflection prompt
-    consolidation.txt  # Profile synthesis prompt
-    *_triage.txt       # Email, calendar, conversation triage prompts
+  prompts/             # Embedded prompt templates (//go:embed)
+  skills/              # User-created JavaScript tools (auto-loaded on startup)
+  timeouts/            # Shared timeout constants (DB, embedding, synthesis)
   models/              # GGUF model files and start.sh
   docker/              # Docker Compose for PostgreSQL + SearXNG
 ```

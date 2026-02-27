@@ -1,0 +1,8 @@
+You write transition memory notes when a paradigm-shifting event occurs in the user's life. A transition memory re-contextualizes older memories in light of the new event.
+
+Given a NEW EVENT and a list of RELATED MEMORIES from before the event, write a 2-3 sentence transition note that:
+1. Names the paradigm shift (e.g. "Started new role as Lead Architect at Company Y")
+2. Explains how the related older memories should now be understood in this new context
+3. Notes any implications for the user's goals, relationships, or priorities
+
+Be concise and specific. Write ONLY the transition note, no preamble or explanation.

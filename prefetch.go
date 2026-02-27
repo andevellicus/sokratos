@@ -1,0 +1,89 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"sokratos/llm"
+	"sokratos/logger"
+	"sokratos/memory"
+	"sokratos/tools"
+)
+
+// prefetchResult holds the subconscious prefetch output: a system message
+// with retrieved context, plus the memory IDs for usefulness feedback.
+type prefetchResult struct {
+	Message   *llm.Message
+	IDs       []int64
+	Summaries string // formatted memory summaries for usefulness evaluation
+}
+
+// subconsciousPrefetch embeds the user's message and retrieves semantically
+// similar memories as background context.
+func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, msgText string, recentMessages []llm.Message) *prefetchResult {
+	// Build trajectory string from recent user messages for contextual vector recall.
+	var trajectoryParts []string
+	count := 0
+	for i := len(recentMessages) - 1; i >= 0 && count < 3; i-- {
+		m := recentMessages[i]
+		if m.Role != "user" {
+			continue
+		}
+		text := m.Content
+		if idx := strings.Index(text, "\n\n[Current Agent State]"); idx > 0 {
+			text = text[:idx]
+		}
+		if len(text) > 200 {
+			text = text[:200]
+		}
+		text = strings.TrimSpace(text)
+		if text != "" {
+			trajectoryParts = append(trajectoryParts, text)
+			count++
+		}
+	}
+	for i, j := 0, len(trajectoryParts)-1; i < j; i, j = i+1, j-1 {
+		trajectoryParts[i], trajectoryParts[j] = trajectoryParts[j], trajectoryParts[i]
+	}
+	trajectoryParts = append(trajectoryParts, msgText)
+	trajectoryStr := strings.Join(trajectoryParts, " | ")
+
+	pf := memory.Prefetch(ctx, pool, embedURL, embedModel, trajectoryStr, msgText, 3)
+	if pf == nil {
+		return nil
+	}
+	return &prefetchResult{
+		Message:   &llm.Message{Role: "user", Content: pf.Content},
+		IDs:       pf.IDs,
+		Summaries: pf.Content,
+	}
+}
+
+// evaluateMemoryUsefulnessViaSubagent calls the subagent to determine whether
+// prefetched memories contributed to the assistant's response.
+func evaluateMemoryUsefulnessViaSubagent(pool *pgxpool.Pool, sc *tools.SubagentClient, memoryIDs []int64, userMsg, assistantReply, memorySummaries string) {
+	ctx, cancel := context.WithTimeout(context.Background(), tools.TimeoutUsefulnessEval)
+	defer cancel()
+
+	prompt := fmt.Sprintf("User message: %s\n\nRetrieved memories:\n%s\n\nAssistant response: %s\n\n"+
+		"Were any of the retrieved memories directly useful in generating this response? "+
+		"Answer with exactly YES or NO.", userMsg, memorySummaries, assistantReply)
+
+	content, err := sc.Complete(ctx,
+		"You evaluate whether specific retrieved memories were useful for generating an assistant response. "+
+			"A memory is useful if its content directly informed or contributed to the response. "+
+			"Topic overlap alone is not sufficient. Answer with exactly YES or NO. Nothing else.",
+		prompt, 16)
+	if err != nil {
+		logger.Log.Warnf("[usefulness] subagent evaluation failed: %v", err)
+		return
+	}
+
+	answer := strings.TrimSpace(strings.ToUpper(content))
+	wasUseful := strings.HasPrefix(answer, "YES")
+	memory.RecordMemoryUsefulness(ctx, pool, memoryIDs, wasUseful)
+	logger.Log.Debugf("[usefulness] memories %v: useful=%v (raw=%q)", memoryIDs, wasUseful, answer)
+}

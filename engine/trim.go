@@ -6,6 +6,14 @@ import (
 	"sokratos/llm"
 )
 
+// DefaultMaxTail is the standard number of recent messages preserved during trimming.
+const DefaultMaxTail = 12
+
+// DefaultTrimFn is a ready-to-use TrimMessages closure with DefaultMaxTail.
+func DefaultTrimFn(msgs []llm.Message) []llm.Message {
+	return TrimMessages(msgs, DefaultMaxTail)
+}
+
 // TrimMessages implements a sliding window over a message slice. It always
 // preserves messages[0] (the system prompt) and keeps the last maxTail
 // messages. If the calculated cutoff lands on a tool-result message, it

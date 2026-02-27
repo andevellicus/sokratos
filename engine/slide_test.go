@@ -47,7 +47,7 @@ func TestSafeCutoffNeverSplitsToolCallPair(t *testing.T) {
 	// Backward from 3: all tool messages → no safe boundary.
 	// Forward from 4: i=4 "what is 2+2?" → safe! safeIndex=4.
 	// Keeps [0] + [4,5] = 3 messages. Tool pair (2,3) removed together, not split.
-	SlideAndArchiveContext(context.Background(), sm, 3, nil, "", "")
+	SlideAndArchiveContext(context.Background(), sm, 3, ArchiveDeps{})
 
 	if len(sm.messages) != 3 {
 		t.Errorf("expected 3 messages after slide, got %d", len(sm.messages))
@@ -83,7 +83,7 @@ func TestCutsAtUserBoundary(t *testing.T) {
 	//   i=4: assistant tool call → isToolCallContent → not safe.
 	//   i=3: user "second question" → not tool msg → safe! safeIndex=3.
 	// Archive msgs[1:3] = [first_q, first_a]. Keep system + msgs[3:] = 6.
-	SlideAndArchiveContext(context.Background(), sm, 4, nil, "", "")
+	SlideAndArchiveContext(context.Background(), sm, 4, ArchiveDeps{})
 
 	if len(sm.messages) != 6 {
 		t.Errorf("expected 6 messages after slide, got %d", len(sm.messages))
@@ -118,7 +118,7 @@ func TestCutsAtAssistantBoundary(t *testing.T) {
 	//   i=3: assistant tool call → isToolCallContent → not safe.
 	//   i=2: assistant "a1" → not tool call → safe! safeIndex=2.
 	// Archive msgs[1:2] = [q1]. Keep system + msgs[2:] = 6.
-	SlideAndArchiveContext(context.Background(), sm, 3, nil, "", "")
+	SlideAndArchiveContext(context.Background(), sm, 3, ArchiveDeps{})
 
 	if len(sm.messages) != 6 {
 		t.Errorf("expected 6 messages after slide, got %d", len(sm.messages))
@@ -152,7 +152,7 @@ func TestAllToolMessages_Aborts(t *testing.T) {
 	// Backward from 4: all tool messages → no safe boundary.
 	// Forward from 5: i=5 "finally a real question" → safe! safeIndex=5.
 	// Keeps [0] + [5,6] = 3 messages. Both tool pairs removed together.
-	SlideAndArchiveContext(context.Background(), sm, 3, nil, "", "")
+	SlideAndArchiveContext(context.Background(), sm, 3, ArchiveDeps{})
 
 	if len(sm.messages) != 3 {
 		t.Errorf("expected 3 messages after slide, got %d", len(sm.messages))

@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,44 +12,27 @@ import (
 )
 
 // DeepThinkerClient owns the shared HTTP client, URL, and model for all
-// deep-thinker interactions (triage, consolidation, consult).
+// deep-thinker interactions (triage, consolidation, consult). A semaphore
+// limits concurrency to 1, matching Z1's single 32K slot.
 type DeepThinkerClient struct {
-	URL      string
-	Model    string
-	client   *http.Client
-	OnAccess func() // called on every successful request to keep VRAM auditor informed
+	baseClient
+	sem chan struct{}
 }
 
 // NewDeepThinkerClient returns a ready-to-use client with a shared 120s HTTP
-// transport.
+// transport and a concurrency semaphore of 1 (Z1 runs --parallel 1 with full
+// 32K context for heavy reasoning; subagent overflow queues behind DTC).
 func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 	return &DeepThinkerClient{
-		URL:    url,
-		Model:  model,
-		client: &http.Client{Timeout: TimeoutDeepThinker},
+		baseClient: baseClient{
+			URL:    url,
+			Model:  model,
+			client: &http.Client{Timeout: TimeoutDeepThinker},
+			cb:     newCircuitBreaker("dtc"),
+			logTag: "[dtc]",
+		},
+		sem: make(chan struct{}, 1),
 	}
-}
-
-// dtcRequest is the payload sent to /v1/chat/completions.
-type dtcRequest struct {
-	Model       string       `json:"model,omitempty"`
-	Messages    []dtcMessage `json:"messages"`
-	Temperature float64      `json:"temperature"`
-	MaxTokens   int          `json:"max_tokens"`
-	Think       *bool        `json:"think,omitempty"` // when false, disables chain-of-thought reasoning (llama-server)
-}
-
-type dtcMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type dtcResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
 }
 
 // triageResult is the structured output from a triage call.
@@ -60,6 +42,7 @@ type triageResult struct {
 	Category      string   `json:"category"`
 	Tags          []string `json:"tags"`
 	Save          *bool    `json:"save,omitempty"`
+	ParadigmShift bool     `json:"paradigm_shift,omitempty"`
 }
 
 // Complete sends a system+user message pair to the deep thinker and returns the
@@ -79,7 +62,25 @@ func (d *DeepThinkerClient) CompleteNoThink(ctx context.Context, systemPrompt, u
 // complete is the internal implementation shared by Complete and Triage.
 // When think is non-nil, it is sent as the "think" parameter to llama-server,
 // allowing triage calls to disable chain-of-thought reasoning for lower latency.
+// Sends a lightweight probe to verify the model is responding before the real request.
 func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userContent string, maxTokens int, think *bool) (string, error) {
+	if err := d.cb.check(); err != nil {
+		return "", err
+	}
+
+	// Acquire the DTC slot before hitting the server.
+	select {
+	case d.sem <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-d.sem }()
+
+	if err := d.ensureLoaded(ctx); err != nil {
+		d.cb.recordFailure()
+		return "", fmt.Errorf("model not available: %w", err)
+	}
+
 	payload := dtcRequest{
 		Model: d.Model,
 		Messages: []dtcMessage{
@@ -96,42 +97,15 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, d.URL+"/v1/chat/completions", bytes.NewReader(body))
+	result, err := d.doRequest(ctx, body)
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := d.client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("server returned status %d", resp.StatusCode)
+		d.cb.recordFailure()
+		return "", err
 	}
 
-	var raw dtcResponse
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
-	}
-
-	if len(raw.Choices) == 0 {
-		return "", fmt.Errorf("server returned empty choices array")
-	}
-
-	// Notify the VRAM auditor that the model was just used, preventing
-	// idle eviction between frequent triage/consolidation calls.
-	if d.OnAccess != nil {
-		d.OnAccess()
-	}
-
-	return strings.TrimSpace(raw.Choices[0].Message.Content), nil
+	d.cb.recordSuccess()
+	return result, nil
 }
-
-// thinkFalse is a reusable pointer to false for triage requests.
-var thinkFalse = func() *bool { b := false; return &b }()
 
 // Triage calls the deep thinker with thinking disabled (structured classification
 // doesn't benefit from chain-of-thought, and it cuts latency significantly).
@@ -142,9 +116,7 @@ func (d *DeepThinkerClient) Triage(ctx context.Context, systemPrompt, userConten
 		return nil, err
 	}
 
-	content = textutil.StripThinkTags(content)
-	content = textutil.StripCodeFences(content)
-	content = textutil.ExtractJSON(content)
+	content = textutil.CleanLLMJSON(content)
 
 	var result triageResult
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
@@ -177,4 +149,3 @@ func (d *DeepThinkerClient) TriageItem(ctx context.Context, systemPrompt, format
 	}
 	return result, err
 }
-

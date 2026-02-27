@@ -43,9 +43,9 @@ func ParseMessage(msg *gm.Message) Email {
 			e.Subject = h.Value
 		case "date":
 			if t, err := time.Parse(time.RFC1123Z, h.Value); err == nil {
-				e.Date = t
+				e.Date = t.Local()
 			} else if t, err := time.Parse("Mon, 2 Jan 2006 15:04:05 -0700", h.Value); err == nil {
-				e.Date = t
+				e.Date = t.Local()
 			}
 		}
 	}
@@ -76,40 +76,6 @@ func FetchEmails(svc *gm.Service, query string, maxResults int64) ([]Email, erro
 	}
 
 	return emails, nil
-}
-
-// FormatForEmbedding produces a full-text block for vector embedding that
-// includes headers, body (truncated to ~1200 chars), and triage results.
-func FormatForEmbedding(e Email, triageSummary string) string {
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "From: %s\n", e.From)
-	fmt.Fprintf(&b, "To: %s\n", e.To)
-	if e.CC != "" {
-		fmt.Fprintf(&b, "CC: %s\n", e.CC)
-	}
-	if e.BCC != "" {
-		fmt.Fprintf(&b, "BCC: %s\n", e.BCC)
-	}
-	fmt.Fprintf(&b, "Subject: %s\n", e.Subject)
-	if !e.Date.IsZero() {
-		fmt.Fprintf(&b, "Date: %s\n", e.Date.Format("2006-01-02"))
-	}
-
-	body := e.Body
-	if body == "" {
-		body = e.Snippet
-	}
-	if len(body) > 1200 {
-		body = body[:1200] + "..."
-	}
-	fmt.Fprintf(&b, "\n%s\n", body)
-
-	if triageSummary != "" {
-		fmt.Fprintf(&b, "\n%s", triageSummary)
-	}
-
-	return b.String()
 }
 
 // FormatEmailSummary returns a human-readable summary of an email,

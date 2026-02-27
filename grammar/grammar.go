@@ -75,7 +75,7 @@ number ::= [0-9]+ ("." [0-9]+)?
 boolean ::= "true" | "false"
 string-array ::= "[" ws "]" | "[" ws string (ws "," ws string)* ws "]"
 
-root ::= "{" ws "\"salience_score\"" ws ":" ws number ws "," ws "\"summary\"" ws ":" ws string ws "," ws "\"category\"" ws ":" ws string ws "," ws "\"tags\"" ws ":" ws string-array ws "," ws "\"save\"" ws ":" ws boolean ws "}"
+root ::= "{" ws "\"salience_score\"" ws ":" ws number ws "," ws "\"summary\"" ws ":" ws string ws "," ws "\"category\"" ws ":" ws string ws "," ws "\"tags\"" ws ":" ws string-array ws "," ws "\"save\"" ws ":" ws boolean ws "," ws "\"paradigm_shift\"" ws ":" ws boolean ws "}"
 `
 }
 

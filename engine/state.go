@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/timeouts"
 )
 
 // Task represents a row in the PostgreSQL tasks table.
@@ -49,10 +52,11 @@ func (s AgentState) ToMarkdown() string {
 // (status, current_task, step_count) live in memory only. User preferences are
 // backed by the user_preferences table in PostgreSQL.
 type StateManager struct {
-	mu       sync.RWMutex
-	state    AgentState
-	pool     *pgxpool.Pool // nil when running without database
-	messages []llm.Message // conversation context (not persisted)
+	mu               sync.RWMutex
+	state            AgentState
+	pool             *pgxpool.Pool // nil when running without database
+	messages         []llm.Message // conversation context (not persisted)
+	lastUserActivity time.Time     // last time a user message was received
 }
 
 // NewStateManager creates a StateManager. If pool is non-nil, it loads user
@@ -86,7 +90,7 @@ func (sm *StateManager) RefreshPrefs() {
 // loadPrefsFromDB reads all user preferences from the database into memory.
 // Caller must hold sm.mu.
 func (sm *StateManager) loadPrefsFromDB() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 	defer cancel()
 
 	rows, err := sm.pool.Query(ctx, `SELECT key, value FROM user_preferences`)
@@ -142,7 +146,7 @@ func (sm *StateManager) SetPref(key, value string) error {
 	sm.state.UserPrefs[key] = value
 
 	if sm.pool != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 		defer cancel()
 		_, err := sm.pool.Exec(ctx,
 			`INSERT INTO user_preferences (key, value, updated_at)
@@ -164,7 +168,7 @@ func (sm *StateManager) DeletePref(key string) error {
 	delete(sm.state.UserPrefs, key)
 
 	if sm.pool != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 		defer cancel()
 		_, err := sm.pool.Exec(ctx,
 			`DELETE FROM user_preferences WHERE key = $1`, key)
@@ -199,4 +203,53 @@ func (sm *StateManager) MessageCount() int {
 	defer sm.mu.RUnlock()
 
 	return len(sm.messages)
+}
+
+// TouchUserActivity records that a user message was received right now.
+func (sm *StateManager) TouchUserActivity() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.lastUserActivity = time.Now()
+}
+
+// LastUserActivity returns the time of the last user message.
+func (sm *StateManager) LastUserActivity() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	return sm.lastUserActivity
+}
+
+// SlideMessages atomically removes messages[1:cutoff] from the conversation
+// context after verifying the fingerprint still matches. Returns true if the
+// slide was applied.
+func (sm *StateManager) SlideMessages(cutoff int, expectedFP [32]byte) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if len(sm.messages) <= cutoff {
+		logger.Log.Warnf("[slide] messages changed (len=%d, cutoff=%d); aborting", len(sm.messages), cutoff)
+		return false
+	}
+
+	currentFP := fingerprintMessages(sm.messages[1:cutoff])
+	if expectedFP != currentFP {
+		logger.Log.Warnf("[slide] fingerprint mismatch; aborting slide")
+		return false
+	}
+
+	kept := make([]llm.Message, 0, 1+len(sm.messages)-cutoff)
+	kept = append(kept, sm.messages[0])
+	kept = append(kept, sm.messages[cutoff:]...)
+	sm.messages = kept
+
+	logger.Log.Infof("[slide] removed %d messages (kept %d)", cutoff-1, len(sm.messages))
+	return true
+}
+
+// fingerprintMessages returns a SHA-256 hash of the JSON-serialized messages.
+func fingerprintMessages(msgs []llm.Message) [32]byte {
+	data, _ := json.Marshal(msgs)
+	return sha256.Sum256(data)
 }

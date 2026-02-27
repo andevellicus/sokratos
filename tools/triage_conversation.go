@@ -8,45 +8,27 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
 )
 
-// GraniteTriageConfig holds the dependencies for routing conversation triage
-// through the Granite tool agent with GBNF grammar constraints.
-type GraniteTriageConfig struct {
-	Client  *llm.Client
-	Model   string
-	Grammar string
-}
-
-// TriageViaGranite sends content to Granite with a GBNF-constrained grammar
-// and parses the result into a triageResult. Falls back to safe defaults on
-// parse failure (Granite should always produce valid JSON via grammar, but
-// defensive coding is cheap).
-func TriageViaGranite(ctx context.Context, cfg *GraniteTriageConfig, systemPrompt, content string, maxLen int) (*triageResult, error) {
+// TriageViaSubagent sends content to the subagent with a GBNF-constrained
+// grammar and parses the result into a triageResult. Falls back to safe
+// defaults on parse failure.
+func TriageViaSubagent(ctx context.Context, sc *SubagentClient, triageGrammar, systemPrompt, content string, maxLen int) (*triageResult, error) {
 	if len(content) > maxLen {
 		content = content[:maxLen] + "..."
 	}
 
-	resp, err := cfg.Client.Chat(ctx, llm.ChatRequest{
-		Model: cfg.Model,
-		Messages: []llm.Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: content},
-		},
-		Grammar: cfg.Grammar,
-	})
+	raw, err := sc.CompleteWithGrammar(ctx, systemPrompt, content, triageGrammar, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("granite triage request: %w", err)
+		return nil, fmt.Errorf("subagent triage request: %w", err)
 	}
 
-	raw := strings.TrimSpace(resp.Message.Content)
 	var result triageResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		logger.Log.Warnf("[conversation_triage] granite parse failure, using fallback: %v (raw: %s)", err, raw)
+		logger.Log.Warnf("[conversation_triage] subagent parse failure, using fallback: %v (raw: %s)", err, raw)
 		summary := content
 		if len(summary) > 200 {
 			summary = summary[:200] + "..."
@@ -79,13 +61,27 @@ func CleanupPreTriageMemories(pool *pgxpool.Pool) {
 	logger.Log.Infof("[cleanup] deleted %d pre-triage conversation memories", result.RowsAffected())
 }
 
+// TriageConfig groups dependencies for conversation triage and memory save.
+type TriageConfig struct {
+	Pool          *pgxpool.Pool
+	EmbedEndpoint string
+	EmbedModel    string
+	DTC           *DeepThinkerClient
+	SubagentFn    memory.SubagentFunc
+	Subagent      *SubagentClient
+	TriageGrammar string
+}
+
 // TriageAndSaveConversationAsync sends a conversation exchange for triage
-// scoring, then saves it to memory if it contains new information (salience >= 3).
-// When graniteTriage is non-nil, routes through Granite with GBNF grammar;
-// otherwise falls back to the deep thinker. When granite (GraniteFunc) is
-// non-nil, contradiction detection and quality scoring are applied on save.
+// scoring, then saves it to memory if it meets the salience threshold.
+// When toolsUsed is true (exchange was grounded by tool results), the threshold
+// is 3. When false (pure parametric knowledge), the threshold is raised to 5
+// to prevent hallucinated facts from entering memory and creating feedback loops.
+// When Subagent is non-nil, routes through the subagent with GBNF grammar;
+// otherwise falls back to the deep thinker. When SubagentFn is non-nil,
+// contradiction detection and quality scoring are applied on save.
 // Runs as a fire-and-forget goroutine.
-func TriageAndSaveConversationAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, dtc *DeepThinkerClient, granite memory.GraniteFunc, graniteTriage *GraniteTriageConfig, exchange string) {
+func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed bool) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
 		defer cancel()
@@ -94,10 +90,10 @@ func TriageAndSaveConversationAsync(pool *pgxpool.Pool, embedEndpoint, embedMode
 
 		var result *triageResult
 		var err error
-		if graniteTriage != nil {
-			result, err = TriageViaGranite(ctx, graniteTriage, triagePrompt, exchange, 4000)
+		if cfg.Subagent != nil && cfg.TriageGrammar != "" {
+			result, err = TriageViaSubagent(ctx, cfg.Subagent, cfg.TriageGrammar, triagePrompt, exchange, 4000)
 		} else {
-			result, err = dtc.TriageItem(ctx, triagePrompt, exchange, 4000)
+			result, err = cfg.DTC.TriageItem(ctx, triagePrompt, exchange, 4000)
 		}
 		if err != nil {
 			logger.Log.Warnf("[conversation_triage] triage failed: %v", err)
@@ -108,8 +104,16 @@ func TriageAndSaveConversationAsync(pool *pgxpool.Pool, embedEndpoint, embedMode
 			logger.Log.Debugf("[conversation_triage] save=%v for exchange (score=%.0f)", *result.Save, result.SalienceScore)
 		}
 
-		if result.SalienceScore < 3 {
-			logger.Log.Infof("[conversation_triage] skipped (score=%.0f): %s", result.SalienceScore, result.Summary)
+		threshold := float64(3)
+		if !toolsUsed {
+			threshold = 5
+		}
+		if result.SalienceScore < threshold {
+			if !toolsUsed && result.SalienceScore >= 3 {
+				logger.Log.Infof("[conversation_triage] skipped (unverified, score=%.0f): %s", result.SalienceScore, result.Summary)
+			} else {
+				logger.Log.Infof("[conversation_triage] skipped (score=%.0f): %s", result.SalienceScore, result.Summary)
+			}
 			return
 		}
 
@@ -118,24 +122,28 @@ func TriageAndSaveConversationAsync(pool *pgxpool.Pool, embedEndpoint, embedMode
 		text := fmt.Sprintf("%s\n\nSource exchange:\n%s", result.Summary, exchange)
 		tags := append([]string{"conversation"}, result.Tags...)
 
-		if granite != nil {
-			req := memory.MemoryWriteRequest{
-				Summary:       text,
-				Tags:          tags,
-				Salience:      result.SalienceScore,
-				MemoryType:    "general",
-				Source:        "conversation",
-				EmbedEndpoint: embedEndpoint,
-				EmbedModel:    embedModel,
-			}
-			if _, err := memory.CheckAndWriteWithContradiction(ctx, pool, req, granite); err != nil {
+		req := memory.MemoryWriteRequest{
+			Summary:       text,
+			Tags:          tags,
+			Salience:      result.SalienceScore,
+			MemoryType:    "general",
+			Source:        "conversation",
+			EmbedEndpoint: cfg.EmbedEndpoint,
+			EmbedModel:    cfg.EmbedModel,
+		}
+		if cfg.SubagentFn != nil {
+			if _, err := memory.CheckAndWriteWithContradiction(ctx, cfg.Pool, req, cfg.SubagentFn); err != nil {
 				logger.Log.Warnf("[conversation_triage] contradiction-checked save failed: %v", err)
 				return
 			}
 		} else {
-			memory.SaveToMemoryWithSalienceAsync(pool, embedEndpoint, embedModel, text, result.SalienceScore, tags, "conversation", nil)
+			memory.SaveToMemoryWithSalienceAsync(cfg.Pool, req, nil)
 		}
 
 		logger.Log.Infof("[conversation_triage] saved (score=%.0f, category=%s, tags=%v): %s", result.SalienceScore, result.Category, tags, result.Summary)
+
+		if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {
+			GenerateTransitionMemoryAsync(cfg.Pool, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.DTC, result.Summary, tags)
+		}
 	}()
 }

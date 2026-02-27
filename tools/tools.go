@@ -26,9 +26,12 @@ type ParamSchema struct {
 }
 
 // ToolSchema describes a tool's name and parameter types for grammar generation.
+// Description is optional — when set, the tool is included in dynamic tool
+// descriptions for the tool agent (used by skills and other runtime-registered tools).
 type ToolSchema struct {
-	Name   string
-	Params []ParamSchema
+	Name        string
+	Params      []ParamSchema
+	Description string
 }
 
 // Registry maps tool names to their implementations and optional schemas.
@@ -43,6 +46,19 @@ func NewRegistry() *Registry {
 		tools:   make(map[string]ToolFunc),
 		schemas: make(map[string]ToolSchema),
 	}
+}
+
+// Has returns true if a tool with the given name is registered.
+func (r *Registry) Has(name string) bool {
+	_, ok := r.tools[name]
+	return ok
+}
+
+// Unregister removes a tool from the registry.
+func (r *Registry) Unregister(name string) {
+	delete(r.tools, name)
+	delete(r.schemas, name)
+	logger.Log.Infof("[tools] unregistered %s", name)
 }
 
 // Register adds a tool to the registry with an optional schema for grammar generation.
@@ -79,6 +95,36 @@ func (r *Registry) Schemas() []ToolSchema {
 		},
 	})
 	return schemas
+}
+
+// DynamicToolDescriptions returns formatted descriptions for tools that have a
+// non-empty Description field (typically runtime-registered skills). These are
+// appended to the static prompts.Tools content for the tool agent's system prompt.
+func (r *Registry) DynamicToolDescriptions() string {
+	var b strings.Builder
+	for _, s := range r.schemas {
+		if s.Description == "" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(s.Name)
+		b.WriteString(": ")
+		b.WriteString(s.Description)
+		if len(s.Params) > 0 {
+			b.WriteString(" Arguments: {")
+			for i, p := range s.Params {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "\"%s\": \"<%s>\"", p.Name, p.Type)
+			}
+			b.WriteString("}")
+		} else {
+			b.WriteString(" No arguments.")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // Execute parses raw JSON into a ToolCall, looks up the tool, and invokes it.
