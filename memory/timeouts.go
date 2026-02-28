@@ -1,10 +1,15 @@
 package memory
 
-import "time"
+import (
+	"time"
+
+	"sokratos/timeouts"
+)
 
 const (
-	TimeoutEmbeddingCall      = 10 * time.Second
-	TimeoutSaveOp             = 30 * time.Second
-	TimeoutQualityScore       = 10 * time.Second
-	TimeoutContradictionCheck = 8 * time.Second
+	TimeoutEmbeddingCall       = 10 * time.Second
+	TimeoutSaveOp              = timeouts.MemorySave
+	TimeoutQualityScore        = 20 * time.Second
+	TimeoutContradictionCheck  = 20 * time.Second
+	TimeoutQualityEnrich       = 30 * time.Second
 )

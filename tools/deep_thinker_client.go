@@ -4,11 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"strings"
 
-	"sokratos/logger"
-	"sokratos/textutil"
+	"sokratos/httputil"
 )
 
 // DeepThinkerClient owns the shared HTTP client, URL, and model for all
@@ -27,7 +24,7 @@ func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 		baseClient: baseClient{
 			URL:    url,
 			Model:  model,
-			client: &http.Client{Timeout: TimeoutDeepThinker},
+			client: httputil.NewClient(TimeoutDeepThinker),
 			cb:     newCircuitBreaker("dtc"),
 			logTag: "[dtc]",
 		},
@@ -59,9 +56,8 @@ func (d *DeepThinkerClient) CompleteNoThink(ctx context.Context, systemPrompt, u
 	return d.complete(ctx, systemPrompt, userContent, maxTokens, thinkFalse)
 }
 
-// complete is the internal implementation shared by Complete and Triage.
-// When think is non-nil, it is sent as the "think" parameter to llama-server,
-// allowing triage calls to disable chain-of-thought reasoning for lower latency.
+// complete is the internal implementation shared by Complete and CompleteNoThink.
+// When think is non-nil, it is sent as the "think" parameter to llama-server.
 // Sends a lightweight probe to verify the model is responding before the real request.
 func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userContent string, maxTokens int, think *bool) (string, error) {
 	if err := d.cb.check(); err != nil {
@@ -77,7 +73,7 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 	defer func() { <-d.sem }()
 
 	if err := d.ensureLoaded(ctx); err != nil {
-		d.cb.recordFailure()
+		d.cb.recordFailureIfServer(err)
 		return "", fmt.Errorf("model not available: %w", err)
 	}
 
@@ -99,7 +95,7 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 
 	result, err := d.doRequest(ctx, body)
 	if err != nil {
-		d.cb.recordFailure()
+		d.cb.recordFailureIfServer(err)
 		return "", err
 	}
 
@@ -107,45 +103,3 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 	return result, nil
 }
 
-// Triage calls the deep thinker with thinking disabled (structured classification
-// doesn't benefit from chain-of-thought, and it cuts latency significantly).
-// Strips any residual think tags and code fences, then unmarshals the JSON result.
-func (d *DeepThinkerClient) Triage(ctx context.Context, systemPrompt, userContent string) (*triageResult, error) {
-	content, err := d.complete(ctx, systemPrompt, userContent, 2048, thinkFalse)
-	if err != nil {
-		return nil, err
-	}
-
-	content = textutil.CleanLLMJSON(content)
-
-	var result triageResult
-	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return nil, fmt.Errorf("parse triage JSON: %w (raw: %s)", err, content)
-	}
-	return &result, nil
-}
-
-// TriageItem truncates formattedText to maxLen, then calls Triage. This is the
-// common entry point for email, calendar, and conversation triage.
-// On parse errors (model returned non-JSON), returns fallback defaults instead
-// of propagating the error. Network/HTTP errors still propagate.
-func (d *DeepThinkerClient) TriageItem(ctx context.Context, systemPrompt, formattedText string, maxLen int) (*triageResult, error) {
-	if len(formattedText) > maxLen {
-		formattedText = formattedText[:maxLen] + "..."
-	}
-	result, err := d.Triage(ctx, systemPrompt, formattedText)
-	if err != nil && strings.Contains(err.Error(), "parse triage JSON") {
-		// Model returned non-JSON — degrade gracefully with safe defaults.
-		logger.Log.Warnf("[triage] parse failure, using fallback defaults: %v", err)
-		summary := formattedText
-		if len(summary) > 200 {
-			summary = summary[:200] + "..."
-		}
-		return &triageResult{
-			SalienceScore: 5,
-			Summary:       summary,
-			Tags:          nil,
-		}, nil
-	}
-	return result, err
-}

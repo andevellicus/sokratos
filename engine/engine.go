@@ -14,6 +14,7 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/timefmt"
 	"sokratos/timeouts"
 )
 
@@ -60,11 +61,15 @@ type Engine struct {
 	PersonalityContent string        // personality traits markdown for system prompt injection
 	ProfileContent     string        // identity profile JSON for system prompt injection
 
+	MaintenanceInterval time.Duration        // interval between maintenance runs (decay, pruning); 0 = 30m default
 	MemoryStalenessDays int                  // prune stale memories older than this many days (0 = disabled)
 	SendFunc            func(text string)    // sends a message to the user via Telegram
 	InterruptChan       chan struct{}        // signals the task scheduler to recalculate
 	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
-	SubagentFunc        memory.SubagentFunc  // for conversation archive distillation (nil = skip distillation)
+	SubagentFunc        memory.SubagentFunc        // for conversation archive distillation (nil = skip distillation)
+	GrammarFunc         memory.GrammarSubagentFunc // for grammar-constrained quality scoring (nil = skip enrichment)
+	QueueFunc           memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
+	OnFirstTick         func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
 
 	// Internal timers (not configured externally).
 	lastCognitiveRun   time.Time
@@ -110,7 +115,7 @@ func (e *Engine) sendDeduped(text, logLabel string) bool {
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.
 func (e *Engine) archiveDeps() ArchiveDeps {
-	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, SubagentFn: e.SubagentFunc}
+	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, SubagentFn: e.SubagentFunc, GrammarFn: e.GrammarFunc, QueueFn: e.QueueFunc}
 }
 
 // Run starts a blocking loop that fires at the given interval. Each tick, it
@@ -141,9 +146,18 @@ func (e *Engine) Run() {
 	logger.Log.Infof("[engine] heartbeat started (interval: %s, buffer: %d, lull: %s, ceiling: %s)",
 		e.Interval, e.Cognitive.BufferThreshold, e.Cognitive.LullDuration, e.Cognitive.Ceiling)
 
+	firstTick := true
 	for {
 		<-heartbeat.C
 		e.heartbeatTick()
+
+		// Run deferred startup work (e.g. consolidation) after the first
+		// heartbeat completes, so Z1 is available for interactive requests
+		// during startup instead of being blocked by consolidation.
+		if firstTick && e.OnFirstTick != nil {
+			go e.OnFirstTick()
+			firstTick = false
+		}
 	}
 }
 
@@ -227,6 +241,16 @@ type heartbeatMemory struct {
 	CreatedAt time.Time
 }
 
+// backgroundTask represents a background plan_and_execute task for heartbeat context.
+type backgroundTask struct {
+	ID        int64
+	Directive string
+	Status    string
+	Priority  int
+	Progress  string // "2/5"
+	ErrMsg    *string
+}
+
 // heartbeatContext holds working memory gathered from Postgres for Phase 2.
 type heartbeatContext struct {
 	currentTime      string
@@ -234,6 +258,7 @@ type heartbeatContext struct {
 	userLastActive   string // RFC3339 timestamp of last user message
 	tasks            []heartbeatTask
 	memories         []heartbeatMemory
+	backgroundTasks  []backgroundTask
 }
 
 // executivePromptBase is the template for the Phase 2 system message.
@@ -503,7 +528,7 @@ func (e *Engine) heartbeatPhase2Orchestrator(contextXML, stalenessNote string, c
 // affected section is left empty — the orchestrator still runs with partial context.
 func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	hc := heartbeatContext{
-		currentTime:      time.Now().Format(time.RFC3339),
+		currentTime:      timefmt.Now(),
 		currentObjective: e.SM.GetState().CurrentTask,
 	}
 	if la := e.SM.LastUserActivity(); !la.IsZero() {
@@ -562,6 +587,33 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 		memRows.Close()
 	}
 
+	// Query 3: Background tasks (running + recently completed within 1h).
+	bgRows, err := e.DB.Query(queryCtx,
+		`SELECT id, directive, status, COALESCE(priority, 5), steps_total, steps_completed, error_message
+		 FROM background_tasks
+		 WHERE status = 'running'
+		    OR (status IN ('completed', 'failed') AND completed_at >= NOW() - INTERVAL '1 hour')
+		 ORDER BY
+		    CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+		    priority DESC,
+		    created_at DESC
+		 LIMIT 5`)
+	if err != nil {
+		logger.Log.Warnf("heartbeat: failed to query background tasks: %v", err)
+	} else {
+		for bgRows.Next() {
+			var bt backgroundTask
+			var stepsTotal, stepsCompleted int
+			if err := bgRows.Scan(&bt.ID, &bt.Directive, &bt.Status, &bt.Priority, &stepsTotal, &stepsCompleted, &bt.ErrMsg); err != nil {
+				logger.Log.Warnf("heartbeat: failed to scan background task row: %v", err)
+				continue
+			}
+			bt.Progress = fmt.Sprintf("%d/%d", stepsCompleted, stepsTotal)
+			hc.backgroundTasks = append(hc.backgroundTasks, bt)
+		}
+		bgRows.Close()
+	}
+
 	return hc
 }
 
@@ -611,6 +663,26 @@ func (hc heartbeatContext) toXML() string {
 				t.ID, due, t.Description)
 		}
 		b.WriteString("  </pending_tasks>\n")
+	}
+
+	// Background tasks.
+	if len(hc.backgroundTasks) == 0 {
+		b.WriteString("  <background_tasks>none</background_tasks>\n")
+	} else {
+		b.WriteString("  <background_tasks>\n")
+		for _, bt := range hc.backgroundTasks {
+			errAttr := ""
+			if bt.ErrMsg != nil && *bt.ErrMsg != "" {
+				errAttr = fmt.Sprintf(" error=%q", *bt.ErrMsg)
+			}
+			dir := bt.Directive
+			if len(dir) > 80 {
+				dir = dir[:77] + "..."
+			}
+			fmt.Fprintf(&b, "    <bg_task id=\"%d\" status=\"%s\" priority=\"%d\" progress=\"%s\"%s>%s</bg_task>\n",
+				bt.ID, bt.Status, bt.Priority, bt.Progress, errAttr, dir)
+		}
+		b.WriteString("  </background_tasks>\n")
 	}
 
 	b.WriteString("</heartbeat_context>")

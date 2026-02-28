@@ -9,22 +9,28 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/timefmt"
 )
 
 const salienceThreshold = 8
 
-// validateProfile checks that a profile map has minimum required structure.
-func validateProfile(profile map[string]any) error {
-	if _, ok := profile["name"]; !ok {
-		return fmt.Errorf("profile missing required 'name' key")
+// validateProfile checks that a merge didn't lose data. currentMap is the
+// profile before the merge — any key present in currentMap must survive in
+// mergedMap (the merge should never drop existing fields).
+func validateProfile(mergedMap, currentMap map[string]any) error {
+	for key := range currentMap {
+		if _, ok := mergedMap[key]; !ok {
+			return fmt.Errorf("merge dropped existing key %q", key)
+		}
 	}
-	if len(profile) < 2 {
-		return fmt.Errorf("profile has only %d top-level key(s), need at least 2", len(profile))
+	if len(mergedMap) < len(currentMap) {
+		return fmt.Errorf("merged profile shrank from %d to %d keys", len(currentMap), len(mergedMap))
 	}
 	return nil
 }
@@ -203,11 +209,18 @@ type ConsolidateOpts struct {
 	MaxPromptChars    int // soft cap on user-content chars to avoid exceeding model context; 0 = 14000
 }
 
+// memoryMerge describes a group of redundant memories to merge.
+type memoryMerge struct {
+	SourceIDs     []int  `json:"source_ids"`
+	MergedSummary string `json:"merged_summary"`
+}
+
 // consolidationOutput is the expected dual structure from the consolidation prompt.
 type consolidationOutput struct {
 	ProfileUpdates     json.RawMessage     `json:"profile_updates"`
-	UserProfile        json.RawMessage     `json:"user_profile"`         // legacy fallback
+	UserProfile        json.RawMessage     `json:"user_profile"` // legacy fallback
 	PersonalityUpdates []personalityUpdate `json:"personality_updates"`
+	MemoryMerges       []memoryMerge       `json:"memory_merges"`
 }
 
 // profileData returns whichever of ProfileUpdates or UserProfile is present.
@@ -232,7 +245,7 @@ type personalityUpdate struct {
 // When memories exceed the context budget, they are processed in batches with
 // the profile incrementally updated between rounds.
 // Returns the count of memories synthesized.
-func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, opts ConsolidateOpts) (int, error) {
+func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, opts ConsolidateOpts, grammarFn memory.GrammarSubagentFunc) (int, error) {
 	memories, err := QueryHighSalienceMemories(ctx, pool, opts.SalienceThreshold, opts.MemoryLimit)
 	if err != nil {
 		return 0, fmt.Errorf("query high-salience memories: %w", err)
@@ -274,16 +287,18 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 			memBudget = 500
 		}
 
-		// Fill this batch up to the memory budget.
+		// Fill this batch up to the memory budget, tracking IDs for merge validation.
 		included := 0
 		used := 0
-		for i, m := range remaining {
-			line := fmt.Sprintf("%d. %s\n", i+1, m)
+		var batchIDs []int
+		for _, m := range remaining {
+			line := fmt.Sprintf("[id=%d] %s\n", m.ID, m.Summary)
 			if used+len(line) > memBudget && included > 0 {
 				break
 			}
 			fixedPrompt.WriteString(line)
 			used += len(line)
+			batchIDs = append(batchIDs, m.ID)
 			included++
 		}
 		remaining = remaining[included:]
@@ -292,14 +307,22 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 			logger.Log.Infof("[consolidate] batch %d: processing %d memories (%d remaining)", batch, included, len(remaining))
 		}
 
-		raw, cErr := dtc.CompleteNoThink(ctx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
+		var reqCtx context.Context
+		var cancel context.CancelFunc
+		if opts.Timeout > 0 {
+			reqCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		} else {
+			reqCtx, cancel = context.WithTimeout(ctx, 10*time.Minute)
+		}
+		raw, cErr := dtc.CompleteNoThink(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
+		cancel()
 		if cErr != nil {
 			return totalProcessed, fmt.Errorf("consolidation request (batch %d): %w", batch, cErr)
 		}
 
 		raw = textutil.CleanLLMJSON(raw)
 
-		updatedProfile, n, aErr := applyConsolidationResult(ctx, pool, embedEndpoint, embedModel, raw, currentProfile, included)
+		updatedProfile, n, aErr := applyConsolidationResult(ctx, pool, embedEndpoint, embedModel, raw, currentProfile, included, batchIDs, grammarFn)
 		if aErr != nil {
 			return totalProcessed, fmt.Errorf("apply consolidation (batch %d): %w", batch, aErr)
 		}
@@ -314,8 +337,8 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 
 // buildConsolidationPrompt constructs the fixed (non-memory) portion of the
 // consolidation prompt. Returns a builder ready for memory lines to be appended.
-func buildConsolidationPrompt(currentProfile string, traits []memory.PersonalityTrait) strings.Builder {
-	var b strings.Builder
+func buildConsolidationPrompt(currentProfile string, traits []memory.PersonalityTrait) *strings.Builder {
+	b := &strings.Builder{}
 	b.WriteString("CURRENT USER PROFILE:\n")
 	b.WriteString(currentProfile)
 
@@ -348,17 +371,23 @@ func buildConsolidationPrompt(currentProfile string, traits []memory.Personality
 	}
 
 	b.WriteString("\nHIGH-SALIENCE MEMORIES:\n")
-	fmt.Fprintf(&b, "(Current time: %s)\n\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(b, "(Current time: %s)\n\n", timefmt.Now())
 	return b
 }
 
 // applyConsolidationResult parses the DTC output and applies profile/personality
-// updates. Returns the updated profile string (or "" if unchanged) and count.
-func applyConsolidationResult(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel, raw, currentProfile string, memCount int) (string, int, error) {
+// updates and memory merges. Returns the updated profile string (or "" if unchanged) and count.
+func applyConsolidationResult(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel, raw, currentProfile string, memCount int, batchIDs []int, grammarFn memory.GrammarSubagentFunc) (string, int, error) {
+	// Parse current profile once for validation comparisons.
+	var currentMap map[string]any
+	if err := json.Unmarshal([]byte(currentProfile), &currentMap); err != nil {
+		currentMap = make(map[string]any)
+	}
+
 	// Try dual output format (profile_updates or user_profile + personality_updates).
 	var dual consolidationOutput
 	if err := json.Unmarshal([]byte(raw), &dual); err == nil && len(dual.profileData()) > 0 {
-		n, err := applyConsolidationDual(ctx, pool, embedEndpoint, embedModel, dual, memCount, currentProfile)
+		n, err := applyConsolidationDual(ctx, pool, embedEndpoint, embedModel, dual, memCount, currentProfile, currentMap, batchIDs, grammarFn)
 		if err != nil {
 			return "", 0, err
 		}
@@ -384,8 +413,26 @@ func applyConsolidationResult(ctx context.Context, pool *pgxpool.Pool, embedEndp
 		}
 	}
 	if !hasProfileKey {
-		logger.Log.Warnf("[consolidate] deep thinker returned non-profile JSON, discarding: %s", raw)
-		return "", 0, nil
+		// Check if Z1 returned a bare user_preferences entry ({"key":..., "value":...})
+		// instead of the wrapped format. This happens with sparse inputs.
+		if _, hasKey := fallback["key"]; hasKey {
+			if _, hasVal := fallback["value"]; hasVal {
+				wrapped := fmt.Sprintf(`{"user_preferences":[%s],"last_consolidated":"%s"}`, raw, timefmt.Now())
+				logger.Log.Infof("[consolidate] wrapped bare preference entry into profile format: %s", raw)
+				raw = wrapped
+				// Re-parse so the merge below works with the wrapped version.
+				fallback = nil
+				if err := json.Unmarshal([]byte(raw), &fallback); err != nil {
+					return "", 0, fmt.Errorf("re-parse wrapped preference: %w", err)
+				}
+			} else {
+				logger.Log.Warnf("[consolidate] deep thinker returned non-profile JSON, discarding: %s", raw)
+				return "", 0, nil
+			}
+		} else {
+			logger.Log.Warnf("[consolidate] deep thinker returned non-profile JSON, discarding: %s", raw)
+			return "", 0, nil
+		}
 	}
 
 	merged, err := mergeProfileJSON(currentProfile, raw)
@@ -397,7 +444,7 @@ func applyConsolidationResult(ctx context.Context, pool *pgxpool.Pool, embedEndp
 	if err := json.Unmarshal([]byte(merged), &mergedMap); err != nil {
 		return "", 0, fmt.Errorf("parse merged profile: %w", err)
 	}
-	if err := validateProfile(mergedMap); err != nil {
+	if err := validateProfile(mergedMap, currentMap); err != nil {
 		logger.Log.Warnf("[consolidate] merged profile failed validation, discarding: %v", err)
 		return "", 0, nil
 	}
@@ -412,8 +459,9 @@ func applyConsolidationResult(ctx context.Context, pool *pgxpool.Pool, embedEndp
 	return "", memCount, nil
 }
 
-// applyConsolidationDual merges profile updates and applies personality updates.
-func applyConsolidationDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, dual consolidationOutput, memCount int, currentProfile string) (int, error) {
+// applyConsolidationDual merges profile updates, applies personality updates,
+// and executes memory merges.
+func applyConsolidationDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, dual consolidationOutput, memCount int, currentProfile string, currentMap map[string]any, batchIDs []int, grammarFn memory.GrammarSubagentFunc) (int, error) {
 	// Merge profile updates into current profile.
 	updates := string(dual.profileData())
 	merged, err := mergeProfileJSON(currentProfile, updates)
@@ -425,7 +473,7 @@ func applyConsolidationDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoi
 	if err := json.Unmarshal([]byte(merged), &mergedMap); err != nil {
 		return 0, fmt.Errorf("parse merged profile: %w", err)
 	}
-	if err := validateProfile(mergedMap); err != nil {
+	if err := validateProfile(mergedMap, currentMap); err != nil {
 		logger.Log.Warnf("[consolidate] merged profile failed validation, discarding: %v", err)
 		return 0, nil
 	}
@@ -461,14 +509,117 @@ func applyConsolidationDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoi
 		logger.Log.Infof("[consolidate] applied %d personality updates", len(dual.PersonalityUpdates))
 	}
 
+	// Apply memory merges.
+	if len(dual.MemoryMerges) > 0 {
+		mergedCount, mErr := applyMemoryMerges(ctx, pool, embedEndpoint, embedModel, dual.MemoryMerges, batchIDs, grammarFn)
+		if mErr != nil {
+			logger.Log.Warnf("[consolidate] memory merge error: %v", mErr)
+		} else if mergedCount > 0 {
+			logger.Log.Infof("[consolidate] merged %d memories into %d new entries", mergedCount, len(dual.MemoryMerges))
+		}
+	}
+
 	return memCount, nil
+}
+
+// applyMemoryMerges creates merged memories and supersedes the originals.
+// Only processes merges where all source_ids are in the current batch.
+func applyMemoryMerges(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, merges []memoryMerge, batchIDs []int, grammarFn memory.GrammarSubagentFunc) (int, error) {
+	// Build lookup set for batch validation.
+	validIDs := make(map[int]bool, len(batchIDs))
+	for _, id := range batchIDs {
+		validIDs[id] = true
+	}
+
+	merged := 0
+	for _, m := range merges {
+		if len(m.SourceIDs) < 2 || strings.TrimSpace(m.MergedSummary) == "" {
+			continue
+		}
+
+		// Validate all source IDs belong to the current batch.
+		valid := true
+		for _, id := range m.SourceIDs {
+			if !validIDs[id] {
+				logger.Log.Warnf("[consolidate] merge skipped: source_id %d not in current batch", id)
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+
+		// Get max salience from source memories.
+		var maxSalience float64
+		err := pool.QueryRow(ctx,
+			`SELECT COALESCE(MAX(salience), 5) FROM memories WHERE id = ANY($1)`,
+			m.SourceIDs,
+		).Scan(&maxSalience)
+		if err != nil {
+			logger.Log.Warnf("[consolidate] merge: failed to query salience: %v", err)
+			continue
+		}
+
+		// Embed the merged summary.
+		vec, err := memory.GetEmbedding(ctx, embedEndpoint, embedModel, m.MergedSummary)
+		if err != nil {
+			logger.Log.Warnf("[consolidate] merge: failed to embed: %v", err)
+			continue
+		}
+
+		// Transaction: insert merged memory, supersede sources.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return merged, fmt.Errorf("begin merge tx: %w", err)
+		}
+
+		var newID int
+		err = tx.QueryRow(ctx,
+			`INSERT INTO memories (summary, embedding, salience, memory_type, source, entities)
+			 VALUES ($1, $2, $3, 'general', 'consolidation', $4)
+			 RETURNING id`,
+			m.MergedSummary, pgvector.NewVector(vec), maxSalience, []string{},
+		).Scan(&newID)
+		if err != nil {
+			tx.Rollback(ctx)
+			logger.Log.Warnf("[consolidate] merge: failed to insert: %v", err)
+			continue
+		}
+
+		_, err = tx.Exec(ctx,
+			`UPDATE memories SET superseded_by = $1 WHERE id = ANY($2) AND superseded_by IS NULL`,
+			newID, m.SourceIDs,
+		)
+		if err != nil {
+			tx.Rollback(ctx)
+			logger.Log.Warnf("[consolidate] merge: failed to supersede: %v", err)
+			continue
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			logger.Log.Warnf("[consolidate] merge: commit failed: %v", err)
+			continue
+		}
+
+		logger.Log.Infof("[consolidate] merged ids %v → id=%d: %s", m.SourceIDs, newID, textutil.Truncate(m.MergedSummary, 100))
+
+		// Fire async entity enrichment for the merged memory.
+		if grammarFn != nil {
+			go memory.EnrichViaGrammarFn(pool, grammarFn, []int64{int64(newID)}, m.MergedSummary, maxSalience, nil)
+		}
+
+		merged += len(m.SourceIDs)
+	}
+
+	return merged, nil
 }
 
 // NewConsolidateMemory returns a ToolFunc that triggers the memory consolidation
 // pipeline: query high-salience memories from pgvector, read the current identity
 // profile from the database, send both to the Deep Thinker, and write the updated
 // profile back as an identity memory row.
-func NewConsolidateMemory(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, memoryLimit int, refreshFn func()) ToolFunc {
+func NewConsolidateMemory(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, memoryLimit int, grammarFn memory.GrammarSubagentFunc, refreshFn func()) ToolFunc {
 	return func(ctx context.Context, _ json.RawMessage) (string, error) {
 		if pool == nil {
 			return "Memory consolidation unavailable: no database configured.", nil
@@ -480,7 +631,7 @@ func NewConsolidateMemory(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpo
 		n, err := ConsolidateCore(ctx, pool, dtc, embedEndpoint, embedModel, ConsolidateOpts{
 			SalienceThreshold: salienceThreshold,
 			MemoryLimit:       memoryLimit,
-		})
+		}, grammarFn)
 		if err != nil {
 			return fmt.Sprintf("Consolidation failed: %v", err), nil
 		}
@@ -500,7 +651,7 @@ func NewConsolidateMemory(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpo
 // RunInitialConsolidation runs a one-shot memory consolidation at startup.
 // It is intended to be called as a fire-and-forget goroutine so the identity
 // profile exists as early as possible.
-func RunInitialConsolidation(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, memoryLimit int) {
+func RunInitialConsolidation(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, memoryLimit int, grammarFn memory.GrammarSubagentFunc) {
 	logger.Log.Info("[consolidate] running initial profile consolidation on startup")
 
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutInitConsolidation)
@@ -513,13 +664,13 @@ func RunInitialConsolidation(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEn
 		SalienceThreshold: 5,
 		MemoryLimit:       memoryLimit,
 		Timeout:           TimeoutInitConsolidation,
-	})
+	}, grammarFn)
 	if err != nil {
 		logger.Log.Errorf("[consolidate] startup: %v", err)
 		return
 	}
 	if n == 0 {
-		logger.Log.Info("[consolidate] startup: no memories found, skipping")
+		logger.Log.Info("[consolidate] startup: no actionable updates produced, skipping")
 		return
 	}
 

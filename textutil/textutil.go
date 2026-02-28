@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// Truncate returns s unchanged if len(s) <= n, otherwise returns s[:n] + "...".
+func Truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
 // thinkTagRe matches <think>...</think> blocks (including across newlines).
 var thinkTagRe = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
 
@@ -41,10 +49,20 @@ func StripToolIntentTags(s string) string {
 	return strings.TrimSpace(toolIntentTagRe.ReplaceAllString(s, ""))
 }
 
+// trailingDotRe matches trailing decimal points (e.g., "salience": 7. }) which are
+// technically valid in some JS engines but rejected by Go's strict json.Unmarshal.
+var trailingDotRe = regexp.MustCompile(`(\d)\.\s*([,\]}])`)
+
+// decimalSpaceRe matches spaces inside decimal numbers (e.g., "salience": 7. 0)
+// which Flash models sometimes produce. Go's json.Unmarshal rejects these.
+var decimalSpaceRe = regexp.MustCompile(`(\d\.)\s+(\d)`)
+
 // CleanLLMJSON applies the standard cleanup pipeline for LLM-generated JSON:
-// strip think tags → strip code fences → extract JSON object.
+// strip think tags → strip code fences → extract JSON object → clean trailing dots.
 func CleanLLMJSON(s string) string {
-	return ExtractJSON(StripCodeFences(StripThinkTags(s)))
+	jsonStr := ExtractJSON(StripCodeFences(StripThinkTags(s)))
+	jsonStr = decimalSpaceRe.ReplaceAllString(jsonStr, "$1$2")
+	return trailingDotRe.ReplaceAllString(jsonStr, "$1$2")
 }
 
 // ExtractJSON finds the first top-level JSON object in s by locating the first

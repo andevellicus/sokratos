@@ -11,6 +11,7 @@ import (
 
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/textutil"
 )
 
 type forgetTopicArgs struct {
@@ -86,11 +87,7 @@ func NewForgetTopic(pool *pgxpool.Pool, embedEndpoint, embedModel string) ToolFu
 				limit = len(matches)
 			}
 			for i := 0; i < limit; i++ {
-				summary := matches[i].Summary
-				if len(summary) > 100 {
-					summary = summary[:100] + "..."
-				}
-				fmt.Fprintf(&b, "- %s\n", summary)
+				fmt.Fprintf(&b, "- %s\n", textutil.Truncate(matches[i].Summary, 100))
 			}
 			if len(matches) > 5 {
 				fmt.Fprintf(&b, "... and %d more.\n", len(matches)-5)

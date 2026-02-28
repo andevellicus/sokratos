@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sokratos/httputil"
 	"sokratos/logger"
 )
 
@@ -42,8 +43,8 @@ type text2sqlResponse struct {
 // into PostgreSQL via the Arctic-Text2SQL model, executes it, and returns the
 // results. The database schema is fetched dynamically from information_schema
 // so the SQL model always sees the current table definitions.
-func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL string) ToolFunc {
-	httpClient := &http.Client{Timeout: TimeoutText2SQL}
+func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL, text2sqlModel, keepAlive string) ToolFunc {
+	httpClient := httputil.NewClient(TimeoutText2SQL)
 
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a askDBArgs
@@ -66,13 +67,13 @@ func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL string) ToolFunc {
 			"\n\nOutput ONLY the SQL statement. Do not include any explanations or formatting."
 
 		reqBody := text2sqlRequest{
-			Model: "Arctic-Text2SQL-R1-7B.Q8_0",
+			Model: text2sqlModel,
 			Messages: []text2sqlMsg{
 				{Role: "system", Content: systemPrompt},
 				{Role: "user", Content: a.Query},
 			},
 			Stream:    false,
-			KeepAlive: "30s",
+			KeepAlive: keepAlive,
 		}
 
 		body, err := json.Marshal(reqBody)
@@ -261,8 +262,9 @@ func executeQuery(ctx context.Context, pool *pgxpool.Pool, sql string) (string, 
 		b.WriteString(strings.Join(parts, " | "))
 		b.WriteString("\n")
 		rowCount++
-		if rowCount >= 50 {
-			b.WriteString("... (truncated at 50 rows)\n")
+		const maxQueryRows = 50
+		if rowCount >= maxQueryRows {
+			fmt.Fprintf(&b, "... (truncated at %d rows)\n", maxQueryRows)
 			break
 		}
 	}

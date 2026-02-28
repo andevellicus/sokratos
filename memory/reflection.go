@@ -10,7 +10,32 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/textutil"
 )
+
+// CountMemoriesSince returns the number of substantive memories created after
+// the given timestamp. When since is zero, counts all non-superseded memories.
+// Used by the cognitive processing trigger to count memories since last run.
+func CountMemoriesSince(ctx context.Context, db *pgxpool.Pool, since time.Time) (int, error) {
+	var count int
+	var cutoff time.Time
+	if since.IsZero() {
+		cutoff = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	} else {
+		cutoff = since
+	}
+	err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM memories
+		 WHERE superseded_by IS NULL
+		   AND memory_type NOT IN ('reflection', 'episode', 'identity')
+		   AND created_at > $1`,
+		cutoff,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count memories since %v: %w", cutoff, err)
+	}
+	return count, nil
+}
 
 // CountMemoriesSinceLastReflection returns the number of substantive memories
 // created since the last reflection. This is used for trigger-based reflection.
@@ -59,7 +84,7 @@ func TrackRetrieval(ctx context.Context, db *pgxpool.Pool, ids []int64) {
 // ReflectOnMemories performs a meta-cognitive reflection over memories created
 // since the given time, identifying patterns, evolving interests, connections,
 // and predictions. Returns the reflection memory ID, or 0 if skipped.
-func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel, reflectionPrompt string, synthesize SynthesizeFunc, since time.Time) (int64, error) {
+func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel, reflectionPrompt string, synthesize SynthesizeFunc, grammarFn GrammarSubagentFunc, since time.Time) (int64, error) {
 	// Query memories since the given time (excluding reflections), grouped by source/type.
 	rows, err := db.Query(ctx,
 		`SELECT source, memory_type, summary
@@ -92,9 +117,7 @@ func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, emb
 			orderedKeys = append(orderedKeys, key)
 		}
 		if len(groups[key]) < 10 {
-			if len(summary) > 300 {
-				summary = summary[:300]
-			}
+			summary = textutil.Truncate(summary, 300)
 			groups[key] = append(groups[key], summary)
 			totalCount++
 		}
@@ -134,11 +157,11 @@ func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, emb
 	for _, ec := range embedded {
 		var chunkID int64
 		err = db.QueryRow(ctx,
-			`INSERT INTO memories (summary, embedding, salience, tags, memory_type, source)
-			 VALUES ($1, $2, $3, $4, $5, $6)
+			`INSERT INTO memories (summary, embedding, salience, tags, memory_type, source, entities)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
 			 RETURNING id`,
 			ec.Text, pgvector.NewVector(ec.Embedding), 9.0, []string{"reflection", "meta"},
-			"reflection", "reflection",
+			"reflection", "reflection", []string{},
 		).Scan(&chunkID)
 		if err != nil {
 			return 0, fmt.Errorf("reflection insert failed: %w", err)
@@ -149,5 +172,11 @@ func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, emb
 	}
 
 	logger.Log.Infof("[memory] reflection saved id=%d (%d bytes from %d memories)", id, len(raw), totalCount)
+
+	// Fire async entity enrichment for the reflection.
+	if grammarFn != nil && id > 0 {
+		go EnrichViaGrammarFn(db, grammarFn, []int64{id}, raw, 9.0, nil)
+	}
+
 	return id, nil
 }

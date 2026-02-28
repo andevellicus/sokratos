@@ -19,7 +19,7 @@ func TestMain(m *testing.M) {
 
 func TestParseSkillMD(t *testing.T) {
 	md := `---
-name: test-skill
+name: test_skill
 description: A test skill for unit testing.
 ---
 
@@ -38,8 +38,8 @@ Some extra notes.
 	if err != nil {
 		t.Fatalf("parseSkillMD error: %v", err)
 	}
-	if manifest.Name != "test-skill" {
-		t.Errorf("expected name=test-skill, got %q", manifest.Name)
+	if manifest.Name != "test_skill" {
+		t.Errorf("expected name=test_skill, got %q", manifest.Name)
 	}
 	if manifest.Description != "A test skill for unit testing." {
 		t.Errorf("expected description, got %q", manifest.Description)
@@ -57,7 +57,7 @@ Some extra notes.
 
 func TestParseSkillMD_MultilineDescription(t *testing.T) {
 	md := `---
-name: multi-desc
+name: multi_desc
 description: |
   Line one of the description.
   Line two of the description.
@@ -67,8 +67,8 @@ description: |
 	if err != nil {
 		t.Fatalf("parseSkillMD error: %v", err)
 	}
-	if manifest.Name != "multi-desc" {
-		t.Errorf("expected name=multi-desc, got %q", manifest.Name)
+	if manifest.Name != "multi_desc" {
+		t.Errorf("expected name=multi_desc, got %q", manifest.Name)
 	}
 	if manifest.Description != "Line one of the description. Line two of the description." {
 		t.Errorf("unexpected description: %q", manifest.Description)
@@ -77,7 +77,7 @@ description: |
 
 func TestParseSkillMD_NoParams(t *testing.T) {
 	md := `---
-name: no-params
+name: no_params
 description: A skill with no parameters.
 ---
 `
@@ -85,8 +85,8 @@ description: A skill with no parameters.
 	if err != nil {
 		t.Fatalf("parseSkillMD error: %v", err)
 	}
-	if manifest.Name != "no-params" {
-		t.Errorf("expected name=no-params, got %q", manifest.Name)
+	if manifest.Name != "no_params" {
+		t.Errorf("expected name=no_params, got %q", manifest.Name)
 	}
 	if len(params) != 0 {
 		t.Errorf("expected 0 params, got %d", len(params))
@@ -130,7 +130,7 @@ func TestValidateSkillSource(t *testing.T) {
 func TestExecuteSkill_ReturnStatement(t *testing.T) {
 	source := `var result = args.a * args.b; return "product=" + result;`
 	args := json.RawMessage(`{"a": 5, "b": 6}`)
-	result, err := ExecuteSkill(context.Background(), "test-return", source, args)
+	result, err := ExecuteSkill(context.Background(), "test_return", source, args)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -221,12 +221,12 @@ func TestLoadSkills_NonexistentDir(t *testing.T) {
 
 func TestLoadSkills_ValidSkill(t *testing.T) {
 	dir := t.TempDir()
-	skillDir := filepath.Join(dir, "test-skill")
+	skillDir := filepath.Join(dir, "test_skill")
 	scriptsDir := filepath.Join(skillDir, "scripts")
 	os.MkdirAll(scriptsDir, 0755)
 
 	md := `---
-name: test-skill
+name: test_skill
 description: A test skill.
 ---
 
@@ -246,8 +246,8 @@ description: A test skill.
 	if len(skills) != 1 {
 		t.Fatalf("expected 1 skill, got %d", len(skills))
 	}
-	if skills[0].Manifest.Name != "test-skill" {
-		t.Errorf("expected test-skill, got %q", skills[0].Manifest.Name)
+	if skills[0].Manifest.Name != "test_skill" {
+		t.Errorf("expected test_skill, got %q", skills[0].Manifest.Name)
 	}
 	if len(skills[0].Params) != 1 {
 		t.Errorf("expected 1 param, got %d", len(skills[0].Params))
@@ -257,7 +257,7 @@ description: A test skill.
 func TestRegisterSkill_AndExecute(t *testing.T) {
 	registry := NewRegistry()
 	skill := Skill{
-		Manifest: SkillManifest{Name: "add-nums", Description: "Adds two numbers"},
+		Manifest: SkillManifest{Name: "add_nums", Description: "Adds two numbers"},
 		Params: []ParamSchema{
 			{Name: "a", Type: "number", Required: true},
 			{Name: "b", Type: "number", Required: true},
@@ -266,11 +266,11 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 	}
 	RegisterSkill(registry, skill)
 
-	if !registry.Has("add-nums") {
-		t.Fatal("expected add-nums to be registered")
+	if !registry.Has("add_nums") {
+		t.Fatal("expected add_nums to be registered")
 	}
 
-	raw := json.RawMessage(`{"name":"add-nums","arguments":{"a":10,"b":20}}`)
+	raw := json.RawMessage(`{"name":"add_nums","arguments":{"a":10,"b":20}}`)
 	result, err := registry.Execute(context.Background(), raw)
 	if err != nil {
 		t.Fatalf("Execute error: %v", err)
@@ -281,7 +281,7 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 }
 
 func TestGenerateSkillMD(t *testing.T) {
-	md := GenerateSkillMD("my-skill", "Does something useful.", []ParamSchema{
+	md := GenerateSkillMD("my_skill", "Does something useful.", []ParamSchema{
 		{Name: "query", Type: "string", Required: true},
 	})
 	if md == "" {
@@ -293,8 +293,8 @@ func TestGenerateSkillMD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("round-trip parse error: %v", err)
 	}
-	if manifest.Name != "my-skill" {
-		t.Errorf("expected my-skill, got %q", manifest.Name)
+	if manifest.Name != "my_skill" {
+		t.Errorf("expected my_skill, got %q", manifest.Name)
 	}
 	if manifest.Description != "Does something useful." {
 		t.Errorf("expected description, got %q", manifest.Description)
@@ -312,8 +312,6 @@ func TestLoadSkills_BuiltinSkills(t *testing.T) {
 
 	expected := map[string]struct{}{
 		"get_server_time": {},
-		"search_web":      {},
-		"read_url":        {},
 	}
 
 	loaded := make(map[string]struct{})
@@ -343,8 +341,6 @@ func TestLoadSkills_BuiltinSkillParams(t *testing.T) {
 
 	paramCounts := map[string]int{
 		"get_server_time": 0,
-		"search_web":      1,
-		"read_url":        2,
 	}
 
 	for _, s := range skills {
@@ -361,11 +357,11 @@ func TestLoadSkills_BuiltinSkillParams(t *testing.T) {
 func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	// Simulate create_skill: generate SKILL.md + handler.js, then load via LoadSkills.
 	dir := t.TempDir()
-	skillDir := filepath.Join(dir, "test-generated")
+	skillDir := filepath.Join(dir, "test_generated")
 	scriptsDir := filepath.Join(skillDir, "scripts")
 	os.MkdirAll(scriptsDir, 0755)
 
-	md := GenerateSkillMD("test-generated", "A tool-created skill for testing.", []ParamSchema{
+	md := GenerateSkillMD("test_generated", "A tool-created skill for testing.", []ParamSchema{
 		{Name: "city", Type: "string", Required: true},
 		{Name: "units", Type: "string", Required: false},
 	})
@@ -381,8 +377,8 @@ func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	}
 
 	s := skills[0]
-	if s.Manifest.Name != "test-generated" {
-		t.Errorf("expected name=test-generated, got %q", s.Manifest.Name)
+	if s.Manifest.Name != "test_generated" {
+		t.Errorf("expected name=test_generated, got %q", s.Manifest.Name)
 	}
 	if s.Manifest.Description != "A tool-created skill for testing." {
 		t.Errorf("expected description, got %q", s.Manifest.Description)
@@ -409,18 +405,18 @@ func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 
 func TestUnregister(t *testing.T) {
 	registry := NewRegistry()
-	registry.Register("temp-tool", func(ctx context.Context, args json.RawMessage) (string, error) {
+	registry.Register("temp_tool", func(ctx context.Context, args json.RawMessage) (string, error) {
 		return "ok", nil
-	}, ToolSchema{Name: "temp-tool"})
+	}, ToolSchema{Name: "temp_tool"})
 
-	if !registry.Has("temp-tool") {
-		t.Fatal("expected temp-tool to be registered")
+	if !registry.Has("temp_tool") {
+		t.Fatal("expected temp_tool to be registered")
 	}
 
-	registry.Unregister("temp-tool")
+	registry.Unregister("temp_tool")
 
-	if registry.Has("temp-tool") {
-		t.Error("expected temp-tool to be unregistered")
+	if registry.Has("temp_tool") {
+		t.Error("expected temp_tool to be unregistered")
 	}
 }
 

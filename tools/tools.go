@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"sokratos/logger"
+	"sokratos/textutil"
 )
 
 // ToolCall represents a tool invocation from the LLM.
@@ -32,6 +33,7 @@ type ToolSchema struct {
 	Name        string
 	Params      []ParamSchema
 	Description string
+	IsSkill     bool // true for user-created JS skills
 }
 
 // Registry maps tool names to their implementations and optional schemas.
@@ -70,17 +72,6 @@ func (r *Registry) Register(name string, fn ToolFunc, schema ...ToolSchema) {
 	logger.Log.Infof("[tools] registered %s", name)
 }
 
-// ToolSchemas returns all registered tool schemas WITHOUT the built-in "respond"
-// meta-tool. Used by the supervisor pattern where the tool agent should never
-// call respond — the orchestrator responds in plain text instead.
-func (r *Registry) ToolSchemas() []ToolSchema {
-	var schemas []ToolSchema
-	for _, s := range r.schemas {
-		schemas = append(schemas, s)
-	}
-	return schemas
-}
-
 // Schemas returns all registered tool schemas plus the built-in "respond" schema.
 func (r *Registry) Schemas() []ToolSchema {
 	var schemas []ToolSchema
@@ -94,6 +85,18 @@ func (r *Registry) Schemas() []ToolSchema {
 			{Name: "text", Type: "string", Required: true},
 		},
 	})
+	return schemas
+}
+
+// SchemasForTools returns schemas for the named subset of tools. Tools not
+// found in the registry are silently skipped.
+func (r *Registry) SchemasForTools(names []string) []ToolSchema {
+	var schemas []ToolSchema
+	for _, name := range names {
+		if s, ok := r.schemas[name]; ok {
+			schemas = append(schemas, s)
+		}
+	}
 	return schemas
 }
 
@@ -143,11 +146,23 @@ func (r *Registry) Execute(ctx context.Context, raw json.RawMessage) (string, er
 	if err != nil {
 		logger.Log.Errorf("[tool] %s error: %v", tc.Name, err)
 	} else {
-		preview := result
-		if len(preview) > 200 {
-			preview = preview[:200] + "..."
-		}
-		logger.Log.Infof("[tool] %s result: %s", tc.Name, preview)
+		logger.Log.Infof("[tool] %s result: %s", tc.Name, textutil.Truncate(result, 200))
 	}
 	return result, err
+}
+
+// NewScopedToolExec returns a SubagentToolExec that validates tool availability
+// against dc before delegating to the registry. Use this wherever a subagent
+// supervisor loop needs restricted tool access.
+func NewScopedToolExec(registry *Registry, dc *DelegateConfig) SubagentToolExec {
+	return func(ctx context.Context, raw json.RawMessage) (string, error) {
+		var tc ToolCall
+		if err := json.Unmarshal(raw, &tc); err != nil {
+			return "", fmt.Errorf("invalid tool call JSON: %w", err)
+		}
+		if !dc.IsAllowed(tc.Name) {
+			return fmt.Sprintf("tool %q is not available", tc.Name), nil
+		}
+		return registry.Execute(ctx, raw)
+	}
 }

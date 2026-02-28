@@ -81,10 +81,7 @@ func GenerateTransitionMemoryAsync(
 		var b strings.Builder
 		fmt.Fprintf(&b, "NEW EVENT:\n%s\n\nRELATED MEMORIES:\n", newEventSummary)
 		for i, m := range related {
-			summary := m.Summary
-			if len(summary) > 300 {
-				summary = summary[:300] + "..."
-			}
+			summary := textutil.Truncate(m.Summary, 300)
 			fmt.Fprintf(&b, "%d. %s\n", i+1, summary)
 		}
 
@@ -113,7 +110,7 @@ func GenerateTransitionMemoryAsync(
 			EmbedEndpoint: embedEndpoint,
 			EmbedModel:    embedModel,
 		}
-		id, err := memory.ScoreAndWrite(ctx, pool, req, nil) // nil subagentFn = skip quality scoring
+		id, err := memory.ScoreAndWrite(ctx, pool, req, nil) // nil grammarFn = skip quality scoring
 		if err != nil {
 			logger.Log.Warnf("[transition] save failed: %v", err)
 			return

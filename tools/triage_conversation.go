@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -50,6 +51,16 @@ func CleanupPreTriageMemories(pool *pgxpool.Pool) {
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutMemorySave)
 	defer cancel()
 
+	// First unlink any superseded_by references pointing at the rows
+	// we're about to delete, then delete. Without this, the FK
+	// constraint on superseded_by prevents deletion.
+	_, _ = pool.Exec(ctx,
+		`UPDATE memories SET superseded_by = NULL
+		 WHERE superseded_by IN (
+		   SELECT id FROM memories
+		   WHERE 'conversation' = ANY(tags)
+		     AND summary NOT LIKE '%Triage:%'
+		 )`)
 	result, err := pool.Exec(ctx,
 		`DELETE FROM memories
 		 WHERE 'conversation' = ANY(tags)
@@ -61,6 +72,23 @@ func CleanupPreTriageMemories(pool *pgxpool.Pool) {
 	logger.Log.Infof("[cleanup] deleted %d pre-triage conversation memories", result.RowsAffected())
 }
 
+// truncateAssistantReply caps the assistant portion of a "user: ...\nassistant: ..."
+// exchange so the user's statement dominates the triage input. Returns the
+// original exchange unchanged if no assistant prefix is found or if the reply
+// is already short enough.
+func truncateAssistantReply(exchange string, maxReplyLen int) string {
+	idx := strings.Index(exchange, "\nassistant: ")
+	if idx < 0 {
+		return exchange
+	}
+	replyStart := idx + len("\nassistant: ")
+	reply := exchange[replyStart:]
+	if len(reply) <= maxReplyLen {
+		return exchange
+	}
+	return exchange[:replyStart] + reply[:maxReplyLen] + "..."
+}
+
 // TriageConfig groups dependencies for conversation triage and memory save.
 type TriageConfig struct {
 	Pool          *pgxpool.Pool
@@ -68,8 +96,83 @@ type TriageConfig struct {
 	EmbedModel    string
 	DTC           *DeepThinkerClient
 	SubagentFn    memory.SubagentFunc
+	QueueFn       memory.WorkQueueFunc       // background work queue for quality enrichment
+	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking variant for entity extraction
 	Subagent      *SubagentClient
 	TriageGrammar string
+	RetryQueue    *RetryQueue // deferred triage retry queue (nil = drop on failure)
+}
+
+// TriageSaveRequest encapsulates all parameters for a triage-then-save operation.
+// Domain-specific threshold logic lives in the ShouldSave closure.
+type TriageSaveRequest struct {
+	TriagePrompt  string     // system prompt for the triage LLM
+	TriageInput   string     // content to triage (may be truncated by caller)
+	SourceContent string     // full source content for storage (capped at 2000 chars internally)
+	SourceLabel   string     // "Source exchange" or "Source email"
+	DomainTag     string     // "conversation" or "email" — prepended to tags
+	MemoryType    string     // "general" or "email"
+	Source        string     // "conversation" or "email"
+	SourceDate    *time.Time // optional: for email source dates
+	MaxTriageLen  int        // max chars for triage input (typically 4000)
+	ShouldSave    func(result *triageResult) bool
+}
+
+// triageAndSave is the core triage-then-save pipeline used by both async
+// and retry paths for conversation and email triage. It triages via subagent,
+// checks the domain-specific ShouldSave predicate, builds and saves the memory,
+// and optionally triggers paradigm shift detection.
+func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest) error {
+	if cfg.Subagent == nil || cfg.TriageGrammar == "" {
+		return fmt.Errorf("subagent not configured")
+	}
+
+	result, err := TriageViaSubagent(ctx, cfg.Subagent, cfg.TriageGrammar, req.TriagePrompt, req.TriageInput, req.MaxTriageLen)
+	if err != nil {
+		return err
+	}
+
+	if !req.ShouldSave(result) {
+		logger.Log.Infof("[triage:%s] skipped (score=%.0f): %s", req.DomainTag, result.SalienceScore, result.Summary)
+		return nil
+	}
+
+	// Store summary first (dominates the embedding model's 512-token window)
+	// followed by the full source for internal analysis (contradiction detection,
+	// consolidation). A 2000-char safety cap prevents copy-paste bombs.
+	sourceContent := req.SourceContent
+	if len(sourceContent) > 2000 {
+		sourceContent = sourceContent[:2000] + "..."
+	}
+	text := fmt.Sprintf("%s\n\n%s:\n%s", result.Summary, req.SourceLabel, sourceContent)
+	tags := append([]string{req.DomainTag}, result.Tags...)
+
+	memReq := memory.MemoryWriteRequest{
+		Summary:       text,
+		Tags:          tags,
+		Salience:      result.SalienceScore,
+		MemoryType:    req.MemoryType,
+		Source:        req.Source,
+		SourceDate:    req.SourceDate,
+		EmbedEndpoint: cfg.EmbedEndpoint,
+		EmbedModel:    cfg.EmbedModel,
+	}
+	if cfg.SubagentFn != nil {
+		if _, saveErr := memory.CheckAndWriteWithContradiction(ctx, cfg.Pool, memReq, cfg.SubagentFn, cfg.BgGrammarFn, cfg.QueueFn); saveErr != nil {
+			logger.Log.Warnf("[triage:%s] save failed: %v", req.DomainTag, saveErr)
+			return nil // save failed but triage succeeded — don't retry
+		}
+	} else {
+		memory.SaveToMemoryWithSalienceAsync(cfg.Pool, memReq, nil)
+	}
+
+	logger.Log.Infof("[triage:%s] saved (score=%.0f, category=%s, tags=%v): %s",
+		req.DomainTag, result.SalienceScore, result.Category, tags, result.Summary)
+
+	if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {
+		GenerateTransitionMemoryAsync(cfg.Pool, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.DTC, result.Summary, tags)
+	}
+	return nil
 }
 
 // TriageAndSaveConversationAsync sends a conversation exchange for triage
@@ -77,73 +180,46 @@ type TriageConfig struct {
 // When toolsUsed is true (exchange was grounded by tool results), the threshold
 // is 3. When false (pure parametric knowledge), the threshold is raised to 5
 // to prevent hallucinated facts from entering memory and creating feedback loops.
-// When Subagent is non-nil, routes through the subagent with GBNF grammar;
-// otherwise falls back to the deep thinker. When SubagentFn is non-nil,
-// contradiction detection and quality scoring are applied on save.
 // Runs as a fire-and-forget goroutine.
 func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed bool) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
 		defer cancel()
 
-		triagePrompt := strings.TrimSpace(prompts.ConversationTriage)
-
-		var result *triageResult
-		var err error
-		if cfg.Subagent != nil && cfg.TriageGrammar != "" {
-			result, err = TriageViaSubagent(ctx, cfg.Subagent, cfg.TriageGrammar, triagePrompt, exchange, 4000)
-		} else {
-			result, err = cfg.DTC.TriageItem(ctx, triagePrompt, exchange, 4000)
-		}
-		if err != nil {
-			logger.Log.Warnf("[conversation_triage] triage failed: %v", err)
-			return
-		}
-
-		if result.Save != nil {
-			logger.Log.Debugf("[conversation_triage] save=%v for exchange (score=%.0f)", *result.Save, result.SalienceScore)
-		}
+		triageInput := truncateAssistantReply(exchange, 300)
 
 		threshold := float64(3)
 		if !toolsUsed {
 			threshold = 5
 		}
-		if result.SalienceScore < threshold {
-			if !toolsUsed && result.SalienceScore >= 3 {
-				logger.Log.Infof("[conversation_triage] skipped (unverified, score=%.0f): %s", result.SalienceScore, result.Summary)
-			} else {
-				logger.Log.Infof("[conversation_triage] skipped (score=%.0f): %s", result.SalienceScore, result.Summary)
-			}
-			return
-		}
 
-		// Put the clean summary first so it dominates the embedding model's
-		// 512-token window, with the full exchange preserved as context.
-		text := fmt.Sprintf("%s\n\nSource exchange:\n%s", result.Summary, exchange)
-		tags := append([]string{"conversation"}, result.Tags...)
-
-		req := memory.MemoryWriteRequest{
-			Summary:       text,
-			Tags:          tags,
-			Salience:      result.SalienceScore,
+		err := triageAndSave(ctx, cfg, TriageSaveRequest{
+			TriagePrompt:  strings.TrimSpace(prompts.ConversationTriage),
+			TriageInput:   triageInput,
+			SourceContent: exchange,
+			SourceLabel:   "Source exchange",
+			DomainTag:     "conversation",
 			MemoryType:    "general",
 			Source:        "conversation",
-			EmbedEndpoint: cfg.EmbedEndpoint,
-			EmbedModel:    cfg.EmbedModel,
-		}
-		if cfg.SubagentFn != nil {
-			if _, err := memory.CheckAndWriteWithContradiction(ctx, cfg.Pool, req, cfg.SubagentFn); err != nil {
-				logger.Log.Warnf("[conversation_triage] contradiction-checked save failed: %v", err)
-				return
+			MaxTriageLen:  4000,
+			ShouldSave: func(r *triageResult) bool {
+				if r.Save != nil {
+					logger.Log.Debugf("[conversation_triage] save=%v (score=%.0f)", *r.Save, r.SalienceScore)
+				}
+				if r.SalienceScore < threshold {
+					if !toolsUsed && r.SalienceScore >= 3 {
+						logger.Log.Infof("[conversation_triage] skipped (unverified, score=%.0f): %s", r.SalienceScore, r.Summary)
+					}
+					return false
+				}
+				return true
+			},
+		})
+		if err != nil {
+			logger.Log.Warnf("[conversation_triage] triage failed: %v", err)
+			if cfg.RetryQueue != nil {
+				EnqueueConversationTriage(cfg.RetryQueue, cfg, triageInput, exchange, toolsUsed)
 			}
-		} else {
-			memory.SaveToMemoryWithSalienceAsync(cfg.Pool, req, nil)
-		}
-
-		logger.Log.Infof("[conversation_triage] saved (score=%.0f, category=%s, tags=%v): %s", result.SalienceScore, result.Category, tags, result.Summary)
-
-		if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {
-			GenerateTransitionMemoryAsync(cfg.Pool, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.DTC, result.Summary, tags)
 		}
 	}()
 }

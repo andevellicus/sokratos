@@ -16,6 +16,7 @@ import (
 
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/timefmt"
 )
 
 // --- Search tool ---
@@ -76,20 +77,9 @@ func contentHash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// parseISO8601 parses an ISO8601 timestamp in common formats: RFC3339,
-// datetime without timezone, datetime without seconds, or date-only.
+// parseISO8601 delegates to timefmt.ParseISO8601 for centralized time parsing.
 func parseISO8601(s string) (time.Time, error) {
-	for _, layout := range []string{
-		time.RFC3339,
-		"2006-01-02T15:04:05", // datetime without timezone
-		"2006-01-02T15:04",    // datetime without seconds
-		"2006-01-02",          // date only
-	} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t, nil
-		}
-	}
-	return time.Time{}, fmt.Errorf("parsing time %q: unrecognized format", s)
+	return timefmt.ParseISO8601(s)
 }
 
 // retrievalOrderBy is the composite ranking expression used by all retrieval
@@ -118,6 +108,9 @@ func queryMemories(ctx context.Context, pool *pgxpool.Pool, emb []float32, query
 	if memoryType != "" {
 		extraWhere += fmt.Sprintf("\n\t            AND memory_type = $%d", nextParam)
 		args = append(args, memoryType)
+	} else {
+		// Exclude internal memory types from general searches.
+		extraWhere += "\n\t            AND memory_type NOT IN ('identity', 'reflection')"
 	}
 
 	query := fmt.Sprintf(`SELECT id, summary, created_at,
@@ -303,8 +296,8 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 	var b strings.Builder
 	b.WriteString("[MEMORY RETRIEVAL RESULTS]:\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, "--- (score: %.2f, recorded: %s)\n", r.score, r.createdAt.Format("2006-01-02"))
-		b.WriteString(r.summary)
+		fmt.Fprintf(&b, "--- (score: %.2f, recorded: %s)\n", r.score, timefmt.FormatDate(r.createdAt))
+		b.WriteString(memory.ExtractSummary(r.summary))
 		b.WriteByte('\n')
 	}
 	return b.String(), nil
@@ -400,9 +393,9 @@ func (a saveMemoryArgs) effectiveTags() []string {
 	return append([]string{a.Category}, a.Tags...)
 }
 
-// saveMemoryAsync quality-scores (via the subagent), embeds, and inserts the memory
-// on a background goroutine so it doesn't block the calling agent.
-func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagentFn memory.SubagentFunc, a saveMemoryArgs) {
+// saveMemoryAsync quality-scores (via the grammar-constrained subagent), embeds,
+// and inserts the memory on a background goroutine so it doesn't block the calling agent.
+func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc, a saveMemoryArgs) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutMemorySave)
 		defer cancel()
@@ -417,7 +410,7 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, subag
 			EmbedModel:    embedModel,
 		}
 
-		id, err := memory.ScoreAndWrite(ctx, pool, req, subagentFn)
+		id, err := memory.ScoreAndWrite(ctx, pool, req, grammarFn)
 		if err != nil {
 			logger.Log.Errorf("[save_memory] failed: %v", err)
 			return
@@ -426,11 +419,18 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, subag
 	}()
 }
 
-// QueryHighSalienceMemories returns summaries of memories with salience >= threshold
-// created in the last 24 hours. Used by the consolidation pipeline.
-func QueryHighSalienceMemories(ctx context.Context, pool *pgxpool.Pool, threshold, limit int) ([]string, error) {
+// HighSalienceMemory pairs a memory ID with its summary text.
+type HighSalienceMemory struct {
+	ID      int
+	Summary string
+}
+
+// QueryHighSalienceMemories returns memories with salience >= threshold
+// created in the last 24 hours, including their IDs. Used by the
+// consolidation pipeline for profile updates and memory merging.
+func QueryHighSalienceMemories(ctx context.Context, pool *pgxpool.Pool, threshold, limit int) ([]HighSalienceMemory, error) {
 	rows, err := pool.Query(ctx,
-		`SELECT summary FROM memories
+		`SELECT id, summary FROM memories
 		 WHERE salience >= $1
 		   AND superseded_by IS NULL
 		   AND created_at >= NOW() - INTERVAL '24 hours'
@@ -443,13 +443,13 @@ func QueryHighSalienceMemories(ctx context.Context, pool *pgxpool.Pool, threshol
 	}
 	defer rows.Close()
 
-	var results []string
+	var results []HighSalienceMemory
 	for rows.Next() {
-		var summary string
-		if err := rows.Scan(&summary); err != nil {
+		var m HighSalienceMemory
+		if err := rows.Scan(&m.ID, &m.Summary); err != nil {
 			return nil, fmt.Errorf("scan high-salience row: %w", err)
 		}
-		results = append(results, summary)
+		results = append(results, m)
 	}
 	return results, rows.Err()
 }
@@ -463,8 +463,8 @@ func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subag
 	}
 }
 
-// NewSaveMemory returns a ToolFunc that closes over the pool, endpoints, and subagent function.
-func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagentFn memory.SubagentFunc) ToolFunc {
+// NewSaveMemory returns a ToolFunc that closes over the pool, endpoints, and grammar-constrained subagent.
+func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc) ToolFunc {
 	return func(_ context.Context, args json.RawMessage) (string, error) {
 		var a saveMemoryArgs
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -475,7 +475,7 @@ func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagen
 			return "error: summary is required and must contain actual content", nil
 		}
 
-		saveMemoryAsync(pool, embedEndpoint, embedModel, subagentFn, a)
+		saveMemoryAsync(pool, embedEndpoint, embedModel, grammarFn, a)
 		return "Memory queued for saving.", nil
 	}
 }

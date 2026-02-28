@@ -109,7 +109,7 @@ func SearchMemoriesByDomain(ctx context.Context, pool *pgxpool.Pool, embedEndpoi
 			continue
 		}
 		ids = append(ids, id)
-		results = append(results, summary)
+		results = append(results, memory.ExtractSummary(summary))
 	}
 
 	if len(results) == 0 {

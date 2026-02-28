@@ -10,6 +10,7 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/textutil"
 	"sokratos/tools"
 )
 
@@ -36,9 +37,7 @@ func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, emb
 		if idx := strings.Index(text, "\n\n[Current Agent State]"); idx > 0 {
 			text = text[:idx]
 		}
-		if len(text) > 200 {
-			text = text[:200]
-		}
+		text = textutil.Truncate(text, 200)
 		text = strings.TrimSpace(text)
 		if text != "" {
 			trajectoryParts = append(trajectoryParts, text)
@@ -72,11 +71,16 @@ func evaluateMemoryUsefulnessViaSubagent(pool *pgxpool.Pool, sc *tools.SubagentC
 		"Were any of the retrieved memories directly useful in generating this response? "+
 		"Answer with exactly YES or NO.", userMsg, memorySummaries, assistantReply)
 
-	content, err := sc.Complete(ctx,
+	// GBNF grammar forces the model to output exactly "YES" or "NO" —
+	// without this, Flash generates analysis text that gets truncated
+	// before reaching the verdict.
+	const yesNoGrammar = `root ::= "YES" | "NO"`
+
+	content, err := sc.CompleteWithGrammar(ctx,
 		"You evaluate whether specific retrieved memories were useful for generating an assistant response. "+
 			"A memory is useful if its content directly informed or contributed to the response. "+
-			"Topic overlap alone is not sufficient. Answer with exactly YES or NO. Nothing else.",
-		prompt, 16)
+			"Topic overlap alone is not sufficient.",
+		prompt, yesNoGrammar, 8)
 	if err != nil {
 		logger.Log.Warnf("[usefulness] subagent evaluation failed: %v", err)
 		return

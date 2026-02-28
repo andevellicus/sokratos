@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -27,7 +28,7 @@ const episodeSynthesisPrompt = `You synthesize related memories into a cohesive 
 - Preserves key facts, names, dates, and outcomes
 - Reads as a natural narrative, not a bullet list
 
-Return ONLY the narrative summary. No preamble, no explanation.`
+Return a JSON object: {"summary": "<your narrative>"}. No other output.`
 
 // SynthesizeFunc is the function signature for calling an LLM to synthesize text.
 type SynthesizeFunc func(ctx context.Context, systemPrompt, content string) (string, error)
@@ -88,7 +89,7 @@ func clusterBySimilarity(memories []EpisodeMemory, distanceThreshold float64) []
 // SynthesizeEpisodes clusters recent memories by semantic similarity and
 // synthesizes each cluster into an episodic memory. Returns the number of
 // episodes created.
-func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel string, synthesize SynthesizeFunc) (int, error) {
+func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel string, synthesize SynthesizeFunc, grammarFn GrammarSubagentFunc) (int, error) {
 	// Query recent non-episode, non-reflection, non-superseded memories from last 24h.
 	rows, err := db.Query(ctx,
 		`SELECT id, summary, embedding
@@ -145,7 +146,18 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 			logger.Log.Warnf("[memory] episode synthesis failed for cluster of %d: %v", len(cluster), err)
 			continue
 		}
-		raw = textutil.StripThinkTags(strings.TrimSpace(raw))
+
+		// Extract narrative from JSON (strips reasoning preamble from Z1 output).
+		cleaned := textutil.CleanLLMJSON(raw)
+		var episodeOut struct {
+			Summary string `json:"summary"`
+		}
+		if err := json.Unmarshal([]byte(cleaned), &episodeOut); err != nil || strings.TrimSpace(episodeOut.Summary) == "" {
+			// Fallback: use raw output with think-tag stripping.
+			raw = textutil.StripThinkTags(strings.TrimSpace(raw))
+		} else {
+			raw = strings.TrimSpace(episodeOut.Summary)
+		}
 		if raw == "" {
 			continue
 		}
@@ -209,6 +221,11 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 
 		episodeCount++
 		logger.Log.Infof("[memory] synthesized episode id=%d from %d memories", episodeID, len(cluster))
+
+		// Fire async entity enrichment for the episode.
+		if grammarFn != nil {
+			go EnrichViaGrammarFn(db, grammarFn, []int64{episodeID}, raw, 8.0, nil)
+		}
 	}
 
 	return episodeCount, nil

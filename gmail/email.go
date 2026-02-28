@@ -7,6 +7,8 @@ import (
 	"time"
 
 	gm "google.golang.org/api/gmail/v1"
+
+	"sokratos/timefmt"
 )
 
 // Email holds parsed fields from a Gmail message.
@@ -91,7 +93,7 @@ func FormatEmailSummary(e Email) string {
 
 	dateStr := ""
 	if !e.Date.IsZero() {
-		dateStr = e.Date.Format("2006-01-02 15:04")
+		dateStr = timefmt.FormatDateTime(e.Date)
 	}
 
 	to := e.To

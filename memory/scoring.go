@@ -11,6 +11,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/textutil"
 )
 
 // --- Structured writes with quality scoring ---
@@ -33,78 +34,50 @@ const qualitySystemPrompt = `You are a memory quality scorer. Given a memory sum
 
 Return ONLY the JSON object. No explanation.`
 
-// qualityScoreResult holds the output from scoreQuality.
-type qualityScoreResult struct {
-	Entities   []string
-	Confidence float64
-	Salience   float64
+// qualityGrammar is a GBNF grammar constraining quality scoring output to a
+// valid JSON object with the expected fields. Without this, Flash models dump
+// chain-of-thought reasoning instead of JSON.
+const qualityGrammar = `root ::= "{" ws "\"specificity\":" ws number "," ws "\"uniqueness\":" ws number "," ws "\"entities\":" ws array "," ws "\"confidence\":" ws number ws "}"
+number ::= [0-9] ("." [0-9]+)?
+array ::= "[]" | "[" ws string (ws "," ws string)* ws "]"
+string ::= "\"" [^"\\]* "\""
+ws ::= [ \t\n\r]*`
+
+// entityGrammar is a GBNF grammar constraining entity extraction output to a
+// JSON array of strings.
+const entityGrammar = `root ::= "[]" | "[" ws string (ws "," ws string)* ws "]"
+string ::= "\"" [^"\\]* "\""
+ws ::= [ \t\n\r]*`
+
+// buildEnrichmentPrompt formats the user content for quality scoring,
+// optionally including existing memories for uniqueness comparison.
+func buildEnrichmentPrompt(summary string, existingSummaries []string) string {
+	if len(existingSummaries) == 0 {
+		return summary
+	}
+	var sb strings.Builder
+	sb.WriteString("NEW MEMORY:\n")
+	sb.WriteString(summary)
+	sb.WriteString("\n\nEXISTING SIMILAR MEMORIES:\n")
+	for i, s := range existingSummaries {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, s)
+	}
+	return sb.String()
 }
 
-// scoreQuality calls the subagent to evaluate memory quality and adjusts salience.
-// When existingSummaries is non-empty, they are included for uniqueness comparison.
-// Returns default values if subagentFn is nil or scoring fails (graceful degradation).
-func scoreQuality(ctx context.Context, subagentFn SubagentFunc, summary string, baseSalience float64, existingSummaries []string) qualityScoreResult {
-	result := qualityScoreResult{Confidence: 1.0, Salience: baseSalience}
-	if subagentFn == nil {
-		return result
-	}
-
-	// Build user content with optional existing memories for uniqueness comparison.
-	var userContent string
-	if len(existingSummaries) > 0 {
-		var sb strings.Builder
-		sb.WriteString("NEW MEMORY:\n")
-		sb.WriteString(summary)
-		sb.WriteString("\n\nEXISTING SIMILAR MEMORIES:\n")
-		for i, s := range existingSummaries {
-			fmt.Fprintf(&sb, "%d. %s\n", i+1, s)
-		}
-		userContent = sb.String()
-	} else {
-		userContent = summary
-	}
-
-	scoreCtx, cancel := context.WithTimeout(ctx, TimeoutQualityScore)
-	raw, err := subagentFn(scoreCtx, qualitySystemPrompt, userContent)
-	cancel()
-	if err != nil {
-		logger.Log.Warnf("[memory] quality scoring failed, using defaults: %v", err)
-		return result
-	}
-
-	var qr qualityResult
-	if err := json.Unmarshal([]byte(raw), &qr); err != nil {
-		logger.Log.Warnf("[memory] quality JSON parse failed: %v (raw: %s)", err, raw)
-		return result
-	}
-
-	result.Entities = qr.Entities
-	result.Confidence = qr.Confidence
-	qualityBoost := (qr.Specificity + qr.Uniqueness) / 2.0
-	result.Salience = baseSalience + (qualityBoost * (1.0 - baseSalience/10.0))
-	if result.Salience > 10 {
-		result.Salience = 10
-	}
-	return result
-}
-
-// ScoreAndWrite quality-scores a memory via the subagent, embeds it, and inserts it.
-// Returns the new memory ID. If subagent scoring fails, the memory is still saved
-// with default quality values (graceful degradation).
-func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, subagentFn SubagentFunc) (int64, error) {
-	qs := scoreQuality(ctx, subagentFn, req.Summary, req.Salience, nil)
-	entities := qs.Entities
-	confidence := qs.Confidence
-	req.Salience = qs.Salience
-
+// ScoreAndWrite embeds and inserts a memory with default quality values, then
+// fires async quality enrichment via the subagent (if available). The memory is
+// immediately available for retrieval; enrichment updates entities, confidence,
+// and salience in the background without blocking the caller.
+func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, grammarFn GrammarSubagentFunc) (int64, error) {
 	memType := req.MemoryType
 	if memType == "" {
 		memType = "general"
 	}
 
-	// Chunk long content; first chunk reuses scored metadata.
 	chunks := ChunkText(req.Summary, MaxChunkBytes)
 	var firstID int64
+	var allIDs []int64
 
 	for i, chunk := range chunks {
 		embedded, err := embedWithFallback(ctx, req.EmbedEndpoint, req.EmbedModel, chunk)
@@ -119,7 +92,7 @@ func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest
 				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 				 RETURNING id`,
 				ec.Text, pgvector.NewVector(ec.Embedding), req.Salience, req.Tags,
-				memType, entities, confidence, req.Source, req.SourceDate,
+				memType, []string{}, 1.0, req.Source, req.SourceDate,
 			).Scan(&id)
 			if err != nil {
 				return firstID, fmt.Errorf("insert chunk %d failed: %w", i, err)
@@ -128,12 +101,89 @@ func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest
 			if firstID == 0 {
 				firstID = id
 			}
-			logger.Log.Infof("[memory] scored+saved id=%d chunk=%d/%d (salience=%.1f, entities=%v, confidence=%.2f, source=%s): %s",
-				id, i+1, len(chunks), req.Salience, entities, confidence, req.Source, ec.Text)
+			allIDs = append(allIDs, id)
+			logger.Log.Infof("[memory] saved id=%d chunk=%d/%d (salience=%.1f, source=%s): %s",
+				id, i+1, len(chunks), req.Salience, req.Source, ec.Text)
 		}
 	}
 
+	if grammarFn != nil && len(allIDs) > 0 {
+		go EnrichViaGrammarFn(db, grammarFn, allIDs, req.Summary, req.Salience, nil)
+	}
+
 	return firstID, nil
+}
+
+// EnrichViaGrammarFn runs quality scoring synchronously via grammarFn and
+// applies the result. Used by ScoreAndWrite where no work queue is available,
+// and by episode/reflection/consolidation for post-insert entity extraction.
+func EnrichViaGrammarFn(db *pgxpool.Pool, grammarFn GrammarSubagentFunc, ids []int64, summary string, baseSalience float64, existingSummaries []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), TimeoutQualityEnrich)
+	defer cancel()
+
+	userContent := buildEnrichmentPrompt(summary, existingSummaries)
+	raw, err := grammarFn(ctx, qualitySystemPrompt, userContent, qualityGrammar)
+	if err != nil {
+		logger.Log.Warnf("[memory] quality scoring failed: %v", err)
+		return
+	}
+	applyEnrichment(db, ids, raw, baseSalience)
+}
+
+// submitEnrichment queues a quality enrichment task via the work queue.
+// The LLM call runs in the queue worker with its own timeout; the callback
+// parses the result and updates the DB.
+func submitEnrichment(queueFn WorkQueueFunc, db *pgxpool.Pool, ids []int64, summary string, baseSalience float64, existingSummaries []string) {
+	queueFn(WorkRequest{
+		Label:        "quality-enrichment",
+		SystemPrompt: qualitySystemPrompt,
+		UserPrompt:   buildEnrichmentPrompt(summary, existingSummaries),
+		Grammar:      qualityGrammar,
+		MaxTokens:    512,
+		Timeout:      TimeoutQualityEnrich,
+		Retries:      2,
+		OnComplete: func(raw string, err error) {
+			if err != nil {
+				logger.Log.Warnf("[memory] quality enrichment failed: %v", err)
+				return
+			}
+			applyEnrichment(db, ids, raw, baseSalience)
+		},
+	})
+}
+
+// applyEnrichment parses quality scoring output and updates memory rows.
+func applyEnrichment(db *pgxpool.Pool, ids []int64, raw string, baseSalience float64) {
+	cleaned := textutil.CleanLLMJSON(raw)
+	var qr qualityResult
+	if err := json.Unmarshal([]byte(cleaned), &qr); err != nil {
+		logger.Log.Warnf("[memory] quality JSON parse failed: %v (raw: %s)", err, raw)
+		return
+	}
+
+	qualityBoost := (qr.Specificity + qr.Uniqueness) / 2.0
+	salience := baseSalience + (qualityBoost * (1.0 - baseSalience/10.0))
+	if salience > 10 {
+		salience = 10
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), TimeoutSaveOp)
+	defer cancel()
+
+	_, err := db.Exec(ctx,
+		`UPDATE memories
+		 SET entities = (SELECT ARRAY(SELECT DISTINCT e FROM unnest(entities || $1::text[]) AS e)),
+		     confidence = $2,
+		     salience = $3
+		 WHERE id = ANY($4)`,
+		qr.Entities, qr.Confidence, salience, ids,
+	)
+	if err != nil {
+		logger.Log.Warnf("[memory] async quality enrichment failed: %v", err)
+		return
+	}
+	logger.Log.Infof("[memory] enriched ids=%v (salience=%.1f→%.1f, entities=%v, confidence=%.2f)",
+		ids, baseSalience, salience, qr.Entities, qr.Confidence)
 }
 
 // --- Entity extraction ---
@@ -144,15 +194,16 @@ Exclude: generic nouns, pronouns, common words.
 Return ONLY the JSON array. Example: ["John Smith", "Google", "Berlin"]
 If no entities found, return: []`
 
-// extractEntitiesLightweight uses the subagent to quickly extract named entities
-// from a summary before contradiction search. Returns nil on failure (graceful degradation).
-func extractEntitiesLightweight(ctx context.Context, subagentFn SubagentFunc, summary string) []string {
-	if subagentFn == nil {
+// extractEntitiesLightweight uses the subagent (with GBNF grammar) to quickly
+// extract named entities from a summary before contradiction search. Returns
+// nil on failure (graceful degradation).
+func extractEntitiesLightweight(ctx context.Context, grammarFn GrammarSubagentFunc, summary string) []string {
+	if grammarFn == nil {
 		return nil
 	}
 
-	extractCtx, cancel := context.WithTimeout(ctx, TimeoutQualityScore)
-	raw, err := subagentFn(extractCtx, entityExtractionPrompt, summary)
+	extractCtx, cancel := context.WithTimeout(context.Background(), TimeoutQualityScore)
+	raw, err := grammarFn(extractCtx, entityExtractionPrompt, summary, entityGrammar)
 	cancel()
 	if err != nil {
 		logger.Log.Warnf("[memory] entity extraction failed, skipping: %v", err)
@@ -191,7 +242,12 @@ type contradictionCandidate struct {
 // CheckAndWriteWithContradiction finds similar existing memories, checks for
 // contradictions via the subagent, supersedes contradicted memories, and writes
 // the new memory. Returns the new memory ID.
-func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, subagentFn SubagentFunc) (int64, error) {
+//
+// Function parameters serve distinct roles:
+//   - subagentFn: blocking, for critical-path contradiction detection
+//   - bgGrammarFn: non-blocking, for optional entity extraction (skips when busy)
+//   - queueFn: fire-and-forget work queue for background quality enrichment
+func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, subagentFn SubagentFunc, bgGrammarFn GrammarSubagentFunc, queueFn WorkQueueFunc) (int64, error) {
 	// Chunk first; use first chunk for contradiction search embedding.
 	chunks := ChunkText(req.Summary, MaxChunkBytes)
 
@@ -199,6 +255,9 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 	firstEmbedded, err := embedWithFallback(ctx, req.EmbedEndpoint, req.EmbedModel, chunks[0])
 	if err != nil {
 		return 0, fmt.Errorf("embedding failed: %w", err)
+	}
+	if len(firstEmbedded) == 0 {
+		return 0, fmt.Errorf("embedding returned no vectors")
 	}
 	// Use the first sub-chunk's embedding for contradiction search.
 	firstEmb := firstEmbedded[0].Embedding
@@ -218,7 +277,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 	if err != nil {
 		logger.Log.Warnf("[memory] contradiction search failed: %v", err)
 		// Still extract entities even if similarity search failed.
-		entities = extractEntitiesLightweight(ctx, subagentFn, req.Summary)
+		entities = extractEntitiesLightweight(ctx, bgGrammarFn, req.Summary)
 	} else {
 		for rows.Next() {
 			var c contradictionCandidate
@@ -237,13 +296,21 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				// Use only the summary portion for contradiction comparison.
+				// The "Source exchange:" section is appended for archival, not
+				// for semantic comparison — it can cause false contradictions
+				// when the raw exchange mentions other people's information.
+				summaryForComparison := req.Summary
+				if idx := strings.Index(summaryForComparison, "\n\nSource exchange:\n"); idx >= 0 {
+					summaryForComparison = summaryForComparison[:idx]
+				}
 				var promptBuilder strings.Builder
-				fmt.Fprintf(&promptBuilder, "NEW: %s\n", req.Summary)
+				fmt.Fprintf(&promptBuilder, "NEW: %s\n", summaryForComparison)
 				for i, c := range candidates {
 					fmt.Fprintf(&promptBuilder, "EXISTING_%d: %s\n", i+1, c.Summary)
 				}
 
-				checkCtx, cancel := context.WithTimeout(ctx, TimeoutContradictionCheck)
+				checkCtx, cancel := context.WithTimeout(context.Background(), TimeoutContradictionCheck)
 				raw, gErr := subagentFn(checkCtx, contradictionSystemPrompt, promptBuilder.String())
 				cancel()
 				if gErr != nil {
@@ -267,7 +334,9 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			entities = extractEntitiesLightweight(ctx, subagentFn, req.Summary)
+			// Use bgGrammarFn (non-blocking) — entity extraction is optional.
+			// Skips instantly when backends are saturated.
+			entities = extractEntitiesLightweight(ctx, bgGrammarFn, req.Summary)
 		}()
 
 		wg.Wait()
@@ -303,8 +372,8 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 		}
 	}
 
-	// Quality scoring via subagent (best-effort) — score once, apply to all chunks.
-	// Pass candidate summaries for context-aware uniqueness scoring.
+	// Collect candidate summaries for async quality enrichment (context-aware
+	// uniqueness scoring). Quality scoring is deferred to avoid blocking the save.
 	var candidateSummaries []string
 	if len(candidates) > 0 {
 		candidateSummaries = make([]string, len(candidates))
@@ -312,23 +381,6 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 			candidateSummaries[i] = c.Summary
 		}
 	}
-	qs := scoreQuality(ctx, subagentFn, req.Summary, req.Salience, candidateSummaries)
-	// Merge pre-extracted entities with quality-scored entities (dedup).
-	scoredEntities := qs.Entities
-	if len(scoredEntities) > 0 {
-		seen := make(map[string]bool, len(entities))
-		for _, e := range entities {
-			seen[strings.ToLower(e)] = true
-		}
-		for _, e := range scoredEntities {
-			if !seen[strings.ToLower(e)] {
-				entities = append(entities, e)
-				seen[strings.ToLower(e)] = true
-			}
-		}
-	}
-	confidence := qs.Confidence
-	req.Salience = qs.Salience
 
 	memType := req.MemoryType
 	if memType == "" {
@@ -363,6 +415,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 	defer tx.Rollback(ctx)
 
 	var firstID int64
+	var allIDs []int64
 	for _, pc := range prepared {
 		for _, ec := range pc.embedded {
 			var id int64
@@ -371,7 +424,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 				 RETURNING id`,
 				ec.Text, pgvector.NewVector(ec.Embedding), req.Salience, req.Tags,
-				memType, entities, confidence, req.Source, req.SourceDate,
+				memType, entities, 1.0, req.Source, req.SourceDate,
 			).Scan(&id)
 			if err != nil {
 				return 0, fmt.Errorf("insert chunk %d failed: %w", pc.idx, err)
@@ -380,6 +433,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 			if firstID == 0 {
 				firstID = id
 			}
+			allIDs = append(allIDs, id)
 			logger.Log.Infof("[memory] contradiction-checked+saved id=%d chunk=%d/%d (salience=%.1f, entities=%v, source=%s): %s",
 				id, pc.idx+1, len(chunks), req.Salience, entities, req.Source, ec.Text)
 		}
@@ -397,6 +451,13 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit transaction: %w", err)
+	}
+
+	// Fire async quality enrichment after successful commit via the work
+	// queue. Each queued item gets its own fresh context, so enrichment
+	// never competes for the caller's timeout budget.
+	if queueFn != nil && len(allIDs) > 0 {
+		submitEnrichment(queueFn, db, allIDs, req.Summary, req.Salience, candidateSummaries)
 	}
 
 	return firstID, nil

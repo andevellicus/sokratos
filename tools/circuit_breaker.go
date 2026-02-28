@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -78,6 +80,17 @@ func (cb *circuitBreaker) recordSuccess() {
 	cb.failCount = 0
 	cb.state = circuitClosed
 	cb.openDur = cbOpenDuration
+}
+
+// recordFailureIfServer records a failure only if err represents a genuine
+// server problem (5xx, connection refused, etc.). Context cancellations and
+// deadline exceeded errors are the caller's fault (tight timeout, cancelled
+// parent), not a server fault, and should NOT trip the breaker.
+func (cb *circuitBreaker) recordFailureIfServer(err error) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return
+	}
+	cb.recordFailure()
 }
 
 // recordFailure increments the failure counter and opens the breaker if the

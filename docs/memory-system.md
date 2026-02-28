@@ -14,14 +14,14 @@ Each memory row holds: `summary`, `embedding` (vector(1024)), `salience` (1–10
 
 | Path | Triage? | Quality Score? | Contradiction Check? | Threshold |
 |---|---|---|---|---|
-| **Telegram conversation** | Subagent (GBNF) or deep thinker fallback | Subagent (if available) | Yes | salience >= 3 (tools) / >= 5 (parametric) |
-| **Email / Calendar check** | Subagent (GBNF) or deep thinker fallback | Subagent (if available) | Yes | All saved |
+| **Telegram conversation** | Subagent (GBNF), retry queue on failure | Subagent (if available) | Yes | salience >= 3 (tools) / >= 5 (parametric) |
+| **Email / Calendar check** | Subagent (GBNF), retry queue on failure | Subagent (if available) | Yes | salience >= 1 (email) |
 | **LLM `save_memory` tool** | No | No | No | All saved |
 | **Context slide archive** | Subagent distillation (if available) | No | No | Fixed salience=3 (raw) / >= 5 (distilled facts) |
 
 All paths chunk content at **~1200 bytes** (`MaxChunkBytes`) before embedding. BGE-large-en-v1.5 has a 512-token context window; WordPiece tokenization ranges from ~4 bytes/token (plain English) down to ~2.8 bytes/token for structured/HTML content. 1200 bytes stays safely under the 512-token hard limit even for dense email content (~425 tokens at worst case).
 
-**Triage** produces a salience score (1–10), summary, category, and tags. The primary path uses the **subagent** (GLM-4.7-Flash) with a GBNF grammar constraint for structured JSON output, configured via a `TriageConfig` struct. When the subagent is unavailable, triage falls back to the **deep thinker** (GLM-Z1-32B) with thinking disabled. For conversation triage, tool-grounded exchanges use a salience threshold of 3; unverified parametric responses use a threshold of 5 to prevent hallucinated facts from entering memory. The scoring rubric: 1–3 = routine noise, 4–6 = temporal/project relevance, 7–8 = high value/identity, 9–10 = critical/permanent (life-altering only).
+**Triage** produces a salience score (1–10), summary, category, and tags. All triage paths use the **subagent** (GLM-4.7-Flash) with a GBNF grammar constraint for structured JSON output. A unified `triageAndSave()` core function handles the post-triage pipeline (build text/tags, save with contradiction check, paradigm shift detection), with domain-specific logic in `ShouldSave` closures. Failures are enqueued to a background **retry queue** with exponential backoff. For conversation triage, tool-grounded exchanges use a salience threshold of 3; unverified parametric responses use a threshold of 5 to prevent hallucinated facts from entering memory. Email triage saves at salience >= 1 unless the model explicitly sets `save: false`. The scoring rubric: 1–3 = routine noise, 4–6 = temporal/project relevance, 7–8 = high value/identity, 9–10 = critical/permanent (life-altering only).
 
 **Quality scoring** via the subagent produces specificity, uniqueness, entities, and confidence. A quality boost adjusts salience: `salience += (specificity+uniqueness)/2 * (1 - salience/10)`.
 
@@ -78,8 +78,8 @@ Synthesis layers are triggered by **event-driven cognitive processing** (`engine
 | Layer | Trigger | Input | Output |
 |---|---|---|---|
 | **Consolidation** | Cognitive run or explicit tool call | Top memories with salience >= 8 (tool) or >= 5 (startup) | Updated identity profile row (`memory_type = 'identity'`, salience=10) in DB (thinking disabled). Also produces personality trait updates. |
-| **Episodic synthesis** | Cognitive run | Last 24h memories, clustered by cosine similarity (threshold 0.7) | Episode memories (salience=8, type=`episode`) with `related_ids` linking constituents |
-| **Reflection** | 50 new memories (checked during cognitive run) | Memories since last reflection, grouped by source/type (min 5 required) | Reflection memory (salience=9, type=`reflection`) analyzing PATTERNS, EVOLVING INTERESTS, CONNECTIONS, PREDICTIONS |
+| **Episodic synthesis** | Cognitive run | Last 24h memories, clustered by cosine similarity (threshold 0.7) | Episode memories (salience=8, type=`episode`) with `related_ids` linking constituents. Async entity enrichment via `GrammarSubagentFunc`. |
+| **Reflection** | 50 new memories (checked during cognitive run) | Memories since last reflection, grouped by source/type (min 5 required) | Reflection memory (salience=9, type=`reflection`) analyzing PATTERNS, EVOLVING INTERESTS, CONNECTIONS, PREDICTIONS. Async entity enrichment via `GrammarSubagentFunc`. |
 
 ---
 
@@ -88,7 +88,7 @@ Synthesis layers are triggered by **event-driven cognitive processing** (`engine
 | Call site | Method | Thinking | Rationale |
 |---|---|---|---|
 | `consult_deep_thinker` | `Complete` | on | Open-ended reasoning |
-| Triage (email/calendar/conversation) | `Triage` (think:false) | **off** | Structured classification |
+| Triage (email/calendar/conversation) | Subagent `CompleteWithGrammar` | **off** | Structured classification (GBNF-constrained JSON) |
 | Consolidation (profile synthesis) | `CompleteNoThink` | **off** | Structured JSON transformation |
 | Episode synthesis | `Complete` (via SynthesizeFunc) | on | Narrative reasoning |
 | Reflection | `Complete` (via SynthesizeFunc) | on | Analytical meta-cognition |

@@ -10,6 +10,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/timefmt"
 )
 
 // PrefetchResult holds the output of a prefetch: formatted XML context and
@@ -35,6 +36,7 @@ func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, que
 		`SELECT id, summary, created_at
 		 FROM memories
 		 WHERE superseded_by IS NULL
+		   AND memory_type NOT IN ('identity', 'reflection')
 		 ORDER BY `+RankingOrderBy(1, 2)+`
 		 LIMIT `+fmt.Sprintf("%d", limit),
 		pgvector.NewVector(emb), fulltext,
@@ -55,7 +57,7 @@ func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, que
 			continue
 		}
 		ids = append(ids, id)
-		fmt.Fprintf(&sb, "- %s (recorded: %s)\n", summary, createdAt.Format("2006-01-02"))
+		fmt.Fprintf(&sb, "- %s (recorded: %s)\n", ExtractSummary(summary), timefmt.FormatDate(createdAt))
 	}
 	if len(ids) == 0 {
 		return nil

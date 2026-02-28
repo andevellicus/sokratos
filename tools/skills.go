@@ -15,6 +15,7 @@ import (
 
 	"github.com/dop251/goja"
 
+	"sokratos/httputil"
 	"sokratos/logger"
 )
 
@@ -251,6 +252,7 @@ func RegisterSkill(registry *Registry, skill Skill) {
 		Name:        name,
 		Params:      skill.Params,
 		Description: skill.Manifest.Description,
+		IsSkill:     true,
 	}
 
 	registry.Register(name, fn, schema)
@@ -381,7 +383,7 @@ func httpBridge(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 		}
 	}
 
-	client := &http.Client{Timeout: TimeoutSkillHTTP}
+	client := httputil.NewClient(TimeoutSkillHTTP)
 	resp, err := client.Do(req)
 	if err != nil {
 		panic(vm.NewTypeError("http_request failed: %s", err.Error()))

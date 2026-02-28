@@ -11,9 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"sokratos/httputil"
 	"sokratos/logger"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/timefmt"
+	"sokratos/timeouts"
 )
 
 // Client wraps communication with an OpenAI-compatible LLM server (e.g. llama-server).
@@ -42,6 +45,7 @@ type Message struct {
 	Role    string        `json:"-"`
 	Content string        `json:"-"`
 	Parts   []ContentPart `json:"-"`
+	Time    time.Time     `json:"-"`
 }
 
 // MarshalJSON serializes Message. If Parts is non-empty, content is an array
@@ -127,9 +131,7 @@ type ChatResult struct {
 func NewClient(baseURL string) *Client {
 	return &Client{
 		BaseURL: baseURL,
-		HTTPClient: &http.Client{
-			Timeout: 5 * time.Minute,
-		},
+		HTTPClient: httputil.NewClient(timeouts.HTTPSafetyNet),
 		EnableThinking: true,
 	}
 }
@@ -258,7 +260,7 @@ func QueryOrchestrator(ctx context.Context, client *Client, model, prompt string
 		// current time, even across multi-round tool loops.
 		timeCapstone := Message{
 			Role:    "user",
-			Content: "[SYSTEM] CURRENT TIME: " + time.Now().Format("Monday, January 2, 2006 at 3:04 PM"),
+			Content: "[SYSTEM] CURRENT TIME: " + timefmt.FormatNatural(time.Now()),
 		}
 		sent = append(sent, timeCapstone)
 		resp, err := client.Chat(ctx, ChatRequest{

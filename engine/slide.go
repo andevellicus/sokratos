@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/timefmt"
+	"sokratos/timeouts"
 )
 
 // ArchiveDeps groups dependencies for context archival (embedding + memory save).
@@ -22,6 +25,8 @@ type ArchiveDeps struct {
 	EmbedEndpoint string
 	EmbedModel    string
 	SubagentFn    memory.SubagentFunc
+	GrammarFn     memory.GrammarSubagentFunc
+	QueueFn       memory.WorkQueueFunc // background work queue for distillation (preferred over GrammarFn)
 }
 
 // SlideAndArchiveContext trims old messages from the StateManager's
@@ -70,13 +75,23 @@ func SlideAndArchiveContext(
 	}
 
 	// Step 3 — Format archive text from msgs[1:safeIndex].
-	// Tool calls (the JSON invocation) are skipped since they carry no
-	// informational value, but tool results ARE included — they contain
-	// the actual data from search_web, read_url, etc.
+	// Tool calls are skipped (no informational value). Tool results are
+	// condensed to a one-line breadcrumb with the tool name, e.g.:
+	//   [search_web → 5 results for "weather Greenville SC"]
+	// The assistant's response already synthesizes the full details.
+	// A timestamp header gives the distillation model temporal context.
 	var b strings.Builder
+	fmt.Fprintf(&b, "[Conversation archived %s]\n", timefmt.Now())
+	var lastToolName string
 	for _, m := range msgs[1:safeIndex] {
 		if m.Role == "assistant" && isToolCallContent(m.Content) {
 			continue
+		}
+		// Track tool names from assistant messages for breadcrumb labels.
+		if m.Role == "assistant" {
+			if name := extractToolName(m.Content); name != "" {
+				lastToolName = name
+			}
 		}
 		content := m.Content
 		content = stripAgentState(content)
@@ -86,7 +101,21 @@ func SlideAndArchiveContext(
 		if content == "" {
 			continue
 		}
-		fmt.Fprintf(&b, "%s: %s\n", m.Role, content)
+		// Tool results: condense to a one-line breadcrumb with tool name.
+		if isToolMessage(m) {
+			firstLine, _, _ := strings.Cut(content, "\n")
+			if lastToolName != "" {
+				content = fmt.Sprintf("[%s → %s]", lastToolName, strings.TrimPrefix(firstLine, "Tool result: "))
+				lastToolName = ""
+			} else {
+				content = firstLine
+			}
+		}
+		if !m.Time.IsZero() {
+			fmt.Fprintf(&b, "[%s] %s: %s\n", timefmt.FormatDateTime(m.Time), m.Role, content)
+		} else {
+			fmt.Fprintf(&b, "%s: %s\n", m.Role, content)
+		}
 	}
 
 	archiveText := b.String()
@@ -108,6 +137,23 @@ func stripAgentState(s string) string {
 		return s[:idx]
 	}
 	return s
+}
+
+// extractToolName pulls the tool name from the first <TOOL_INTENT>tool_name: ...
+// tag in an assistant message. Returns "" if no tag is found.
+func extractToolName(content string) string {
+	const open = "<TOOL_INTENT>"
+	idx := strings.Index(content, open)
+	if idx < 0 {
+		return ""
+	}
+	after := content[idx+len(open):]
+	colonIdx := strings.Index(after, ":")
+	closeIdx := strings.Index(after, "</")
+	if colonIdx < 0 || (closeIdx >= 0 && closeIdx < colonIdx) {
+		return ""
+	}
+	return strings.TrimSpace(after[:colonIdx])
 }
 
 // isSafeBoundary returns true if the message is a safe place to cut:
@@ -157,31 +203,89 @@ type distilledFact struct {
 	Tags     []string `json:"tags"`
 }
 
+// distillationGrammar constrains conversation distillation output to a valid
+// JSON object with a facts array. Without this, Flash models produce malformed
+// JSON (spaces inside decimal numbers, trailing dots, etc.).
+const distillationGrammar = `root ::= "{" ws "\"facts\":" ws facts ws "}"
+facts ::= "[]" | "[" ws fact (ws "," ws fact)* ws "]"
+fact ::= "{" ws "\"text\":" ws string "," ws "\"salience\":" ws number "," ws "\"tags\":" ws tags ws "}"
+tags ::= "[]" | "[" ws string (ws "," ws string)* ws "]"
+string ::= "\"" [^"\\]* "\""
+number ::= [0-9] ("." [0-9]+)?
+ws ::= [ \t\n\r]*`
+
 // distillAndSaveArchive runs the cleaned archive text through a subagent to
-// extract lasting facts, then saves each fact individually. Falls back to
-// saving the raw cleaned archive if SubagentFn is nil.
+// extract lasting facts, then saves each fact individually. Prefers the work
+// queue (QueueFn) which gives each item its own fresh context, preventing
+// queue wait time from eating into inference time. Falls back to direct
+// GrammarFn/SubagentFn calls, then to raw archive save.
 func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
-	if deps.SubagentFn == nil {
+	if deps.QueueFn == nil && deps.GrammarFn == nil && deps.SubagentFn == nil {
 		memory.SaveToMemoryAsync(deps.DB, deps.EmbedEndpoint, deps.EmbedModel, "conversation_archive", archiveText)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	prompt := strings.TrimSpace(prompts.DistillConversation)
+
+	// Prefer the work queue — each item gets its own fresh context, so queue
+	// wait time doesn't eat into the inference timeout.
+	if deps.QueueFn != nil {
+		deps.QueueFn(memory.WorkRequest{
+			Label:        "distillation",
+			SystemPrompt: prompt,
+			UserPrompt:   archiveText,
+			Grammar:      distillationGrammar,
+			MaxTokens:    2048,
+			Timeout:      timeouts.Distillation,
+			Retries:      2,
+			OnComplete: func(raw string, err error) {
+				if err != nil {
+					logger.Log.Warnf("[slide] conversation distillation failed: %v; discarding archive", err)
+					return
+				}
+				saveDistilledFacts(deps, raw)
+			},
+		})
+		return
+	}
+
+	// Fallback: direct call (no queue available).
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.Distillation)
 	defer cancel()
 
-	raw, err := deps.SubagentFn(ctx, strings.TrimSpace(prompts.DistillConversation), archiveText)
+	var raw string
+	var err error
+	if deps.GrammarFn != nil {
+		raw, err = deps.GrammarFn(ctx, prompt, archiveText, distillationGrammar)
+	} else {
+		raw, err = deps.SubagentFn(ctx, prompt, archiveText)
+	}
 	if err != nil {
 		logger.Log.Warnf("[slide] conversation distillation failed: %v; discarding archive", err)
 		return
 	}
+	saveDistilledFacts(deps, raw)
+}
 
+// nearDuplicateThreshold is the max cosine distance for two memories to be
+// considered near-duplicates. 0.15 is strict — only near-identical semantics.
+const nearDuplicateThreshold = 0.15
+
+// saveDistilledFacts parses distillation output, deduplicates within the batch
+// and against existing memories, then saves each unique fact.
+func saveDistilledFacts(deps ArchiveDeps, raw string) {
 	cleaned := textutil.CleanLLMJSON(raw)
 	var result struct {
 		Facts []distilledFact `json:"facts"`
 	}
 	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
-		logger.Log.Warnf("[slide] conversation distillation parse failed: %v; discarding archive", err)
-		return
+		// Partial recovery: try to salvage complete facts from truncated JSON.
+		result.Facts = recoverPartialFacts(cleaned)
+		if len(result.Facts) == 0 {
+			logger.Log.Warnf("[slide] conversation distillation parse failed: %v; discarding archive", err)
+			return
+		}
+		logger.Log.Infof("[slide] recovered %d facts from truncated distillation output", len(result.Facts))
 	}
 
 	if len(result.Facts) == 0 {
@@ -189,10 +293,24 @@ func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
 		return
 	}
 
+	// Within-batch dedup by normalized text.
+	seen := make(map[string]bool)
+	saved := 0
 	for _, fact := range result.Facts {
-		if strings.TrimSpace(fact.Text) == "" || fact.Salience < 5 {
+		key := strings.ToLower(strings.TrimSpace(fact.Text))
+		if key == "" || fact.Salience < 5 || seen[key] {
 			continue
 		}
+		seen[key] = true
+
+		// Cross-batch dedup: skip if a near-duplicate already exists in DB.
+		if deps.DB != nil && deps.EmbedEndpoint != "" {
+			if isNearDuplicate(deps, fact.Text) {
+				logger.Log.Debugf("[slide] skipping near-duplicate fact: %.60s", fact.Text)
+				continue
+			}
+		}
+
 		memory.SaveToMemoryWithSalienceAsync(deps.DB, memory.MemoryWriteRequest{
 			Summary:       fact.Text,
 			Tags:          fact.Tags,
@@ -200,7 +318,71 @@ func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
 			Source:        "conversation",
 			EmbedEndpoint: deps.EmbedEndpoint,
 			EmbedModel:    deps.EmbedModel,
-		}, deps.SubagentFn)
+		}, deps.GrammarFn)
+		saved++
 	}
-	logger.Log.Infof("[slide] distilled %d facts from conversation archive", len(result.Facts))
+	logger.Log.Infof("[slide] distilled %d facts from conversation archive (%d from batch, %d after dedup)",
+		saved, len(result.Facts), saved)
+}
+
+// isNearDuplicate embeds the text and checks if a semantically similar memory
+// already exists. Returns false on any error (fail-open).
+func isNearDuplicate(deps ArchiveDeps, text string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	emb, err := memory.GetEmbedding(ctx, deps.EmbedEndpoint, deps.EmbedModel, text)
+	if err != nil {
+		return false
+	}
+
+	var exists bool
+	err = deps.DB.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM memories WHERE (embedding <=> $1) < $2 LIMIT 1)`,
+		pgvector.NewVector(emb), nearDuplicateThreshold,
+	).Scan(&exists)
+	if err != nil {
+		return false
+	}
+	return exists
+}
+
+// recoverPartialFacts attempts to salvage complete fact objects from truncated
+// JSON output. Finds complete {"text":...,"salience":...,"tags":...} objects
+// and parses them individually.
+func recoverPartialFacts(s string) []distilledFact {
+	var facts []distilledFact
+	for {
+		// Find the start of the next fact object.
+		idx := strings.Index(s, `{"text":`)
+		if idx < 0 {
+			break
+		}
+		s = s[idx:]
+
+		// Walk to find the matching closing brace.
+		depth := 0
+		end := -1
+		for i, ch := range s {
+			if ch == '{' {
+				depth++
+			} else if ch == '}' {
+				depth--
+				if depth == 0 {
+					end = i + 1
+					break
+				}
+			}
+		}
+		if end <= 0 {
+			break // truncated mid-object, stop
+		}
+
+		var fact distilledFact
+		if err := json.Unmarshal([]byte(s[:end]), &fact); err == nil && fact.Text != "" {
+			facts = append(facts, fact)
+		}
+		s = s[end:]
+	}
+	return facts
 }

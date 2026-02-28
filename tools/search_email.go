@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	gm "google.golang.org/api/gmail/v1"
 
 	"sokratos/gmail"
 	"sokratos/logger"
+	"sokratos/prompts"
+	"sokratos/timefmt"
 )
 
 type searchEmailArgs struct {
@@ -26,10 +27,11 @@ type searchEmailArgs struct {
 // Two modes:
 //   - No arguments: fetches newer_than:1h, skips already-seen message IDs
 //     (via processed_emails table), returns only new emails. Used by the
-//     monitor_inbox routine.
+//     monitor_inbox routine. When triageCfg is non-nil, all new emails are
+//     triaged and saved to memory in parallel background goroutines.
 //   - With arguments: pass-through Gmail search with optional time filters.
 //     Used for manual queries like "find emails from Mary."
-func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool) ToolFunc {
+func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *TriageConfig, lookback string, displayBatch int) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a searchEmailArgs
 		if args != nil && len(args) > 2 {
@@ -40,7 +42,7 @@ func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool) ToolFunc {
 
 		// No-arg mode: dedup check for new emails.
 		if a.Query == "" && a.TimeMin == "" && a.TimeMax == "" {
-			return checkNewEmails(ctx, svc, pool)
+			return checkNewEmails(ctx, svc, pool, triageCfg, lookback, displayBatch)
 		}
 
 		// Search mode: pass-through to Gmail.
@@ -48,10 +50,12 @@ func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool) ToolFunc {
 	}
 }
 
-// checkNewEmails fetches recent emails, filters out already-seen IDs, and
-// records new ones. Returns only unseen emails.
-func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool) (string, error) {
-	emails, err := gmail.FetchEmails(svc, "newer_than:1h", 20)
+// checkNewEmails fetches recent emails, filters out already-seen IDs, records
+// ALL new ones as processed, and triages each in a background goroutine (when
+// triageCfg is non-nil). Returns only the first maxBatch emails to the
+// orchestrator for immediate action — context window protection.
+func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool, triageCfg *TriageConfig, lookback string, displayBatch int) (string, error) {
+	emails, err := gmail.FetchEmails(svc, lookback, 20)
 	if err != nil {
 		return fmt.Sprintf("Failed to fetch emails: %v", err), nil
 	}
@@ -59,18 +63,19 @@ func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool) (s
 		return "No emails in the last hour.", nil
 	}
 
+	tracker := &ProcessedTracker{Pool: pool, Table: "processed_emails", IDColumn: "message_id"}
+	emailIDs := make([]string, len(emails))
+	for i, e := range emails {
+		emailIDs[i] = e.ID
+	}
+	newIDs := tracker.FilterNew(ctx, emailIDs)
+	newIDSet := make(map[string]bool, len(newIDs))
+	for _, id := range newIDs {
+		newIDSet[id] = true
+	}
 	var newEmails []gmail.Email
 	for _, e := range emails {
-		var exists bool
-		err := pool.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM processed_emails WHERE message_id = $1)`,
-			e.ID).Scan(&exists)
-		if err != nil {
-			logger.Log.Warnf("[search_email] dedup lookup failed for %s: %v", e.ID, err)
-			newEmails = append(newEmails, e)
-			continue
-		}
-		if !exists {
+		if newIDSet[e.ID] {
 			newEmails = append(newEmails, e)
 		}
 	}
@@ -79,27 +84,65 @@ func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool) (s
 		return "No new emails since last check.", nil
 	}
 
-	// Cap batch size to avoid blowing up the context window.
-	// Unseen emails beyond the cap stay unrecorded and get picked up next cycle.
-	const maxBatch = 5
-	batch := newEmails
-	if len(batch) > maxBatch {
-		batch = batch[:maxBatch]
+	// Record ALL new emails as processed and triage each in parallel.
+	markIDs := make([]string, len(newEmails))
+	for i, e := range newEmails {
+		markIDs[i] = e.ID
 	}
-
-	for _, e := range batch {
-		if _, err := pool.Exec(ctx,
-			`INSERT INTO processed_emails (message_id) VALUES ($1) ON CONFLICT DO NOTHING`,
-			e.ID); err != nil {
-			logger.Log.Warnf("[search_email] failed to record %s as processed: %v", e.ID, err)
+	tracker.MarkProcessed(ctx, markIDs)
+	for _, e := range newEmails {
+		if triageCfg != nil {
+			triageAndSaveEmailAsync(*triageCfg, e)
 		}
 	}
 
+	// Return only the capped batch to orchestrator for immediate action.
+	batch := newEmails
+	if len(batch) > displayBatch {
+		batch = batch[:displayBatch]
+	}
+
 	header := fmt.Sprintf("%d new email(s):", len(batch))
-	if len(newEmails) > maxBatch {
-		header = fmt.Sprintf("%d new email(s) (%d more next cycle):", len(batch), len(newEmails)-maxBatch)
+	if len(newEmails) > displayBatch {
+		header = fmt.Sprintf("%d new email(s) (%d more triaged in background):", len(batch), len(newEmails)-displayBatch)
 	}
 	return formatEmails(batch, header), nil
+}
+
+// triageAndSaveEmailAsync sends an email for triage scoring, then saves it to
+// memory if it meets the salience threshold. Runs as a fire-and-forget goroutine.
+func triageAndSaveEmailAsync(cfg TriageConfig, email gmail.Email) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
+		defer cancel()
+
+		formatted := gmail.FormatEmailSummary(email)
+		sourceDate := email.Date
+
+		err := triageAndSave(ctx, cfg, TriageSaveRequest{
+			TriagePrompt:  strings.TrimSpace(prompts.EmailTriage),
+			TriageInput:   formatted,
+			SourceContent: formatted,
+			SourceLabel:   "Source email",
+			DomainTag:     "email",
+			MemoryType:    "email",
+			Source:        "email",
+			SourceDate:    &sourceDate,
+			MaxTriageLen:  4000,
+			ShouldSave: func(r *triageResult) bool {
+				if r.Save != nil && !*r.Save {
+					return false
+				}
+				return r.SalienceScore >= 1
+			},
+		})
+		if err != nil {
+			logger.Log.Warnf("[email_triage] failed: %v", err)
+			if cfg.RetryQueue != nil {
+				EnqueueEmailTriage(cfg.RetryQueue, cfg, formatted, formatted)
+			}
+		}
+	}()
 }
 
 // searchGmail performs a direct Gmail API search with query and optional time filters.
@@ -123,12 +166,12 @@ func searchGmail(ctx context.Context, svc *gm.Service, a searchEmailArgs) (strin
 		queryParts = append(queryParts, query)
 	}
 	if a.TimeMin != "" {
-		if t, err := time.Parse(time.RFC3339, a.TimeMin); err == nil {
+		if t, err := timefmt.ParseISO8601(a.TimeMin); err == nil {
 			queryParts = append(queryParts, fmt.Sprintf("after:%d", t.Unix()))
 		}
 	}
 	if a.TimeMax != "" {
-		if t, err := time.Parse(time.RFC3339, a.TimeMax); err == nil {
+		if t, err := timefmt.ParseISO8601(a.TimeMax); err == nil {
 			queryParts = append(queryParts, fmt.Sprintf("before:%d", t.Unix()))
 		}
 	}

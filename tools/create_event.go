@@ -8,6 +8,7 @@ import (
 
 	"sokratos/calendar"
 	"sokratos/logger"
+	"sokratos/timefmt"
 
 	cal "google.golang.org/api/calendar/v3"
 )
@@ -35,17 +36,17 @@ func NewCreateEvent(svc *cal.Service) ToolFunc {
 			return "error: 'start' is required (RFC3339 format)", nil
 		}
 
-		startTime, err := time.Parse(time.RFC3339, a.Start)
+		startTime, err := timefmt.ParseISO8601(a.Start)
 		if err != nil {
-			return fmt.Sprintf("error: invalid start time: %v (expected RFC3339 format)", err), nil
+			return fmt.Sprintf("error: invalid start time: %v (expected ISO8601/RFC3339 format)", err), nil
 		}
 
 		endTime := startTime.Add(1 * time.Hour) // default: 1 hour
 		if a.End != "" {
-			if t, err := time.Parse(time.RFC3339, a.End); err == nil {
+			if t, err := timefmt.ParseISO8601(a.End); err == nil {
 				endTime = t
 			} else {
-				return fmt.Sprintf("error: invalid end time: %v (expected RFC3339 format)", err), nil
+				return fmt.Sprintf("error: invalid end time: %v (expected ISO8601/RFC3339 format)", err), nil
 			}
 		}
 
@@ -59,8 +60,8 @@ func NewCreateEvent(svc *cal.Service) ToolFunc {
 
 		result := fmt.Sprintf("Event created successfully:\nTitle: %s\nStart: %s\nEnd: %s",
 			event.Summary,
-			event.Start.Format("2006-01-02 15:04"),
-			event.End.Format("2006-01-02 15:04"))
+			timefmt.FormatDateTime(event.Start),
+			timefmt.FormatDateTime(event.End))
 		if event.Location != "" {
 			result += fmt.Sprintf("\nLocation: %s", event.Location)
 		}

@@ -12,12 +12,19 @@ import (
 	"sokratos/logger"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/timefmt"
 )
 
 // toolIntentCodeRe matches <TOOL_INTENT>...<CODE>...</CODE> with an optional
 // </TOOL_INTENT> after it. The captured group INCLUDES the </CODE> tag so
 // parseToolIntent can extract the code block properly.
 var toolIntentCodeRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?</CODE>)\s*(?:<[/\\]?TOOL_INT[A-Z]*>)?`)
+
+// closingToolIntentRe matches closing TOOL_INTENT tags (including common
+// model mistakes). Used to strip stray closing tags from the intent after
+// CODE block removal — when the model places </TOOL_INTENT> before <CODE>,
+// the code-block regex captures the inner closing tag as part of the content.
+var closingToolIntentRe = regexp.MustCompile(`<[/\\]TOOL_INT[A-Z]*>`)
 
 // toolIntentRe matches <TOOL_INTENT>...</TOOL_INTENT> for intents without
 // a <CODE> block, including common model mistakes (backslash closer,
@@ -81,6 +88,9 @@ func parseToolIntent(intent string) (string, bool) {
 		// Remove the <CODE>...</CODE> block from the intent so the
 		// remainder is clean "tool_name: {json_args}".
 		intent = strings.TrimSpace(codeRe.ReplaceAllString(intent, ""))
+		// Strip stray closing TOOL_INTENT tags that may remain when the
+		// model places </TOOL_INTENT> before the <CODE> block.
+		intent = strings.TrimSpace(closingToolIntentRe.ReplaceAllString(intent, ""))
 	}
 
 	colonIdx := strings.Index(intent, ":")
@@ -204,10 +214,11 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		if trimFn != nil {
 			sent = trimFn(messages)
 		}
-		// Rolling timestamp capstone.
+		// Rolling timestamp capstone. Marked as system context so the model
+		// doesn't treat it as a user message requiring a response.
 		timeCapstone := Message{
 			Role:    "user",
-			Content: "[SYSTEM] CURRENT TIME: " + time.Now().Format("Monday, January 2, 2006 at 3:04 PM"),
+			Content: "[SYSTEM CONTEXT — not a user message, do not respond to this] Current time: " + timefmt.FormatNatural(time.Now()),
 		}
 		sent = append(sent, timeCapstone)
 

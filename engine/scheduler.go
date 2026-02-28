@@ -12,6 +12,7 @@ import (
 
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/timefmt"
 	"sokratos/timeouts"
 )
 
@@ -98,7 +99,7 @@ func (e *Engine) executeTask(task Task) {
 			"Respond directly to the user with a short message fulfilling this task. "+
 			"Do NOT call complete_task, update_state, add_task, or save_memory — the system handles task lifecycle automatically. "+
 			"Current time: %s",
-		task.Description, time.Now().Format(time.RFC3339),
+		task.Description, timefmt.Now(),
 	)
 
 	var reply string

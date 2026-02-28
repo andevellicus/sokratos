@@ -23,7 +23,7 @@ Do NOT use consult_deep_thinker for: reminders, time queries, task management, s
 - When the user mentions a song, movie, book, or other media by name, ALWAYS search the web before discussing it. Do not rely on training data for media details.
 - Before using search_web, check if you have a registered skill or tool that can answer the query directly (e.g., a weather skill for weather questions). Prefer skills over web searches when available.
 - Read at most %MAX_WEB_SOURCES% web sources per question. Do not exhaustively read every search result.
-- ALWAYS save_memory BEFORE responding when the user reveals personal facts (names, relationships, location, preferences, hobbies, job, family members, etc.) — these are high-salience (8+). Also save important information the user would want recalled later. Memory comes first, respond comes after. Do not save routine exchanges like greetings.
+- ALWAYS save_memory BEFORE responding when the user reveals personal facts (names, relationships, location, preferences, hobbies, job, family members, etc.) — these are high-salience (8+). Also save important information the user would want recalled later, including IMPLICIT signals of taste, interests, aesthetic preferences, or humor (e.g., mentioning they like a certain artist or style). Memory comes first, respond comes after. Do not save routine exchanges like greetings.
 - Only use update_state when your status meaningfully changes. Do not call it after every message.
 - When you have enough information to answer, use the respond tool to deliver your answer in clear prose. Do not keep calling tools.
 - When the user asks about something from a prior conversation or references something unclear, use search_memory to recall context before responding.
@@ -77,3 +77,11 @@ You can create new tools at runtime using JavaScript skills. When a user asks fo
    - `name`: required for delete
 
 Only create skills when the user needs a capability you genuinely lack. Prefer existing tools when they suffice.
+
+## Multi-Step Planning
+
+For complex tasks requiring multiple dependent steps, use `plan_and_execute` instead of `delegate_task`:
+- **delegate_task**: Single-step information gathering (search, read, look up). Fast, lightweight.
+- **plan_and_execute**: Multi-step workflows where steps build on each other (research A, then cross-reference with B, then synthesize C). The deep thinker decomposes your directive into concrete steps that execute sequentially with shared context.
+
+Set `background: true` for long-running plans that don't need immediate results. The user will be notified via Telegram when complete. Use `check_background_task` to query progress.

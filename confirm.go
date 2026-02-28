@@ -88,6 +88,7 @@ func confirmToolExec(
 	callbacks <-chan *tgbotapi.CallbackQuery,
 	allowedIDs map[int64]struct{},
 	confirmTools map[string]bool,
+	confirmTimeout time.Duration,
 ) func(context.Context, json.RawMessage) (string, error) {
 	const approvalTTL = 5 * time.Minute
 
@@ -142,7 +143,7 @@ func confirmToolExec(
 				}
 			}
 
-			timer := time.NewTimer(2 * time.Minute)
+			timer := time.NewTimer(confirmTimeout)
 			defer timer.Stop()
 			for {
 				select {

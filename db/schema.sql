@@ -118,9 +118,41 @@ CREATE TABLE IF NOT EXISTS processed_emails (
     seen_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS processed_events (
+    event_uid VARCHAR(512) PRIMARY KEY,
+    seen_at TIMESTAMPTZ DEFAULT now()
+);
+
 INSERT INTO routines (name, interval_duration, instruction)
 VALUES (
     'monitor_inbox',
     '5m',
-    'Use search_email with no arguments to check for new emails. For each email, evaluate its importance. If it contains facts worth remembering (people, dates, plans, preferences, commitments), save them using save_memory. Ignore newsletters, receipts, and spam. Do not message the user unless an email is critically urgent.'
+    'Use search_email with no arguments to check for new emails. Emails are automatically triaged and saved by the background pipeline — do NOT call save_memory for email content. Only evaluate whether any email requires urgent user notification. Do not message the user unless an email is critically urgent.'
 ) ON CONFLICT (name) DO NOTHING;
+
+-- Migration: update existing monitor_inbox instruction to remove save_memory directive.
+UPDATE routines SET instruction = 'Use search_email with no arguments to check for new emails. Emails are automatically triaged and saved by the background pipeline — do NOT call save_memory for email content. Only evaluate whether any email requires urgent user notification. Do not message the user unless an email is critically urgent.'
+WHERE name = 'monitor_inbox';
+
+CREATE TABLE IF NOT EXISTS conversation_snapshot (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    messages JSONB NOT NULL DEFAULT '[]',
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id BIGSERIAL PRIMARY KEY,
+    directive TEXT NOT NULL,
+    status VARCHAR(20) DEFAULT 'running',
+    result TEXT,
+    steps_total INT DEFAULT 0,
+    steps_completed INT DEFAULT 0,
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS background_tasks_status_idx
+    ON background_tasks (status) WHERE status = 'running';
+
+ALTER TABLE background_tasks ADD COLUMN IF NOT EXISTS priority INT DEFAULT 5;

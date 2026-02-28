@@ -35,7 +35,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 
 		// Validate name.
 		if !skillNameRe.MatchString(a.Name) {
-			return "Invalid skill name: must match ^[a-z][a-z0-9_-]{1,48}$ (lowercase, 2-49 chars)", nil
+			return "Invalid skill name: must be lowercase letters, digits, underscores, or dashes, 2-49 chars", nil
 		}
 
 		// Check for collision with existing tools.

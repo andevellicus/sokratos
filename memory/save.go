@@ -19,6 +19,31 @@ import (
 // actual LLM client, keeping the memory package free of llm/tools imports.
 type SubagentFunc func(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 
+// GrammarSubagentFunc is like SubagentFunc but accepts a GBNF grammar string
+// to constrain the model's output. Used for quality scoring and entity
+// extraction where Flash models ignore "return ONLY JSON" instructions and
+// dump chain-of-thought reasoning unless grammar-constrained.
+type GrammarSubagentFunc func(ctx context.Context, systemPrompt, userPrompt, grammar string) (string, error)
+
+// WorkRequest describes a background LLM task to be processed by the work
+// queue. Each item gets its own fresh context (with Timeout duration), so
+// queue wait time does not eat into inference time.
+type WorkRequest struct {
+	Label        string
+	SystemPrompt string
+	UserPrompt   string
+	Grammar      string
+	MaxTokens    int
+	Timeout      time.Duration
+	Retries      int // remaining retry attempts on transient failure (0 = no retry)
+	OnComplete   func(result string, err error)
+}
+
+// WorkQueueFunc submits a background LLM task to the work queue. Items are
+// processed sequentially as server slots become available. Nothing is dropped
+// unless the queue buffer is completely full (64 items).
+type WorkQueueFunc func(req WorkRequest)
+
 // MemoryWriteRequest describes a memory to be quality-scored and written.
 type MemoryWriteRequest struct {
 	Summary       string
@@ -54,14 +79,14 @@ func SaveToMemoryAsync(db *pgxpool.Pool, embedEndpoint, embedModel, tag, content
 }
 
 // SaveToMemoryWithSalienceAsync is like SaveToMemoryAsync but accepts a
-// MemoryWriteRequest with custom salience, tags, and source. When subagentFn
+// MemoryWriteRequest with custom salience, tags, and source. When grammarFn
 // is non-nil, quality scoring (entities, confidence) is performed via ScoreAndWrite.
-func SaveToMemoryWithSalienceAsync(db *pgxpool.Pool, req MemoryWriteRequest, subagentFn SubagentFunc) {
+func SaveToMemoryWithSalienceAsync(db *pgxpool.Pool, req MemoryWriteRequest, grammarFn GrammarSubagentFunc) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutSaveOp)
 		defer cancel()
 
-		id, err := ScoreAndWrite(ctx, db, req, subagentFn)
+		id, err := ScoreAndWrite(ctx, db, req, grammarFn)
 		if err != nil {
 			logger.Log.Errorf("[memory] async save failed: %v", err)
 			return
@@ -144,6 +169,9 @@ func WriteIdentityProfile(ctx context.Context, db *pgxpool.Pool, embedEndpoint, 
 	embedded, err := embedWithFallback(ctx, embedEndpoint, embedModel, "identity profile: "+profileJSON)
 	if err != nil {
 		return fmt.Errorf("embed identity profile: %w", err)
+	}
+	if len(embedded) == 0 {
+		return fmt.Errorf("embedding returned no vectors for identity profile")
 	}
 
 	// Insert + supersede in a single transaction.

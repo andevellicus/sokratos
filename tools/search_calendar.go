@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	cal "google.golang.org/api/calendar/v3"
 
 	"sokratos/calendar"
@@ -67,13 +68,58 @@ func temporalOnlyQuery(q string) bool {
 	return true
 }
 
+// eventUID returns a stable identifier for dedup. Prefers ICalUID (RFC5545),
+// falls back to the Google event ID.
+func eventUID(e calendar.Event) string {
+	if e.ICalUID != "" {
+		return e.ICalUID
+	}
+	return e.ID
+}
+
+// filterNewEvents removes events whose UID is already in processed_events.
+func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []calendar.Event) []calendar.Event {
+	tracker := &ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
+	uids := make([]string, len(events))
+	for i, e := range events {
+		uids[i] = eventUID(e)
+	}
+	newUIDs := tracker.FilterNew(ctx, uids)
+	newUIDSet := make(map[string]bool, len(newUIDs))
+	for _, uid := range newUIDs {
+		newUIDSet[uid] = true
+	}
+	var newEvents []calendar.Event
+	for _, e := range events {
+		if newUIDSet[eventUID(e)] {
+			newEvents = append(newEvents, e)
+		}
+	}
+	return newEvents
+}
+
+// markEventsProcessed inserts event UIDs into processed_events.
+func markEventsProcessed(ctx context.Context, pool *pgxpool.Pool, events []calendar.Event) {
+	tracker := &ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
+	uids := make([]string, len(events))
+	for i, e := range events {
+		uids[i] = eventUID(e)
+	}
+	tracker.MarkProcessed(ctx, uids)
+}
+
 // NewSearchCalendar returns a ToolFunc that searches Google Calendar directly.
-func NewSearchCalendar(svc *cal.Service) ToolFunc {
+// When pool is non-nil and the call has no arguments (routine mode), events are
+// deduplicated against processed_events so the orchestrator only sees new ones.
+func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a searchCalendarArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return fmt.Sprintf("invalid arguments: %v", err), nil
 		}
+
+		// Detect routine mode: no explicit arguments provided.
+		routineMode := pool != nil && a.Query == "" && a.TimeMin == "" && a.TimeMax == ""
 
 		maxResults := int64(25)
 		if a.MaxResults > 0 {
@@ -116,17 +162,49 @@ func NewSearchCalendar(svc *cal.Service) ToolFunc {
 			return fmt.Sprintf("Failed to search calendar: %v", err), nil
 		}
 
+		// When Q + time bounds returns nothing, fall back to time-bounds-only
+		// so the orchestrator sees what's actually on the calendar without
+		// needing a second round-trip. The Q parameter does full-text search
+		// and misses events where the person/topic isn't in the event title.
+		droppedQuery := false
+		if len(events) == 0 && query != "" && (timeMin != nil || timeMax != nil) {
+			logger.Log.Infof("[search_calendar] Q=%q with time bounds returned 0 results, retrying without Q", query)
+			events, err = calendar.SearchEvents(svc, "", timeMin, timeMax, maxResults)
+			if err != nil {
+				logger.Log.Errorf("[search_calendar] fallback failed: %v", err)
+				return fmt.Sprintf("Failed to search calendar: %v", err), nil
+			}
+			droppedQuery = true
+		}
+
+		// In routine mode, filter out already-seen events.
+		if routineMode && len(events) > 0 {
+			events = filterNewEvents(ctx, pool, events)
+			if len(events) == 0 {
+				return "No new events since last check.", nil
+			}
+		}
+
 		if len(events) == 0 {
 			return "No events found matching your query.", nil
 		}
 
 		var b strings.Builder
-		fmt.Fprintf(&b, "Found %d event(s):\n\n", len(events))
+		if droppedQuery {
+			fmt.Fprintf(&b, "No events matched %q specifically, but found %d event(s) in the time range:\n\n", a.Query, len(events))
+		} else {
+			fmt.Fprintf(&b, "Found %d event(s):\n\n", len(events))
+		}
 		for i, e := range events {
 			fmt.Fprintf(&b, "--- Event %d ---\n%s\n\n", i+1, calendar.FormatEventSummary(e))
 		}
 
-		logger.Log.Infof("[search_calendar] %d results found for %q", len(events), a.Query)
+		// In routine mode, mark events as processed after formatting.
+		if routineMode {
+			markEventsProcessed(ctx, pool, events)
+		}
+
+		logger.Log.Infof("[search_calendar] %d results found for %q (fallback=%v, routine=%v)", len(events), a.Query, droppedQuery, routineMode)
 		return b.String(), nil
 	}
 }

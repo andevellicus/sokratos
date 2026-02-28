@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"sokratos/httputil"
 )
 
 // --- Embedding client ---
@@ -23,7 +25,7 @@ type embeddingResp struct {
 	} `json:"data"`
 }
 
-var embeddingHTTPClient = &http.Client{Timeout: TimeoutEmbeddingCall}
+var embeddingHTTPClient = httputil.NewClient(TimeoutEmbeddingCall)
 
 // embeddedChunk pairs a text fragment with its embedding vector.
 type embeddedChunk struct {

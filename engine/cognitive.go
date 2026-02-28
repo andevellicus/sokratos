@@ -9,12 +9,10 @@ import (
 	"sokratos/timeouts"
 )
 
-const maintenanceInterval = 30 * time.Minute
-
 // runMaintenanceIfDue runs lightweight maintenance (salience decay, stale memory
-// pruning) at most every 30 minutes.
+// pruning) at most every MaintenanceInterval.
 func (e *Engine) runMaintenanceIfDue() {
-	if e.DB == nil || time.Since(e.lastMaintenanceRun) < maintenanceInterval {
+	if e.DB == nil || time.Since(e.lastMaintenanceRun) < e.MaintenanceInterval {
 		return
 	}
 	e.lastMaintenanceRun = time.Now()
@@ -43,9 +41,9 @@ func (e *Engine) runCognitiveIfTriggered() {
 		return
 	}
 
-	count, err := memory.CountMemoriesSinceLastReflection(context.Background(), e.DB)
+	count, err := memory.CountMemoriesSince(context.Background(), e.DB, e.lastCognitiveRun)
 	if err != nil {
-		logger.Log.Warnf("[engine] cognitive: unreflected count failed: %v", err)
+		logger.Log.Warnf("[engine] cognitive: memory count failed: %v", err)
 		return
 	}
 
@@ -61,16 +59,19 @@ func (e *Engine) runCognitiveIfTriggered() {
 	logger.Log.Infof("[engine] cognitive processing triggered (count=%d, buffer_full=%v, lull=%v, ceiling=%v)",
 		count, bufferFull, lull, ceilingHit)
 
-	// 1. Reflection (if count meets the reflection-specific threshold).
-	if e.Cognitive.SynthesizeFunc != nil && e.Cognitive.ReflectionPrompt != "" && e.Cognitive.ReflectionMemoryThreshold > 0 && count >= e.Cognitive.ReflectionMemoryThreshold {
-		logger.Log.Infof("[engine] reflection threshold reached (%d >= %d)", count, e.Cognitive.ReflectionMemoryThreshold)
-		e.triggerReflection()
+	// 1. Reflection (if unreflected count meets the reflection-specific threshold).
+	if e.Cognitive.SynthesizeFunc != nil && e.Cognitive.ReflectionPrompt != "" && e.Cognitive.ReflectionMemoryThreshold > 0 {
+		reflCount, reflErr := memory.CountMemoriesSinceLastReflection(context.Background(), e.DB)
+		if reflErr == nil && reflCount >= e.Cognitive.ReflectionMemoryThreshold {
+			logger.Log.Infof("[engine] reflection threshold reached (%d >= %d)", reflCount, e.Cognitive.ReflectionMemoryThreshold)
+			e.triggerReflection()
+		}
 	}
 
 	// 2. Episode synthesis.
 	if e.Cognitive.SynthesizeFunc != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), timeouts.Synthesis)
-		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.SynthesizeFunc)
+		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.SynthesizeFunc, e.GrammarFunc)
 		cancel()
 		if synthErr != nil {
 			logger.Log.Warnf("[engine] episode synthesis failed: %v", synthErr)
@@ -130,7 +131,7 @@ func (e *Engine) triggerReflection() {
 		since = *lastReflection
 	}
 
-	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.ReflectionPrompt, e.Cognitive.SynthesizeFunc, since)
+	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.ReflectionPrompt, e.Cognitive.SynthesizeFunc, e.GrammarFunc, since)
 	if err != nil {
 		logger.Log.Warnf("[engine] reflection failed: %v", err)
 	} else if id > 0 {

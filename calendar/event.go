@@ -2,35 +2,85 @@ package calendar
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	cal "google.golang.org/api/calendar/v3"
+
+	"sokratos/timefmt"
 )
 
 // Event holds parsed fields from a Google Calendar event.
 type Event struct {
-	ID          string
-	Summary     string
-	Description string
-	Location    string
-	Start       time.Time
-	End         time.Time
-	AllDay      bool
-	Organizer   string
-	Attendees   []string // email addresses
-	Status      string   // confirmed, tentative, cancelled
-	HtmlLink    string
+	ID           string
+	Summary      string
+	Description  string
+	Location     string
+	Start        time.Time
+	End          time.Time
+	AllDay       bool
+	Organizer    string
+	Attendees    []string // email addresses
+	Status       string   // confirmed, tentative, cancelled
+	HtmlLink     string
+	CalendarID   string
+	CalendarName string
+	ICalUID      string // RFC5545 UID for cross-calendar dedup
+}
+
+// calInfo pairs a calendar ID with its display name.
+type calInfo struct {
+	ID   string
+	Name string
+}
+
+// Calendar list cache with TTL.
+var (
+	calCache     []calInfo
+	calCacheTime time.Time
+	calCacheMu   sync.RWMutex
+	calCacheTTL  = 10 * time.Minute
+)
+
+// cachedCalendars returns visible calendars, using a TTL cache to avoid
+// hitting the CalendarList API on every search.
+func cachedCalendars(svc *cal.Service) []calInfo {
+	calCacheMu.RLock()
+	if time.Since(calCacheTime) < calCacheTTL && len(calCache) > 0 {
+		cached := calCache
+		calCacheMu.RUnlock()
+		return cached
+	}
+	calCacheMu.RUnlock()
+
+	calCacheMu.Lock()
+	defer calCacheMu.Unlock()
+	// Double-check after write lock.
+	if time.Since(calCacheTime) < calCacheTTL && len(calCache) > 0 {
+		return calCache
+	}
+	cals, err := listVisibleCalendars(svc)
+	if err != nil || len(cals) == 0 {
+		return []calInfo{{ID: "primary", Name: "Primary"}}
+	}
+	calCache = cals
+	calCacheTime = time.Now()
+	return cals
 }
 
 // ParseEvent extracts an Event from a raw Google Calendar API event.
-func ParseEvent(e *cal.Event) Event {
+func ParseEvent(e *cal.Event, calID, calName string) Event {
 	ev := Event{
-		ID:       e.Id,
-		Summary:  e.Summary,
-		Location: e.Location,
-		Status:   e.Status,
-		HtmlLink: e.HtmlLink,
+		ID:           e.Id,
+		Summary:      e.Summary,
+		Location:     e.Location,
+		Status:       e.Status,
+		HtmlLink:     e.HtmlLink,
+		CalendarID:   calID,
+		CalendarName: calName,
+		ICalUID:      e.ICalUID,
 	}
 
 	if e.Description != "" {
@@ -94,44 +144,99 @@ func FetchUpcoming(svc *cal.Service, maxResults int64, timeMin time.Time) ([]Eve
 
 	var events []Event
 	for _, item := range list.Items {
-		events = append(events, ParseEvent(item))
+		events = append(events, ParseEvent(item, "primary", "Primary"))
 	}
 
 	return events, nil
 }
 
 // SearchEvents retrieves events matching a text query within a time range.
+// It searches across all visible calendars (not just "primary") so that
+// shared/family/subscribed calendars are included.
 func SearchEvents(svc *cal.Service, query string, timeMin, timeMax *time.Time, maxResults int64) ([]Event, error) {
 	if maxResults <= 0 {
 		maxResults = 25
 	}
 
-	req := svc.Events.List("primary").
-		SingleEvents(true).
-		OrderBy("startTime").
-		MaxResults(maxResults)
+	cals := cachedCalendars(svc)
 
-	if query != "" {
-		req = req.Q(query)
-	}
-	if timeMin != nil {
-		req = req.TimeMin(timeMin.Format(time.RFC3339))
-	}
-	if timeMax != nil {
-		req = req.TimeMax(timeMax.Format(time.RFC3339))
+	var allEvents []Event
+	for _, c := range cals {
+		req := svc.Events.List(c.ID).
+			SingleEvents(true).
+			OrderBy("startTime").
+			MaxResults(maxResults)
+
+		if query != "" {
+			req = req.Q(query)
+		}
+		if timeMin != nil {
+			req = req.TimeMin(timeMin.Format(time.RFC3339))
+		}
+		if timeMax != nil {
+			req = req.TimeMax(timeMax.Format(time.RFC3339))
+		}
+
+		list, err := req.Do()
+		if err != nil {
+			// Skip calendars that error (e.g. permission issues) rather
+			// than failing the entire search.
+			continue
+		}
+
+		for _, item := range list.Items {
+			allEvents = append(allEvents, ParseEvent(item, c.ID, c.Name))
+		}
 	}
 
-	list, err := req.Do()
+	// Deduplicate by ICalUID before sorting.
+	allEvents = deduplicateEvents(allEvents)
+
+	// Sort by start time and cap at maxResults.
+	sort.Slice(allEvents, func(i, j int) bool {
+		return allEvents[i].Start.Before(allEvents[j].Start)
+	})
+	if int64(len(allEvents)) > maxResults {
+		allEvents = allEvents[:maxResults]
+	}
+
+	return allEvents, nil
+}
+
+// deduplicateEvents removes duplicate events by ICalUID (RFC5545), falling
+// back to event ID when ICalUID is empty.
+func deduplicateEvents(events []Event) []Event {
+	seen := make(map[string]bool, len(events))
+	result := make([]Event, 0, len(events))
+	for _, e := range events {
+		key := e.ICalUID
+		if key == "" {
+			key = e.ID
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, e)
+	}
+	return result
+}
+
+// listVisibleCalendars returns info for all calendars the user can see.
+func listVisibleCalendars(svc *cal.Service) ([]calInfo, error) {
+	list, err := svc.CalendarList.List().Fields("items/id,items/summary").Do()
 	if err != nil {
-		return nil, fmt.Errorf("search events: %w", err)
+		return nil, fmt.Errorf("list calendars: %w", err)
 	}
-
-	var events []Event
-	for _, item := range list.Items {
-		events = append(events, ParseEvent(item))
+	cals := make([]calInfo, len(list.Items))
+	for i, item := range list.Items {
+		name := item.Summary
+		if name == "" {
+			name = item.Id
+		}
+		cals[i] = calInfo{ID: item.Id, Name: name}
 	}
-
-	return events, nil
+	return cals, nil
 }
 
 // CreateEvent creates a new event on the primary calendar.
@@ -157,7 +262,7 @@ func CreateEvent(svc *cal.Service, summary, description, location string, start,
 		return nil, fmt.Errorf("create event: %w", err)
 	}
 
-	result := ParseEvent(created)
+	result := ParseEvent(created, "primary", "Primary")
 	return &result, nil
 }
 
@@ -167,15 +272,18 @@ func FormatEventSummary(e Event) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "Title: %s\n", e.Summary)
+	if e.CalendarName != "" {
+		fmt.Fprintf(&b, "Calendar: %s\n", e.CalendarName)
+	}
 	if !e.Start.IsZero() {
 		if e.AllDay {
-			fmt.Fprintf(&b, "Date: %s (all day)\n", e.Start.Format("2006-01-02"))
+			fmt.Fprintf(&b, "Date: %s (all day)\n", timefmt.FormatDate(e.Start))
 		} else {
-			fmt.Fprintf(&b, "Start: %s\n", e.Start.Format("2006-01-02 15:04"))
+			fmt.Fprintf(&b, "Start: %s\n", timefmt.FormatDateTime(e.Start))
 		}
 	}
 	if !e.End.IsZero() && !e.AllDay {
-		fmt.Fprintf(&b, "End: %s\n", e.End.Format("2006-01-02 15:04"))
+		fmt.Fprintf(&b, "End: %s\n", timefmt.FormatDateTime(e.End))
 	}
 	if e.Location != "" {
 		fmt.Fprintf(&b, "Location: %s\n", e.Location)

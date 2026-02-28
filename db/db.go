@@ -17,18 +17,27 @@ var schema string
 // Pool is the application-wide connection pool.
 var Pool *pgxpool.Pool
 
+// DBPoolConfig holds tunable connection pool parameters.
+type DBPoolConfig struct {
+	MaxConns          int
+	MinConns          int
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
+}
+
 // Connect creates a connection pool from the given DATABASE_URL, verifies
 // connectivity, and ensures the required schema exists.
-func Connect(ctx context.Context, databaseURL string) error {
+func Connect(ctx context.Context, databaseURL string, poolCfg DBPoolConfig) error {
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return fmt.Errorf("parse pool config: %w", err)
 	}
-	poolConfig.MaxConns = 20
-	poolConfig.MinConns = 2
-	poolConfig.MaxConnLifetime = 30 * time.Minute
-	poolConfig.MaxConnIdleTime = 5 * time.Minute
-	poolConfig.HealthCheckPeriod = 30 * time.Second
+	poolConfig.MaxConns = int32(poolCfg.MaxConns)
+	poolConfig.MinConns = int32(poolCfg.MinConns)
+	poolConfig.MaxConnLifetime = poolCfg.MaxConnLifetime
+	poolConfig.MaxConnIdleTime = poolCfg.MaxConnIdleTime
+	poolConfig.HealthCheckPeriod = poolCfg.HealthCheckPeriod
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {

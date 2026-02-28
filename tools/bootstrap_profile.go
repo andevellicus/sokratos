@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -72,7 +71,7 @@ func NewBootstrapProfile(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoi
 		}
 
 		// Call deep thinker with a generous timeout.
-		dtcCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		dtcCtx, cancel := context.WithTimeout(ctx, TimeoutBootstrapProfile)
 		defer cancel()
 
 		raw, err := dtc.CompleteNoThink(dtcCtx, prompt, userContent, 4096)

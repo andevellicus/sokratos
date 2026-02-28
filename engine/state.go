@@ -55,7 +55,7 @@ type StateManager struct {
 	mu               sync.RWMutex
 	state            AgentState
 	pool             *pgxpool.Pool // nil when running without database
-	messages         []llm.Message // conversation context (not persisted)
+	messages         []llm.Message // conversation context (persisted via snapshot)
 	lastUserActivity time.Time     // last time a user message was received
 }
 
@@ -189,12 +189,17 @@ func (sm *StateManager) ReadMessages() []llm.Message {
 	return cp
 }
 
-// AppendMessage appends a message to the conversation context.
+// AppendMessage appends a message to the conversation context and
+// asynchronously persists the snapshot to PostgreSQL.
 func (sm *StateManager) AppendMessage(msg llm.Message) {
+	if msg.Time.IsZero() {
+		msg.Time = time.Now()
+	}
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
 	sm.messages = append(sm.messages, msg)
+	sm.mu.Unlock()
+
+	go sm.persistSnapshot()
 }
 
 // MessageCount returns the number of messages in the conversation context.
@@ -245,6 +250,7 @@ func (sm *StateManager) SlideMessages(cutoff int, expectedFP [32]byte) bool {
 	sm.messages = kept
 
 	logger.Log.Infof("[slide] removed %d messages (kept %d)", cutoff-1, len(sm.messages))
+	go sm.persistSnapshot()
 	return true
 }
 
@@ -252,4 +258,83 @@ func (sm *StateManager) SlideMessages(cutoff int, expectedFP [32]byte) bool {
 func fingerprintMessages(msgs []llm.Message) [32]byte {
 	data, _ := json.Marshal(msgs)
 	return sha256.Sum256(data)
+}
+
+// persistSnapshot serializes the current messages to PostgreSQL. Vision
+// messages are stripped of image data before storage. Runs with a short
+// timeout to avoid blocking the message loop.
+func (sm *StateManager) persistSnapshot() {
+	if sm.pool == nil {
+		return
+	}
+
+	sm.mu.RLock()
+	clean := stripVisionParts(sm.messages)
+	sm.mu.RUnlock()
+
+	data, err := json.Marshal(clean)
+	if err != nil {
+		logger.Log.Warnf("[state] snapshot marshal failed: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err = sm.pool.Exec(ctx,
+		`INSERT INTO conversation_snapshot (id, messages, updated_at)
+		 VALUES (1, $1, NOW())
+		 ON CONFLICT (id) DO UPDATE SET messages = $1, updated_at = NOW()`,
+		data)
+	if err != nil {
+		logger.Log.Warnf("[state] snapshot persist failed: %v", err)
+	}
+}
+
+// LoadConversationSnapshot restores conversation messages from PostgreSQL.
+// Called once at startup to provide continuity across bot sessions.
+func (sm *StateManager) LoadConversationSnapshot() {
+	if sm.pool == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
+	defer cancel()
+
+	var data []byte
+	err := sm.pool.QueryRow(ctx,
+		`SELECT messages FROM conversation_snapshot WHERE id = 1`).Scan(&data)
+	if err != nil {
+		// No snapshot yet — normal on first run.
+		return
+	}
+
+	var msgs []llm.Message
+	if err := json.Unmarshal(data, &msgs); err != nil {
+		logger.Log.Warnf("[state] snapshot unmarshal failed: %v", err)
+		return
+	}
+
+	sm.mu.Lock()
+	sm.messages = msgs
+	sm.mu.Unlock()
+
+	logger.Log.Infof("[state] restored %d messages from snapshot", len(msgs))
+}
+
+// stripVisionParts returns a copy of messages with image_url parts removed.
+// Vision messages degrade to text-only (the Content field is already populated
+// from the text part by UnmarshalJSON). This avoids storing megabytes of
+// base64 image data in the snapshot.
+func stripVisionParts(msgs []llm.Message) []llm.Message {
+	out := make([]llm.Message, len(msgs))
+	for i, m := range msgs {
+		if len(m.Parts) == 0 {
+			out[i] = m
+			continue
+		}
+		// Drop Parts entirely — Content already holds the text.
+		out[i] = llm.Message{Role: m.Role, Content: m.Content, Time: m.Time}
+	}
+	return out
 }
