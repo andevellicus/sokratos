@@ -222,7 +222,7 @@ func QueryOrchestrator(ctx context.Context, client *Client, model, prompt string
 		sysContent += "\n\n" + opts.PersonalityContent
 	}
 	if opts != nil && opts.ProfileContent != "" {
-		sysContent += "\n\n## User Knowledge Profile\n" + opts.ProfileContent
+		sysContent += "\n\n## Identity Card\n" + opts.ProfileContent
 	}
 
 	if !client.EnableThinking {

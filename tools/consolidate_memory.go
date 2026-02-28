@@ -20,17 +20,16 @@ import (
 
 const salienceThreshold = 8
 
-// validateProfile checks that a merge didn't lose data. currentMap is the
-// profile before the merge — any key present in currentMap must survive in
-// mergedMap (the merge should never drop existing fields).
+// validateProfile checks that essential identity card keys survived the merge.
+// Only validates that "name" and "important_people" are preserved if they
+// existed before (the allowlist filter intentionally strips non-card fields).
 func validateProfile(mergedMap, currentMap map[string]any) error {
-	for key := range currentMap {
-		if _, ok := mergedMap[key]; !ok {
-			return fmt.Errorf("merge dropped existing key %q", key)
+	for _, key := range []string{"name", "important_people"} {
+		if _, existed := currentMap[key]; existed {
+			if _, ok := mergedMap[key]; !ok {
+				return fmt.Errorf("merge dropped essential key %q", key)
+			}
 		}
-	}
-	if len(mergedMap) < len(currentMap) {
-		return fmt.Errorf("merged profile shrank from %d to %d keys", len(currentMap), len(mergedMap))
 	}
 	return nil
 }
@@ -52,33 +51,41 @@ func mergeProfileJSON(current, updates string) (string, error) {
 	// Known array-of-objects fields and their identifier keys.
 	objectArrayIDs := map[string]string{
 		"important_people": "name",
-		"user_preferences": "key",
-	}
-	// Known array-of-strings fields.
-	stringArrays := map[string]bool{
-		"recurring_topics": true,
 	}
 
 	for key, updVal := range updatesMap {
 		if idField, ok := objectArrayIDs[key]; ok {
 			currentMap[key] = mergeObjectArray(currentMap[key], updVal, idField)
-		} else if stringArrays[key] {
-			currentMap[key] = mergeStringArray(currentMap[key], updVal)
 		} else {
 			// Scalar or unknown type: overwrite.
 			currentMap[key] = updVal
 		}
 	}
 
+	// Allowlist: strip any key not in the identity card schema.
+	cardKeys := map[string]bool{"name": true, "important_people": true, "last_consolidated": true}
+	for k := range currentMap {
+		if !cardKeys[k] {
+			delete(currentMap, k)
+		}
+	}
+
+	// Cap important_people at 15 entries (keep tail — mergeObjectArray appends new).
+	if people := toObjectSlice(currentMap["important_people"]); len(people) > 15 {
+		trimmed := make([]any, 15)
+		for i, p := range people[len(people)-15:] {
+			trimmed[i] = p
+		}
+		currentMap["important_people"] = trimmed
+	}
+
 	return marshalProfileOrdered(currentMap)
 }
 
-// profileKeyOrder defines the canonical key order for identity profiles.
+// profileKeyOrder defines the canonical key order for identity card profiles.
 var profileKeyOrder = []string{
 	"name",
 	"important_people",
-	"recurring_topics",
-	"user_preferences",
 	"last_consolidated",
 }
 
@@ -147,24 +154,6 @@ func mergeObjectArray(currentVal, updateVal any, idField string) any {
 	return currentArr
 }
 
-// mergeStringArray unions two string arrays with case-insensitive dedup.
-func mergeStringArray(currentVal, updateVal any) any {
-	currentArr := toStringSlice(currentVal)
-	updateArr := toStringSlice(updateVal)
-
-	seen := make(map[string]bool, len(currentArr))
-	for _, s := range currentArr {
-		seen[strings.ToLower(s)] = true
-	}
-	for _, s := range updateArr {
-		if !seen[strings.ToLower(s)] {
-			currentArr = append(currentArr, s)
-			seen[strings.ToLower(s)] = true
-		}
-	}
-	return currentArr
-}
-
 // toObjectSlice converts an any to []map[string]any.
 func toObjectSlice(v any) []map[string]any {
 	if v == nil {
@@ -178,24 +167,6 @@ func toObjectSlice(v any) []map[string]any {
 	for _, item := range arr {
 		if m, ok := item.(map[string]any); ok {
 			result = append(result, m)
-		}
-	}
-	return result
-}
-
-// toStringSlice converts an any to []string.
-func toStringSlice(v any) []string {
-	if v == nil {
-		return nil
-	}
-	arr, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	result := make([]string, 0, len(arr))
-	for _, item := range arr {
-		if s, ok := item.(string); ok {
-			result = append(result, s)
 		}
 	}
 	return result
@@ -406,33 +377,15 @@ func applyConsolidationResult(ctx context.Context, pool *pgxpool.Pool, embedEndp
 	}
 
 	hasProfileKey := false
-	for _, k := range []string{"name", "important_people", "recurring_topics", "user_preferences"} {
+	for _, k := range []string{"name", "important_people"} {
 		if _, ok := fallback[k]; ok {
 			hasProfileKey = true
 			break
 		}
 	}
 	if !hasProfileKey {
-		// Check if Z1 returned a bare user_preferences entry ({"key":..., "value":...})
-		// instead of the wrapped format. This happens with sparse inputs.
-		if _, hasKey := fallback["key"]; hasKey {
-			if _, hasVal := fallback["value"]; hasVal {
-				wrapped := fmt.Sprintf(`{"user_preferences":[%s],"last_consolidated":"%s"}`, raw, timefmt.Now())
-				logger.Log.Infof("[consolidate] wrapped bare preference entry into profile format: %s", raw)
-				raw = wrapped
-				// Re-parse so the merge below works with the wrapped version.
-				fallback = nil
-				if err := json.Unmarshal([]byte(raw), &fallback); err != nil {
-					return "", 0, fmt.Errorf("re-parse wrapped preference: %w", err)
-				}
-			} else {
-				logger.Log.Warnf("[consolidate] deep thinker returned non-profile JSON, discarding: %s", raw)
-				return "", 0, nil
-			}
-		} else {
-			logger.Log.Warnf("[consolidate] deep thinker returned non-profile JSON, discarding: %s", raw)
-			return "", 0, nil
-		}
+		logger.Log.Warnf("[consolidate] deep thinker returned non-profile JSON, discarding: %s", raw)
+		return "", 0, nil
 	}
 
 	merged, err := mergeProfileJSON(currentProfile, raw)

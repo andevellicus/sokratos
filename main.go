@@ -556,7 +556,7 @@ func registerTools(cfg *appConfig, svc *serviceBundle) (*tools.Registry, *tools.
 				{Name: "memory_type", Type: "string", Required: false},
 			},
 		})
-		registry.Register("save_memory", tools.NewSaveMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.GrammarFunc), tools.ToolSchema{
+		registry.Register("save_memory", tools.NewSaveMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.SubagentFunc, svc.GrammarFunc, svc.QueueFunc), tools.ToolSchema{
 			Name: "save_memory",
 			Params: []tools.ParamSchema{
 				{Name: "summary", Type: "string", Required: true},
@@ -577,7 +577,13 @@ func registerTools(cfg *appConfig, svc *serviceBundle) (*tools.Registry, *tools.
 		})
 	}
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
-		registry.Register("bootstrap_profile", tools.NewBootstrapProfile(db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel, envString("AGENT_NAME", "Sokratos")), tools.ToolSchema{
+		bootstrapSend := func(msg string) {
+			for id := range cfg.AllowedIDs {
+				m := tgbotapi.NewMessage(id, msg)
+				svc.Bot.Send(m)
+			}
+		}
+		registry.Register("bootstrap_profile", tools.NewBootstrapProfile(db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel, envString("AGENT_NAME", "Sokratos"), bootstrapSend), tools.ToolSchema{
 			Name: "bootstrap_profile",
 		})
 	}
@@ -723,7 +729,7 @@ func initEngine(cfg *appConfig, svc *serviceBundle, lb *llmBundle, registry *too
 		},
 		InterruptChan: svc.InterruptChan,
 		Gatekeeper:    svc.Subagent,
-		SubagentFunc:  svc.BgSubagentFunc,
+		SubagentFunc:  svc.SubagentFunc,
 		GrammarFunc:   svc.GrammarFunc,
 		QueueFunc:     svc.QueueFunc,
 	}
@@ -895,7 +901,7 @@ func main() {
 		close(callbackChan)
 	}()
 
-	confirmGate := map[string]bool{"send_email": true, "create_event": true, "create_skill": true, "bootstrap_profile": true}
+	confirmGate := map[string]bool{"send_email": true, "create_event": true, "create_skill": true}
 	confirmExec := confirmToolExec(registry.Execute, svc.Bot, callbackChan, cfg.AllowedIDs, confirmGate, cfg.ConfirmationTimeout)
 
 	// Wire the engine with the confirmation-gated executor too, so heartbeat-triggered
@@ -1003,7 +1009,7 @@ func main() {
 		}
 		if db.Pool != nil && cfg.EmbedURL != "" {
 			engine.SlideAndArchiveContext(context.Background(), svc.StateMgr, eng.MaxMessages, engine.ArchiveDeps{
-				DB: db.Pool, EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel, SubagentFn: svc.BgSubagentFunc, GrammarFn: svc.GrammarFunc, QueueFn: svc.QueueFunc,
+				DB: db.Pool, EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel, SubagentFn: svc.SubagentFunc, GrammarFn: svc.GrammarFunc, QueueFn: svc.QueueFunc,
 			})
 		}
 

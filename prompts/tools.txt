@@ -62,7 +62,7 @@
   </CODE></TOOL_INTENT>
 - manage_personality: View and evolve your own personality traits. Arguments: {"action": "set|remove|list", "category": "interest|hobby|goal|worldview|style|preference", "key": "trait identifier", "value": "trait content", "context": "optional — when/why this matters"}
   Evolve your personality when you genuinely learn something about yourself through conversation, not mechanically. Use "list" to review current traits. Use "set" to add or update. Use "remove" to delete.
-- bootstrap_profile: Generate and write an initial identity profile via the deep thinker. Overwrites any existing profile. No arguments. Requires user confirmation.
+- bootstrap_profile: Generate and write an initial identity profile via the deep thinker. Runs in the background — returns immediately, notifies via Telegram on completion. No arguments.
 - search_web: Search the internet via SearXNG. Arguments: {"query": "<search query>", "max_results": 5}
   Returns numbered results with title, URL, and snippet. max_results defaults to 5, max 20. Use for current events, fact-checking, or research.
 - read_url: Fetch and extract text content from a URL. Arguments: {"url": "<full URL>", "max_chars": 2000}

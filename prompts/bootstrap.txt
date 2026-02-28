@@ -14,10 +14,14 @@ Output ONLY valid JSON with two top-level keys (no commentary, no markdown fence
     {"category": "preference", "key": "verbosity", "value": "Concise by default, expansive when the topic demands it"}
   ],
   "user_profile": {
-    "name": "",
-    "important_people": [],
+    "name": "user's name if known",
+    "important_people": [
+      {"name": "person's name", "relation": "wife/husband/friend/colleague/etc"}
+    ],
     "recurring_topics": [],
-    "user_preferences": [],
+    "user_preferences": [
+      {"key": "preference_name", "value": "preference_value"}
+    ],
     "last_consolidated": "RFC3339 timestamp of now"
   }
 }
@@ -31,5 +35,11 @@ Guidelines:
 - Interests should span the intellectual landscape — not just tech. History, science, music, cooking, whatever creates a well-rounded mind.
 - Goals should be about becoming a better thinking partner, not about "improving accuracy metrics."
 - The personality should feel like someone you'd want to have a long conversation with over coffee.
-- The user_profile starts mostly empty — it will be populated through conversation. Use the current timestamp for last_consolidated.
+- The user_profile must contain ONLY facts explicitly stated in the context provided. Never infer, extrapolate, or fabricate user details.
+  - "name": exact name from context, or omit if unknown.
+  - "important_people": only people explicitly named with their stated relationship.
+  - "recurring_topics": only topics the user explicitly listed as interests or hobbies.
+  - "user_preferences": only preferences the user explicitly stated (e.g. "I prefer X"). If no preferences are stated, leave the array empty. NEVER invent plausible-sounding preferences.
+  - Use the current timestamp for last_consolidated.
+- recurring_topics and user_preferences are extracted and stored separately — only name and important_people go into the identity card. Still include all four fields in user_profile so they can be routed to the right storage.
 - Generate at least 10-15 personality traits across multiple categories.

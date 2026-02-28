@@ -22,12 +22,12 @@ Output ONLY valid JSON with this structure (no commentary, no markdown fences):
   ]
 }
 
-The profile_updates object uses the same schema as the full profile:
+The profile_updates object uses the identity card schema:
 - "name": "string"
-- "important_people": [{"name": "string", "relation": "string"}]
-- "recurring_topics": ["string"]
-- "user_preferences": [{"key": "...", "value": "...", "context": "..."}]
+- "important_people": [{"name": "string", "relation": "string"}] (max 15 entries)
 - "last_consolidated": "RFC3339 timestamp"
+
+The profile is a compact identity card — only the user's name and key relationships (family, close friends, important colleagues). Other user facts (preferences, interests, topics, habits) are stored as separate searchable memories. Do not add them to the profile.
 
 Valid categories for personality_updates: worldview, interest, hobby, goal, style, preference.
 Valid actions: "set" (upsert a trait), "remove" (delete a trait).

@@ -13,7 +13,7 @@ const (
 	TimeoutSkillHTTP = 15 * time.Second
 
 	// --- LLM Backend ---
-	TimeoutDeepThinker = 120 * time.Second
+	TimeoutDeepThinker = 4 * time.Minute
 	TimeoutSubagent    = 30 * time.Second
 	TimeoutSubagentCall = 10 * time.Second
 	TimeoutGatekeeper  = 30 * time.Second

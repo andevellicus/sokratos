@@ -8,3 +8,4 @@ settings.yml
 CLAUDE.md
 docker/docker-compose.yml
 sokratos
+bootstrap_context.txt

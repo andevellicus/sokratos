@@ -393,9 +393,14 @@ func (a saveMemoryArgs) effectiveTags() []string {
 	return append([]string{a.Category}, a.Tags...)
 }
 
-// saveMemoryAsync quality-scores (via the grammar-constrained subagent), embeds,
-// and inserts the memory on a background goroutine so it doesn't block the calling agent.
-func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc, a saveMemoryArgs) {
+// saveMemoryAsync embeds, contradiction-checks (when subagentFn is available),
+// and inserts the memory on a background goroutine so it doesn't block the
+// calling agent. Falls back to ScoreAndWrite when contradiction detection
+// dependencies are unavailable.
+func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string,
+	subagentFn memory.SubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc,
+	a saveMemoryArgs) {
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutMemorySave)
 		defer cancel()
@@ -410,7 +415,13 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string, gramm
 			EmbedModel:    embedModel,
 		}
 
-		id, err := memory.ScoreAndWrite(ctx, pool, req, grammarFn)
+		var id int64
+		var err error
+		if subagentFn != nil {
+			id, err = memory.CheckAndWriteWithContradiction(ctx, pool, req, subagentFn, grammarFn, queueFn)
+		} else {
+			id, err = memory.ScoreAndWrite(ctx, pool, req, grammarFn)
+		}
 		if err != nil {
 			logger.Log.Errorf("[save_memory] failed: %v", err)
 			return
@@ -463,8 +474,13 @@ func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subag
 	}
 }
 
-// NewSaveMemory returns a ToolFunc that closes over the pool, endpoints, and grammar-constrained subagent.
-func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc) ToolFunc {
+// NewSaveMemory returns a ToolFunc that closes over the pool, endpoints, and
+// subagent functions. When subagentFn is non-nil, saves go through
+// contradiction detection so the orchestrator can't accidentally overwrite
+// corrected facts.
+func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string,
+	subagentFn memory.SubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc) ToolFunc {
+
 	return func(_ context.Context, args json.RawMessage) (string, error) {
 		var a saveMemoryArgs
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -475,7 +491,7 @@ func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, grammar
 			return "error: summary is required and must contain actual content", nil
 		}
 
-		saveMemoryAsync(pool, embedEndpoint, embedModel, grammarFn, a)
+		saveMemoryAsync(pool, embedEndpoint, embedModel, subagentFn, grammarFn, queueFn, a)
 		return "Memory queued for saving.", nil
 	}
 }

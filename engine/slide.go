@@ -311,14 +311,32 @@ func saveDistilledFacts(deps ArchiveDeps, raw string) {
 			}
 		}
 
-		memory.SaveToMemoryWithSalienceAsync(deps.DB, memory.MemoryWriteRequest{
+		req := memory.MemoryWriteRequest{
 			Summary:       fact.Text,
 			Tags:          fact.Tags,
 			Salience:      fact.Salience,
 			Source:        "conversation",
 			EmbedEndpoint: deps.EmbedEndpoint,
 			EmbedModel:    deps.EmbedModel,
-		}, deps.GrammarFn)
+		}
+
+		// Use contradiction-checked save when subagent is available so
+		// distilled facts don't resurrect information the user corrected.
+		// Saves run sequentially (not in parallel goroutines) to avoid
+		// saturating the subagent's limited slots with concurrent
+		// contradiction checks that would fail with "busy".
+		if deps.SubagentFn != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), memory.TimeoutSaveOp)
+			id, err := memory.CheckAndWriteWithContradiction(ctx, deps.DB, req, deps.SubagentFn, deps.GrammarFn, deps.QueueFn)
+			cancel()
+			if err != nil {
+				logger.Log.Errorf("[slide] contradiction-checked save failed: %v", err)
+				continue
+			}
+			logger.Log.Infof("[slide] contradiction-checked+saved id=%d (salience=%.0f): %.60s", id, req.Salience, req.Summary)
+		} else {
+			memory.SaveToMemoryWithSalienceAsync(deps.DB, req, deps.GrammarFn)
+		}
 		saved++
 	}
 	logger.Log.Infof("[slide] distilled %d facts from conversation archive (%d from batch, %d after dedup)",
