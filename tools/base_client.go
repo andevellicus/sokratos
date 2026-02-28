@@ -26,12 +26,13 @@ type baseClient struct {
 
 // dtcRequest is the payload sent to /v1/chat/completions.
 type dtcRequest struct {
-	Model       string       `json:"model,omitempty"`
-	Messages    []dtcMessage `json:"messages"`
-	Temperature float64      `json:"temperature"`
-	MaxTokens   int          `json:"max_tokens"`
-	Think       *bool        `json:"think,omitempty"`   // when false, disables chain-of-thought reasoning (llama-server)
-	Grammar     string       `json:"grammar,omitempty"` // GBNF grammar constraint (used by SubagentClient)
+	Model           string       `json:"model,omitempty"`
+	Messages        []dtcMessage `json:"messages"`
+	Temperature     float64      `json:"temperature"`
+	MaxTokens       int          `json:"max_tokens"`
+	Think           *bool        `json:"think,omitempty"`            // when false, disables chain-of-thought reasoning (llama-server)
+	Grammar         string       `json:"grammar,omitempty"`          // GBNF grammar constraint (used by SubagentClient)
+	ReasoningFormat string       `json:"reasoning_format,omitempty"` // "deepseek" → split <think> into reasoning_content vs content
 }
 
 type dtcMessage struct {
@@ -110,7 +111,7 @@ func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error
 
 	// GLM models may put all output into reasoning_content even when
 	// think:false is set (template quirk). Fall back to reasoning_content
-	// when content is empty.
+	// when content is empty. This is expected behavior, not an error.
 	content := strings.TrimSpace(raw.Choices[0].Message.Content)
 	if content == "" {
 		content = strings.TrimSpace(raw.Choices[0].Message.ReasoningContent)

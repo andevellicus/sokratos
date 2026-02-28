@@ -24,9 +24,9 @@ func TestStripThinkTags(t *testing.T) {
 			want:  "Result",
 		},
 		{
-			name:  "nested think tags (non-greedy matches inner first)",
+			name:  "nested think tags (strips all reasoning)",
 			input: "<think>outer <think>inner</think> still thinking</think>Done",
-			want:  "still thinking</think>Done",
+			want:  "Done",
 		},
 		{
 			name:  "consecutive think blocks",
@@ -47,6 +47,16 @@ func TestStripThinkTags(t *testing.T) {
 			name:  "only think tags",
 			input: "<think>all thinking</think>",
 			want:  "",
+		},
+		{
+			name:  "orphaned </think> from template-injected <think> (Z1 pattern)",
+			input: "Okay let me think about this.\n</think>\n{\"answer\": 42}",
+			want:  "{\"answer\": 42}",
+		},
+		{
+			name:  "orphaned </think> with reasoning containing JSON",
+			input: "The key {\"k\":\"v\"} is important.\n</think>\n{\"real\":\"output\"}",
+			want:  "{\"real\":\"output\"}",
 		},
 	}
 
@@ -149,6 +159,11 @@ func TestExtractJSON(t *testing.T) {
 			input: `prefix {"key":"val\"ue"} suffix`,
 			want:  `{"key":"val\"ue"}`,
 		},
+		{
+			name:  "truncated JSON returns partial match",
+			input: `Some prose {"key": "val`, // depth never returns to 0
+			want:  `{"key": "val`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -156,6 +171,82 @@ func TestExtractJSON(t *testing.T) {
 			got := ExtractJSON(tt.input)
 			if got != tt.want {
 				t.Errorf("ExtractJSON(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripCodeFences_Embedded(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "prose then code fence",
+			input: "Here is the profile:\n```json\n{\"key\":\"value\"}\n```",
+			want:  `{"key":"value"}`,
+		},
+		{
+			name:  "prose then code fence with trailing text",
+			input: "Profile:\n```json\n{\"a\":1}\n```\nDone.",
+			want:  `{"a":1}`,
+		},
+		{
+			name:  "no fence at all",
+			input: `{"key":"value"}`,
+			want:  `{"key":"value"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StripCodeFences(tt.input)
+			if got != tt.want {
+				t.Errorf("StripCodeFences(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanLLMJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "clean JSON passthrough",
+			input: `{"key":"value"}`,
+			want:  `{"key":"value"}`,
+		},
+		{
+			name:  "think tags + code fences + prose",
+			input: "<think>reasoning</think>Here:\n```json\n{\"a\":1}\n```\nDone.",
+			want:  `{"a":1}`,
+		},
+		{
+			name:  "trailing comma",
+			input: `{"items":["a","b",]}`,
+			want:  `{"items":["a","b"]}`,
+		},
+		{
+			name:  "trailing dot in number",
+			input: `{"score":7.}`,
+			want:  `{"score":7}`,
+		},
+		{
+			name:  "Z1 reasoning preamble with orphaned </think>",
+			input: "Okay let me think. The key {\"k\":\"v\"} matters.\n</think>\n{\"personality\": [{\"a\":\"b\"}], \"user_profile\": {\"name\": \"Jan\"}}",
+			want:  `{"personality": [{"a":"b"}], "user_profile": {"name": "Jan"}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CleanLLMJSON(tt.input)
+			if got != tt.want {
+				t.Errorf("CleanLLMJSON(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}

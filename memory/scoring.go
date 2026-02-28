@@ -240,14 +240,14 @@ type contradictionCandidate struct {
 }
 
 // CheckAndWriteWithContradiction finds similar existing memories, checks for
-// contradictions via the subagent, supersedes contradicted memories, and writes
-// the new memory. Returns the new memory ID.
+// contradictions, supersedes contradicted memories, and writes the new memory.
+// Returns the new memory ID.
 //
 // Function parameters serve distinct roles:
-//   - subagentFn: blocking, for critical-path contradiction detection
-//   - bgGrammarFn: non-blocking, for optional entity extraction (skips when busy)
-//   - queueFn: fire-and-forget work queue for background quality enrichment
-func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, subagentFn SubagentFunc, bgGrammarFn GrammarSubagentFunc, queueFn WorkQueueFunc) (int64, error) {
+//   - bgGrammarFn: non-blocking (TryComplete), for contradiction detection and entity extraction.
+//     When backends are busy, the memory is saved immediately and deferred work is queued.
+//   - queueFn: fire-and-forget work queue for background quality enrichment and deferred work
+func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, bgGrammarFn GrammarSubagentFunc, queueFn WorkQueueFunc) (int64, error) {
 	// Chunk first; use first chunk for contradiction search embedding.
 	chunks := ChunkText(req.Summary, MaxChunkBytes)
 
@@ -266,9 +266,11 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 	var supersededIDs []int64
 	var candidates []contradictionCandidate
 	var entities []string
+	var contradictionDeferred, entityDeferred bool
 	rows, err := db.Query(ctx,
 		`SELECT id, summary FROM memories
 		 WHERE superseded_by IS NULL
+		   AND memory_type != 'identity'
 		   AND (embedding <=> $1) < 0.4
 		 ORDER BY (embedding <=> $1)
 		 LIMIT 3`,
@@ -289,10 +291,11 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 		rows.Close()
 
 		// Run batched contradiction check and entity extraction concurrently.
-		// They are independent subagent calls — parallelizing halves total wait time.
+		// Both use bgGrammarFn (non-blocking TryComplete) — if backends are
+		// busy, the memory is saved immediately and deferred work is queued.
 		var wg sync.WaitGroup
 
-		if subagentFn != nil && len(candidates) > 0 {
+		if bgGrammarFn != nil && len(candidates) > 0 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -311,10 +314,11 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 				}
 
 				checkCtx, cancel := context.WithTimeout(context.Background(), TimeoutContradictionCheck)
-				raw, gErr := subagentFn(checkCtx, contradictionSystemPrompt, promptBuilder.String())
+				raw, gErr := bgGrammarFn(checkCtx, contradictionSystemPrompt, promptBuilder.String(), "")
 				cancel()
 				if gErr != nil {
-					logger.Log.Warnf("[memory] batched contradiction check failed: %v", gErr)
+					logger.Log.Warnf("[memory] contradiction check deferred (busy): %v", gErr)
+					contradictionDeferred = true
 					return
 				}
 				for i, c := range candidates {
@@ -331,13 +335,16 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 			}()
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Use bgGrammarFn (non-blocking) — entity extraction is optional.
-			// Skips instantly when backends are saturated.
-			entities = extractEntitiesLightweight(ctx, bgGrammarFn, req.Summary)
-		}()
+		if bgGrammarFn != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				entities = extractEntitiesLightweight(ctx, bgGrammarFn, req.Summary)
+				if entities == nil {
+					entityDeferred = true
+				}
+			}()
+		}
 
 		wg.Wait()
 	}
@@ -352,6 +359,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 		entityRows, entityErr := db.Query(ctx,
 			`SELECT id, summary FROM memories
 			 WHERE superseded_by IS NULL
+			   AND memory_type != 'identity'
 			   AND entities && $1
 			   AND id != ALL($2)
 			 ORDER BY created_at DESC
@@ -453,6 +461,16 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 		return 0, fmt.Errorf("commit transaction: %w", err)
 	}
 
+	// Queue deferred work that was skipped because backends were busy.
+	// These run asynchronously via the work queue and retroactively update
+	// the already-committed memory rows.
+	if contradictionDeferred && queueFn != nil && len(candidates) > 0 {
+		submitDeferredContradiction(queueFn, db, firstID, candidates, req.Summary)
+	}
+	if entityDeferred && queueFn != nil && len(allIDs) > 0 {
+		submitDeferredEntityExtraction(queueFn, db, allIDs, req.Summary)
+	}
+
 	// Fire async quality enrichment after successful commit via the work
 	// queue. Each queued item gets its own fresh context, so enrichment
 	// never competes for the caller's timeout budget.
@@ -461,4 +479,111 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 	}
 
 	return firstID, nil
+}
+
+// submitDeferredContradiction queues a contradiction check that was skipped
+// because the backend was busy. On completion, supersedes contradicted memories
+// retroactively via UPDATE.
+func submitDeferredContradiction(queueFn WorkQueueFunc, db *pgxpool.Pool, newID int64, candidates []contradictionCandidate, summary string) {
+	summaryForComparison := summary
+	if idx := strings.Index(summaryForComparison, "\n\nSource exchange:\n"); idx >= 0 {
+		summaryForComparison = summaryForComparison[:idx]
+	}
+
+	var promptBuilder strings.Builder
+	fmt.Fprintf(&promptBuilder, "NEW: %s\n", summaryForComparison)
+	for i, c := range candidates {
+		fmt.Fprintf(&promptBuilder, "EXISTING_%d: %s\n", i+1, c.Summary)
+	}
+
+	// Capture candidates slice for the closure.
+	capturedCandidates := make([]contradictionCandidate, len(candidates))
+	copy(capturedCandidates, candidates)
+
+	queueFn(WorkRequest{
+		Label:        "deferred-contradiction",
+		SystemPrompt: contradictionSystemPrompt,
+		UserPrompt:   promptBuilder.String(),
+		Grammar:      "", // plain text output (no grammar constraint)
+		MaxTokens:    512,
+		Timeout:      TimeoutContradictionCheck,
+		Retries:      2,
+		OnComplete: func(raw string, err error) {
+			if err != nil {
+				logger.Log.Warnf("[memory] deferred contradiction check failed: %v", err)
+				LogFailedOp(db, "contradiction_check", fmt.Sprintf("deferred for id=%d", newID), err, map[string]any{
+					"new_id":     newID,
+					"candidates": len(capturedCandidates),
+				})
+				return
+			}
+			for i, c := range capturedCandidates {
+				tag := fmt.Sprintf("EXISTING_%d:", i+1)
+				for _, line := range strings.Split(raw, "\n") {
+					line = strings.TrimSpace(strings.ToUpper(line))
+					if strings.HasPrefix(line, strings.ToUpper(tag)) && strings.Contains(line, "CONTRADICTS") {
+						ctx, cancel := context.WithTimeout(context.Background(), TimeoutSaveOp)
+						_, dbErr := db.Exec(ctx,
+							`UPDATE memories SET superseded_by = $1 WHERE id = $2 AND superseded_by IS NULL`,
+							newID, c.ID)
+						cancel()
+						if dbErr != nil {
+							logger.Log.Warnf("[memory] deferred supersede id=%d failed: %v", c.ID, dbErr)
+						} else {
+							logger.Log.Infof("[memory] deferred supersede: id=%d superseded by id=%d", c.ID, newID)
+						}
+						break
+					}
+				}
+			}
+		},
+	})
+	logger.Log.Infof("[memory] queued deferred contradiction check for id=%d (%d candidates)", newID, len(candidates))
+}
+
+// submitDeferredEntityExtraction queues entity extraction that was skipped
+// because the backend was busy. On completion, merges extracted entities into
+// the already-committed memory rows via UPDATE.
+func submitDeferredEntityExtraction(queueFn WorkQueueFunc, db *pgxpool.Pool, ids []int64, summary string) {
+	// Capture IDs slice for the closure.
+	capturedIDs := make([]int64, len(ids))
+	copy(capturedIDs, ids)
+
+	queueFn(WorkRequest{
+		Label:        "deferred-entity-extraction",
+		SystemPrompt: entityExtractionPrompt,
+		UserPrompt:   summary,
+		Grammar:      entityGrammar,
+		MaxTokens:    512,
+		Timeout:      TimeoutQualityScore,
+		Retries:      2,
+		OnComplete: func(raw string, err error) {
+			if err != nil {
+				logger.Log.Warnf("[memory] deferred entity extraction failed: %v", err)
+				LogFailedOp(db, "entity_extraction", fmt.Sprintf("deferred for ids=%v", capturedIDs), err, map[string]any{
+					"memory_ids": capturedIDs,
+				})
+				return
+			}
+			var extracted []string
+			if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(raw)), &extracted); jsonErr != nil {
+				logger.Log.Warnf("[memory] deferred entity extraction parse failed: %v (raw: %s)", jsonErr, raw)
+				return
+			}
+			if len(extracted) == 0 {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), TimeoutSaveOp)
+			_, dbErr := db.Exec(ctx,
+				`UPDATE memories SET entities = (SELECT ARRAY(SELECT DISTINCT e FROM unnest(entities || $1::text[]) AS e)) WHERE id = ANY($2)`,
+				extracted, capturedIDs)
+			cancel()
+			if dbErr != nil {
+				logger.Log.Warnf("[memory] deferred entity merge failed: %v", dbErr)
+			} else {
+				logger.Log.Infof("[memory] deferred entities applied to ids=%v: %v", capturedIDs, extracted)
+			}
+		},
+	})
+	logger.Log.Infof("[memory] queued deferred entity extraction for ids=%v", ids)
 }

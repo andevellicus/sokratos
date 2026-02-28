@@ -285,7 +285,7 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 		} else {
 			reqCtx, cancel = context.WithTimeout(ctx, 10*time.Minute)
 		}
-		raw, cErr := dtc.CompleteNoThink(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
+		raw, cErr := dtc.Complete(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
 		cancel()
 		if cErr != nil {
 			return totalProcessed, fmt.Errorf("consolidation request (batch %d): %w", batch, cErr)
@@ -537,6 +537,7 @@ func applyMemoryMerges(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, e
 		if err != nil {
 			tx.Rollback(ctx)
 			logger.Log.Warnf("[consolidate] merge: failed to insert: %v", err)
+			logMergeFailure(pool, "merge_insert", m, err)
 			continue
 		}
 
@@ -547,11 +548,13 @@ func applyMemoryMerges(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, e
 		if err != nil {
 			tx.Rollback(ctx)
 			logger.Log.Warnf("[consolidate] merge: failed to supersede: %v", err)
+			logMergeFailure(pool, "merge_supersede", m, err)
 			continue
 		}
 
 		if err := tx.Commit(ctx); err != nil {
 			logger.Log.Warnf("[consolidate] merge: commit failed: %v", err)
+			logMergeFailure(pool, "merge_commit", m, err)
 			continue
 		}
 
@@ -628,4 +631,12 @@ func RunInitialConsolidation(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEn
 	}
 
 	logger.Log.Infof("[consolidate] startup: profile created/updated from %d high-salience memories", n)
+}
+
+// logMergeFailure records a memory merge failure to the failed_operations table.
+func logMergeFailure(pool *pgxpool.Pool, opType string, m memoryMerge, err error) {
+	memory.LogFailedOp(pool, opType, fmt.Sprintf("source_ids=%v", m.SourceIDs), err, map[string]any{
+		"source_ids":     m.SourceIDs,
+		"merged_summary": textutil.Truncate(m.MergedSummary, 200),
+	})
 }

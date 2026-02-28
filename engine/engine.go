@@ -68,6 +68,7 @@ type Engine struct {
 	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
 	SubagentFunc        memory.SubagentFunc        // for conversation archive distillation (nil = skip distillation)
 	GrammarFunc         memory.GrammarSubagentFunc // for grammar-constrained quality scoring (nil = skip enrichment)
+	BgGrammarFunc       memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
 	QueueFunc           memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
 	OnFirstTick         func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
 
@@ -115,7 +116,7 @@ func (e *Engine) sendDeduped(text, logLabel string) bool {
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.
 func (e *Engine) archiveDeps() ArchiveDeps {
-	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, SubagentFn: e.SubagentFunc, GrammarFn: e.GrammarFunc, QueueFn: e.QueueFunc}
+	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, SubagentFn: e.SubagentFunc, GrammarFn: e.GrammarFunc, BgGrammarFn: e.BgGrammarFunc, QueueFn: e.QueueFunc}
 }
 
 // Run starts a blocking loop that fires at the given interval. Each tick, it

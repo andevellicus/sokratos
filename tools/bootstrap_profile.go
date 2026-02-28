@@ -32,7 +32,7 @@ type bootstrapTrait struct {
 // profile via the deep thinker and writes it to the database. The heavy DTC
 // call runs in a background goroutine so the orchestrator can respond
 // immediately; sendFunc delivers a Telegram notification on completion.
-func NewBootstrapProfile(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, agentName string, sendFunc func(string)) ToolFunc {
+func NewBootstrapProfile(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, agentName string, sendFunc func(string), onProfile func()) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		// Check for existing profile.
 		existing, err := memory.GetIdentityProfile(ctx, pool)
@@ -72,56 +72,83 @@ func NewBootstrapProfile(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoi
 
 		// Run the heavy DTC call in the background so the orchestrator
 		// can respond immediately ("on it") instead of blocking 2-3 min.
-		go bootstrapBackground(pool, dtc, embedEndpoint, embedModel, prompt, userContent, sendFunc)
+		go bootstrapBackground(pool, dtc, embedEndpoint, embedModel, prompt, userContent, sendFunc, onProfile)
 
 		return "Profile generation started in the background. I'll notify you when it's ready.", nil
 	}
 }
 
 // bootstrapBackground runs the deep thinker call and writes results. Called
-// as a goroutine from NewBootstrapProfile.
-func bootstrapBackground(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, sendFunc func(string)) {
+// as a goroutine from NewBootstrapProfile. Retries once on JSON parse failure.
+func bootstrapBackground(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, sendFunc func(string), onProfile func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutBootstrapProfile)
 	defer cancel()
 
-	raw, err := dtc.CompleteNoThink(ctx, prompt, userContent, 4096)
+	const maxAttempts = 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		result, done := bootstrapAttempt(ctx, pool, dtc, embedEndpoint, embedModel, prompt, userContent, sendFunc, onProfile, attempt)
+		if done {
+			if result != "" && sendFunc != nil {
+				sendFunc(result)
+			}
+			return
+		}
+		// JSON parse failure — retry if we have attempts left.
+		if attempt < maxAttempts {
+			logger.Log.Warnf("[bootstrap] attempt %d failed, retrying...", attempt)
+		}
+	}
+
+	logger.Log.Errorf("[bootstrap] all %d attempts failed", maxAttempts)
+	if sendFunc != nil {
+		sendFunc("Bootstrap failed after retries — the model couldn't produce valid JSON. Please try again later.")
+	}
+}
+
+// bootstrapAttempt runs one DTC call + parse cycle. Returns (result, done).
+// done=true means either success (result is non-empty) or a non-retryable error
+// (result is empty, error already sent via sendFunc). done=false means a JSON
+// parse failure that should be retried.
+func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, sendFunc func(string), onProfile func(), attempt int) (string, bool) {
+	raw, err := dtc.Complete(ctx, prompt, userContent, 8192)
 	if err != nil {
 		logger.Log.Errorf("[bootstrap] deep thinker call failed: %v", err)
 		if sendFunc != nil {
-			sendFunc(fmt.Sprintf("Bootstrap failed: %v", err))
+			sendFunc("Bootstrap failed — the reasoning server timed out. Please try again later.")
 		}
-		return
+		return "", true // non-retryable
 	}
 
+	logger.Log.Debugf("[bootstrap] raw DTC output (attempt %d, %d chars): %.500s", attempt, len(raw), raw)
+
 	// Clean up and validate JSON.
-	raw = textutil.CleanLLMJSON(raw)
+	cleaned := textutil.CleanLLMJSON(raw)
+	logger.Log.Debugf("[bootstrap] cleaned JSON (attempt %d, %d chars): %.500s", attempt, len(cleaned), cleaned)
 
 	// Try dual structure first; fall back to legacy single-object format.
 	var dual bootstrapOutput
-	if err := json.Unmarshal([]byte(raw), &dual); err == nil && len(dual.Personality) > 0 {
+	if err := json.Unmarshal([]byte(cleaned), &dual); err == nil && len(dual.Personality) > 0 {
 		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, dual)
 		if bErr != nil {
 			logger.Log.Errorf("[bootstrap] failed: %v", bErr)
 			if sendFunc != nil {
-				sendFunc(fmt.Sprintf("Bootstrap failed: %v", bErr))
+				sendFunc("Bootstrap failed — could not save profile. Check the logs for details.")
 			}
-			return
+			return "", true // non-retryable
 		}
 		logger.Log.Infof("[bootstrap] background bootstrap complete")
-		if sendFunc != nil {
-			sendFunc(result)
+		if onProfile != nil {
+			onProfile()
 		}
-		return
+		return result, true
 	}
 
 	// Fallback: treat entire output as a legacy profile.
 	var parsed json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		logger.Log.Errorf("[bootstrap] generated output is not valid JSON: %v", err)
-		if sendFunc != nil {
-			sendFunc("Bootstrap failed: invalid JSON output")
-		}
-		return
+	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
+		logger.Log.Errorf("[bootstrap] attempt %d: not valid JSON: %v", attempt, err)
+		logger.Log.Errorf("[bootstrap] attempt %d: cleaned output was: %.1000s", attempt, cleaned)
+		return "", false // retryable
 	}
 
 	pretty, _ := json.MarshalIndent(parsed, "", "  ")
@@ -130,15 +157,16 @@ func bootstrapBackground(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoi
 	if err := memory.WriteIdentityProfile(ctx, pool, embedEndpoint, embedModel, profileJSON); err != nil {
 		logger.Log.Errorf("[bootstrap] write identity profile failed: %v", err)
 		if sendFunc != nil {
-			sendFunc(fmt.Sprintf("Bootstrap failed: %v", err))
+			sendFunc("Bootstrap failed — could not save profile. Check the logs for details.")
 		}
-		return
+		return "", true // non-retryable
 	}
 
 	logger.Log.Infof("[bootstrap] identity profile generated and written (%d bytes, legacy format)", len(profileJSON))
-	if sendFunc != nil {
-		sendFunc("Identity profile bootstrapped successfully.")
+	if onProfile != nil {
+		onProfile()
 	}
+	return "Identity profile bootstrapped successfully.", true
 }
 
 // bootstrapDual processes the dual-structure bootstrap output: writes personality

@@ -24,9 +24,10 @@ type ArchiveDeps struct {
 	DB            *pgxpool.Pool
 	EmbedEndpoint string
 	EmbedModel    string
-	SubagentFn    memory.SubagentFunc
-	GrammarFn     memory.GrammarSubagentFunc
-	QueueFn       memory.WorkQueueFunc // background work queue for distillation (preferred over GrammarFn)
+	SubagentFn    memory.SubagentFunc        // blocking, for distillation fallback
+	GrammarFn     memory.GrammarSubagentFunc // blocking, for distillation with grammar
+	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
+	QueueFn       memory.WorkQueueFunc       // background work queue for distillation (preferred over GrammarFn)
 }
 
 // SlideAndArchiveContext trims old messages from the StateManager's
@@ -325,9 +326,9 @@ func saveDistilledFacts(deps ArchiveDeps, raw string) {
 		// Saves run sequentially (not in parallel goroutines) to avoid
 		// saturating the subagent's limited slots with concurrent
 		// contradiction checks that would fail with "busy".
-		if deps.SubagentFn != nil {
+		if deps.BgGrammarFn != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), memory.TimeoutSaveOp)
-			id, err := memory.CheckAndWriteWithContradiction(ctx, deps.DB, req, deps.SubagentFn, deps.GrammarFn, deps.QueueFn)
+			id, err := memory.CheckAndWriteWithContradiction(ctx, deps.DB, req, deps.BgGrammarFn, deps.QueueFn)
 			cancel()
 			if err != nil {
 				logger.Log.Errorf("[slide] contradiction-checked save failed: %v", err)

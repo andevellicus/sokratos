@@ -8,16 +8,23 @@ import (
 	"sokratos/logger"
 )
 
+const defaultSubagentToolResultLen = 2000
+
 // SubagentToolExec executes a tool call given its raw JSON ({"name":"...","arguments":{...}}).
 // Returns the tool result string or an error.
 type SubagentToolExec func(ctx context.Context, raw json.RawMessage) (string, error)
+
+// maxSubagentErrorRetries is the number of free tool-error retries that don't
+// count against the round budget.
+const maxSubagentErrorRetries = 3
 
 // SubagentSupervisor runs a lightweight multi-turn tool execution loop for a
 // subagent. The subagent is grammar-constrained to produce either a tool call
 // or a final response. Tool results are injected back as user messages.
 //
+// Tool errors don't consume a round (up to maxSubagentErrorRetries free retries).
 // The loop terminates when the subagent produces a "respond" action or
-// maxRounds is exceeded.
+// usedRounds reaches maxRounds.
 func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 	systemPrompt string, directive string, toolExec SubagentToolExec, maxRounds int) (string, error) {
 
@@ -26,10 +33,13 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 		{Role: "user", Content: directive},
 	}
 
-	for round := 0; round < maxRounds; round++ {
+	usedRounds := 0
+	errorRetries := 0
+
+	for usedRounds < maxRounds {
 		raw, err := sc.CompleteMultiTurnWithGrammar(ctx, messages, grammar, 2048)
 		if err != nil {
-			return "", fmt.Errorf("subagent round %d: %w", round, err)
+			return "", fmt.Errorf("subagent round %d: %w", usedRounds, err)
 		}
 
 		var decision struct {
@@ -39,11 +49,11 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 			Text      string          `json:"text,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(raw), &decision); err != nil {
-			return "", fmt.Errorf("parse subagent decision round %d: %w", round, err)
+			return "", fmt.Errorf("parse subagent decision round %d: %w", usedRounds, err)
 		}
 
 		if decision.Action == "respond" {
-			logger.Log.Infof("[subagent-supervisor] completed in %d round(s)", round+1)
+			logger.Log.Infof("[subagent-supervisor] completed in %d round(s)", usedRounds+1)
 			return decision.Text, nil
 		}
 
@@ -53,15 +63,36 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 
 		// Build a tool call JSON and execute it.
 		toolJSON, _ := json.Marshal(map[string]any{"name": decision.Name, "arguments": decision.Arguments})
-		logger.Log.Infof("[subagent-supervisor] round %d: calling %s", round+1, decision.Name)
+		logger.Log.Infof("[subagent-supervisor] round %d: calling %s", usedRounds+1, decision.Name)
 		result, execErr := toolExec(ctx, toolJSON)
+
+		var toolResultMsg string
 		if execErr != nil {
-			result = fmt.Sprintf("Tool error: %v", execErr)
+			errorRetries++
+			if errorRetries <= maxSubagentErrorRetries {
+				toolResultMsg = fmt.Sprintf("Tool error (attempt %d/%d): %v\nReformulate with corrected parameters or try a different tool.",
+					errorRetries, maxSubagentErrorRetries, execErr)
+				// Don't increment usedRounds — free retry.
+			} else {
+				toolResultMsg = fmt.Sprintf("Tool error (retries exhausted): %v", execErr)
+				usedRounds++
+			}
+		} else {
+			errorRetries = 0
+			usedRounds++
+			// Truncate large tool results.
+			if len(result) > defaultSubagentToolResultLen {
+				origLen := len(result)
+				result = result[:defaultSubagentToolResultLen] + fmt.Sprintf(
+					"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
+					defaultSubagentToolResultLen, origLen)
+			}
+			toolResultMsg = result
 		}
 
 		messages = append(messages,
 			dtcMessage{Role: "assistant", Content: raw},
-			dtcMessage{Role: "user", Content: "Tool result: " + result},
+			dtcMessage{Role: "user", Content: "Tool result: " + toolResultMsg},
 		)
 	}
 	return "", fmt.Errorf("subagent exceeded %d rounds", maxRounds)

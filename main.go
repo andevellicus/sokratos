@@ -198,7 +198,7 @@ func initServices(cfg *appConfig) *serviceBundle {
 	if dtc != nil {
 		capturedDTC := dtc
 		synthesizeFunc = func(ctx context.Context, systemPrompt, content string) (string, error) {
-			return capturedDTC.CompleteNoThink(ctx, systemPrompt, content, 2048)
+			return capturedDTC.Complete(ctx, systemPrompt, content, 2048)
 		}
 	}
 
@@ -556,7 +556,7 @@ func registerTools(cfg *appConfig, svc *serviceBundle) (*tools.Registry, *tools.
 				{Name: "memory_type", Type: "string", Required: false},
 			},
 		})
-		registry.Register("save_memory", tools.NewSaveMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.SubagentFunc, svc.GrammarFunc, svc.QueueFunc), tools.ToolSchema{
+		registry.Register("save_memory", tools.NewSaveMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.BgGrammarFunc, svc.GrammarFunc, svc.QueueFunc), tools.ToolSchema{
 			Name: "save_memory",
 			Params: []tools.ParamSchema{
 				{Name: "summary", Type: "string", Required: true},
@@ -576,17 +576,8 @@ func registerTools(cfg *appConfig, svc *serviceBundle) (*tools.Registry, *tools.
 			},
 		})
 	}
-	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
-		bootstrapSend := func(msg string) {
-			for id := range cfg.AllowedIDs {
-				m := tgbotapi.NewMessage(id, msg)
-				svc.Bot.Send(m)
-			}
-		}
-		registry.Register("bootstrap_profile", tools.NewBootstrapProfile(db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel, envString("AGENT_NAME", "Sokratos"), bootstrapSend), tools.ToolSchema{
-			Name: "bootstrap_profile",
-		})
-	}
+	// bootstrap_profile is registered post-engine (needs eng.RefreshProfile callback).
+	// See the block after initEngine().
 
 	// Build email triage config if dependencies are available.
 	// TriageGrammar is left empty here and set after initLLM builds the grammar.
@@ -597,7 +588,6 @@ func registerTools(cfg *appConfig, svc *serviceBundle) (*tools.Registry, *tools.
 			EmbedEndpoint: cfg.EmbedURL,
 			EmbedModel:    cfg.EmbedModel,
 			DTC:           svc.DTC,
-			SubagentFn:    svc.SubagentFunc,
 			QueueFn:       svc.QueueFunc,
 			BgGrammarFn:   svc.BgGrammarFunc,
 			Subagent:      svc.Subagent,
@@ -731,6 +721,7 @@ func initEngine(cfg *appConfig, svc *serviceBundle, lb *llmBundle, registry *too
 		Gatekeeper:    svc.Subagent,
 		SubagentFunc:  svc.SubagentFunc,
 		GrammarFunc:   svc.GrammarFunc,
+		BgGrammarFunc: svc.BgGrammarFunc,
 		QueueFunc:     svc.QueueFunc,
 	}
 
@@ -766,8 +757,35 @@ func runStartupTasks(cfg *appConfig) {
 		cancel()
 	}
 
+	// Ensure default routines exist (idempotent, ON CONFLICT DO NOTHING).
+	seedDefaultRoutines()
+
 	// Cleanup and initial consolidation are now deferred to OnFirstTick in
 	// the engine, so Z1 is free for interactive requests during startup.
+}
+
+// seedDefaultRoutines ensures pre-defined routines exist in the database.
+// Uses ON CONFLICT DO NOTHING so manually modified routines are preserved.
+func seedDefaultRoutines() {
+	defaults := []struct {
+		Name        string
+		Interval    string
+		Instruction string
+	}{
+		{"check-calendar", "4 hours", "Check upcoming calendar events using check_calendar. Alert about any events today or tomorrow."},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, r := range defaults {
+		_, err := db.Pool.Exec(ctx,
+			`INSERT INTO routines (name, interval_duration, instruction)
+			 VALUES ($1, $2::interval, $3)
+			 ON CONFLICT (name) DO NOTHING`,
+			r.Name, r.Interval, r.Instruction)
+		if err != nil {
+			logger.Log.Warnf("[startup] failed to seed routine %s: %v", r.Name, err)
+		}
+	}
 }
 
 // --- Main ---
@@ -819,6 +837,21 @@ func main() {
 
 	// Register tools that need the engine for refresh callbacks.
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
+		bootstrapSend := func(msg string) {
+			for id := range cfg.AllowedIDs {
+				m := tgbotapi.NewMessage(id, msg)
+				svc.Bot.Send(m)
+			}
+		}
+		registry.Register("bootstrap_profile", tools.NewBootstrapProfile(
+			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
+			envString("AGENT_NAME", "Sokratos"), bootstrapSend, func() {
+				eng.RefreshProfile()
+				eng.RefreshPersonality()
+			},
+		), tools.ToolSchema{
+			Name: "bootstrap_profile",
+		})
 		registry.Register("consolidate_memory", tools.NewConsolidateMemory(
 			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
 			cfg.ConsolidationMemoryLimit, svc.GrammarFunc, func() {
@@ -955,25 +988,34 @@ func main() {
 			msgText = msg.Text
 			logger.Log.Infof("[%s] %s", tag, msgText)
 
-			// Translate Telegram slash commands into explicit tool instructions.
-			effectivePrompt := msgText
-			switch strings.TrimSpace(msgText) {
-			case "/bootstrap":
-				effectivePrompt = "Run the bootstrap_profile tool now to generate my initial identity profile."
-			}
-
-			userPrompt = effectivePrompt + "\n\n[Current Agent State]\n" + stateCtx
+			userPrompt = msgText + "\n\n[Current Agent State]\n" + stateCtx
 		} else {
 			continue
 		}
 
 		chatID := msg.Chat.ID
+
+		// Direct-dispatch slash commands — bypass the orchestrator entirely.
+		if strings.TrimSpace(msgText) == "/bootstrap" {
+			toolJSON := []byte(`{"name":"bootstrap_profile","arguments":{}}`)
+			result, err := registry.Execute(context.Background(), toolJSON)
+			text := result
+			if err != nil {
+				text = "Bootstrap failed — check the logs for details."
+			}
+			reply := tgbotapi.NewMessage(chatID, text)
+			reply.ReplyToMessageID = msg.MessageID
+			svc.Bot.Send(reply)
+			continue
+		}
+
 		typingCtx, typingCancel := context.WithCancel(context.Background())
 		go sendTypingPeriodically(svc.Bot, chatID, typingCtx)
 
-		eng.Mu.Lock()
+		// Phase 1: Snapshot history (StateManager has its own RWMutex).
 		history := svc.StateMgr.ReadMessages()
 
+		// Phase 2: Prefetch (network I/O — no engine state needed).
 		inferHistory := history
 		var prefetchIDs []int64
 		var prefetchSummaries string
@@ -989,6 +1031,9 @@ func main() {
 			pfCancel()
 		}
 
+		// Phase 3: Lock for string snapshots + orchestrator serialization.
+		streamer := newStreamSender(svc.Bot, chatID, msg.MessageID, typingCancel)
+		eng.Mu.Lock()
 		personalityContent := eng.PersonalityContent
 		profileContent := eng.ProfileContent
 		reply, msgs, err := llm.QueryOrchestrator(context.Background(), lb.Client, cfg.LLMModel, userPrompt, confirmExec, lb.TrimFn, &llm.QueryOrchestratorOpts{
@@ -1000,16 +1045,18 @@ func main() {
 			MaxToolResultLen:   cfg.MaxToolResultLen,
 			MaxWebSources:      cfg.MaxWebSources,
 			ToolAgent:          lb.ToolAgent,
+			OnStreamChunk:      streamer.OnChunk,
 		})
 		eng.Mu.Unlock()
 		typingCancel()
 
-		for _, m := range msgs {
+		condensed := condenseToolResults(msgs)
+		for _, m := range condensed {
 			svc.StateMgr.AppendMessage(m)
 		}
 		if db.Pool != nil && cfg.EmbedURL != "" {
 			engine.SlideAndArchiveContext(context.Background(), svc.StateMgr, eng.MaxMessages, engine.ArchiveDeps{
-				DB: db.Pool, EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel, SubagentFn: svc.SubagentFunc, GrammarFn: svc.GrammarFunc, QueueFn: svc.QueueFunc,
+				DB: db.Pool, EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel, SubagentFn: svc.SubagentFunc, GrammarFn: svc.GrammarFunc, BgGrammarFn: svc.BgGrammarFunc, QueueFn: svc.QueueFunc,
 			})
 		}
 
@@ -1041,19 +1088,29 @@ func main() {
 
 		// Don't send orchestrator control tags to the user.
 		if strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
+			streamer.Delete() // clean up any partial message
 			continue
 		}
 
-		replyMsg := tgbotapi.NewMessage(chatID, mdToTelegramHTML(reply))
-		replyMsg.ReplyToMessageID = msg.MessageID
-		replyMsg.ParseMode = tgbotapi.ModeHTML
+		// Extract the raw assistant message (with think tags) for spoiler display.
+		var rawAssistant string
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == "assistant" {
+				rawAssistant = msgs[i].Content
+				break
+			}
+		}
 
-		if _, err := svc.Bot.Send(replyMsg); err != nil {
-			logger.Log.Warnf("HTML send failed, falling back to plain text: %v", err)
-			replyMsg.Text = reply
-			replyMsg.ParseMode = ""
-			if _, err := svc.Bot.Send(replyMsg); err != nil {
-				logger.Log.Errorf("Error sending message: %v", err)
+		// If streaming happened, finalize with formatted text; otherwise send normally.
+		if !streamer.Finalize(rawAssistant) {
+			fm := formatWithThinking(rawAssistant)
+			if _, err := sendFormatted(svc.Bot, chatID, msg.MessageID, fm); err != nil {
+				logger.Log.Warnf("Entity send failed, falling back to plain text: %v", err)
+				replyMsg := tgbotapi.NewMessage(chatID, reply)
+				replyMsg.ReplyToMessageID = msg.MessageID
+				if _, err := svc.Bot.Send(replyMsg); err != nil {
+					logger.Log.Errorf("Error sending message: %v", err)
+				}
 			}
 		}
 	}

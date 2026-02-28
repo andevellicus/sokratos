@@ -393,12 +393,12 @@ func (a saveMemoryArgs) effectiveTags() []string {
 	return append([]string{a.Category}, a.Tags...)
 }
 
-// saveMemoryAsync embeds, contradiction-checks (when subagentFn is available),
+// saveMemoryAsync embeds, contradiction-checks (when bgGrammarFn is available),
 // and inserts the memory on a background goroutine so it doesn't block the
 // calling agent. Falls back to ScoreAndWrite when contradiction detection
 // dependencies are unavailable.
 func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string,
-	subagentFn memory.SubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc,
+	bgGrammarFn memory.GrammarSubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc,
 	a saveMemoryArgs) {
 
 	go func() {
@@ -417,8 +417,8 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string,
 
 		var id int64
 		var err error
-		if subagentFn != nil {
-			id, err = memory.CheckAndWriteWithContradiction(ctx, pool, req, subagentFn, grammarFn, queueFn)
+		if bgGrammarFn != nil {
+			id, err = memory.CheckAndWriteWithContradiction(ctx, pool, req, bgGrammarFn, queueFn)
 		} else {
 			id, err = memory.ScoreAndWrite(ctx, pool, req, grammarFn)
 		}
@@ -475,11 +475,12 @@ func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subag
 }
 
 // NewSaveMemory returns a ToolFunc that closes over the pool, endpoints, and
-// subagent functions. When subagentFn is non-nil, saves go through
+// subagent functions. When bgGrammarFn is non-nil, saves go through
 // contradiction detection so the orchestrator can't accidentally overwrite
-// corrected facts.
+// corrected facts. When backends are busy, contradiction checks and entity
+// extraction are deferred to the work queue.
 func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string,
-	subagentFn memory.SubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc) ToolFunc {
+	bgGrammarFn memory.GrammarSubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc) ToolFunc {
 
 	return func(_ context.Context, args json.RawMessage) (string, error) {
 		var a saveMemoryArgs
@@ -491,7 +492,7 @@ func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string,
 			return "error: summary is required and must contain actual content", nil
 		}
 
-		saveMemoryAsync(pool, embedEndpoint, embedModel, subagentFn, grammarFn, queueFn, a)
+		saveMemoryAsync(pool, embedEndpoint, embedModel, bgGrammarFn, grammarFn, queueFn, a)
 		return "Memory queued for saving.", nil
 	}
 }

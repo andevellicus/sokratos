@@ -50,8 +50,11 @@ func (d *DeepThinkerClient) Complete(ctx context.Context, systemPrompt, userCont
 }
 
 // CompleteNoThink is like Complete but explicitly disables chain-of-thought
-// reasoning. Use for structured output tasks (JSON generation, classification)
-// where thinking wastes tokens and risks leaking reasoning into the output.
+// reasoning. WARNING: GLM-Z1 ignores think:false and still produces reasoning,
+// but llama-server routes everything to reasoning_content (leaving content
+// empty). The doRequest fallback then returns the full reasoning+output mixed
+// together, breaking JSON extraction. Prefer Complete for Z1 — it properly
+// separates reasoning from content.
 func (d *DeepThinkerClient) CompleteNoThink(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error) {
 	return d.complete(ctx, systemPrompt, userContent, maxTokens, thinkFalse)
 }

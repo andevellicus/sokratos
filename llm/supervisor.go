@@ -166,6 +166,124 @@ func parseToolIntent(intent string) (string, bool) {
 	return string(result), true
 }
 
+// streamPhase tracks which phase the streaming state machine is in.
+type streamPhase int
+
+const (
+	phaseThink  streamPhase = iota // buffering inside <think>...</think>
+	phaseProbe                     // buffering first N chars post-think, checking for <TOOL_INTENT
+	phaseStream                    // forwarding tokens to the callback
+	phaseMuted                     // tool intent detected, stop forwarding
+)
+
+const probeChars = 50 // chars to buffer in probe phase before committing to stream
+
+// streamState is a state machine that decides which tokens from the LLM stream
+// should be forwarded to the user via the OnStreamChunk callback. It handles:
+// - Suppressing <think>...</think> blocks
+// - Probing the first few chars after think to detect tool intents
+// - Forwarding user-visible content
+// - Muting once a <TOOL_INTENT> tag is detected
+type streamState struct {
+	callback  func(token string)
+	phase     streamPhase
+	acc       strings.Builder // full accumulated output (including think blocks)
+	postThink strings.Builder // accumulated content after </think>
+}
+
+// newStreamState creates a stream state machine with the given callback.
+func newStreamState(callback func(token string)) *streamState {
+	return &streamState{
+		callback: callback,
+		phase:    phaseThink,
+	}
+}
+
+// onToken processes a single token from the LLM stream. Returns false to abort
+// the stream (when tool intent is fully detected in muted phase).
+func (ss *streamState) onToken(token string) bool {
+	ss.acc.WriteString(token)
+	full := ss.acc.String()
+
+	switch ss.phase {
+	case phaseThink:
+		// Check if we've exited the think block.
+		if strings.Contains(full, "</think>") {
+			// Extract everything after the last </think>.
+			idx := strings.LastIndex(full, "</think>")
+			post := full[idx+len("</think>"):]
+			ss.postThink.WriteString(post)
+			ss.phase = phaseProbe
+			// Fall through to probe logic.
+			return ss.probeCheck()
+		}
+		// Still in think block. But if there's no <think> tag at all and we
+		// have some content, the model may not be using think blocks this round.
+		if !strings.Contains(full, "<think>") && len(full) > 20 {
+			// No think block — treat everything as post-think.
+			ss.postThink.WriteString(full)
+			ss.phase = phaseProbe
+			return ss.probeCheck()
+		}
+		return true
+
+	case phaseProbe:
+		ss.postThink.WriteString(token)
+		return ss.probeCheck()
+
+	case phaseStream:
+		ss.postThink.WriteString(token)
+		ss.callback(token)
+		// Late tool intent check (rare but possible).
+		if strings.Contains(ss.postThink.String(), "<TOOL_INTENT") {
+			ss.phase = phaseMuted
+			return true // keep reading to get the full intent
+		}
+		return true
+
+	case phaseMuted:
+		// Keep accumulating until the full intent is captured.
+		// Check for closing tag to abort early.
+		if strings.Contains(full, "</TOOL_INTENT>") || strings.Contains(full, "</CODE>") {
+			return false // abort stream, we have the full intent
+		}
+		return true
+	}
+
+	return true
+}
+
+// probeCheck is called during the probe phase to decide whether to transition
+// to streaming or muting.
+func (ss *streamState) probeCheck() bool {
+	post := ss.postThink.String()
+
+	// Check for tool intent in buffered content.
+	if strings.Contains(post, "<TOOL_INTENT") {
+		ss.phase = phaseMuted
+		return true // keep reading to get the full intent
+	}
+
+	// If we've buffered enough without seeing a tool intent, start streaming.
+	if len(post) >= probeChars {
+		ss.phase = phaseStream
+		// Flush the buffered post-think content.
+		trimmed := strings.TrimLeft(post, " \t\n\r")
+		if trimmed != "" {
+			ss.callback(trimmed)
+		}
+		return true
+	}
+
+	return true
+}
+
+// streamed returns true if the state machine reached the streaming phase
+// (meaning some content was sent to the user).
+func (ss *streamState) streamed() bool {
+	return ss.phase == phaseStream || (ss.phase == phaseMuted && ss.postThink.Len() >= probeChars)
+}
+
 // querySupervisor implements the multi-agent supervisor pattern. The
 // orchestrator (e.g. Qwen3-VL) runs without grammar and produces free-form
 // text. When it wants a tool, it wraps intent in <TOOL_INTENT> tags. A
@@ -222,16 +340,35 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		}
 		sent = append(sent, timeCapstone)
 
-		// Call orchestrator WITHOUT grammar.
-		resp, err := client.Chat(ctx, ChatRequest{
+		// Call orchestrator WITHOUT grammar. Use streaming when a callback
+		// is provided so the user sees tokens progressively.
+		chatReq := ChatRequest{
 			Model:    model,
 			Messages: sent,
-		})
-		if err != nil {
-			return "", messages[historyLen:], err
+		}
+		var resp ChatResult
+		var ss *streamState
+		if opts != nil && opts.OnStreamChunk != nil {
+			ss = newStreamState(opts.OnStreamChunk)
+			var sErr error
+			resp, sErr = client.ChatStream(ctx, chatReq, ss.onToken)
+			if sErr != nil {
+				return "", messages[historyLen:], sErr
+			}
+		} else {
+			var cErr error
+			resp, cErr = client.Chat(ctx, chatReq)
+			if cErr != nil {
+				return "", messages[historyLen:], cErr
+			}
 		}
 
 		raw := strings.TrimSpace(resp.Message.Content)
+		// Log thinking content before stripping — valuable for debugging
+		// and understanding model reasoning.
+		if thinking := textutil.ExtractThinkContent(raw); thinking != "" {
+			logger.Log.Infof("[llm:thinking] %s", thinking)
+		}
 		// Strip think tags FIRST, then check for tool intent.
 		// This prevents intent inside think blocks from being acted on.
 		content := textutil.StripThinkTags(raw)
@@ -273,7 +410,10 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 						truncLen = opts.MaxToolResultLen
 					}
 					if len(result) > truncLen {
-						result = result[:truncLen] + "\n... (truncated)"
+						origLen := len(result)
+						result = result[:truncLen] + fmt.Sprintf(
+							"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
+							truncLen, origLen)
 					}
 					messages = append(messages, Message{Role: "user", Content: "Tool result: " + result})
 				}

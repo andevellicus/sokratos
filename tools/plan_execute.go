@@ -72,7 +72,7 @@ func decomposePlan(ctx context.Context, dtc *DeepThinkerClient, directive, extra
 	decompCtx, cancel := context.WithTimeout(ctx, TimeoutPlanDecomposition)
 	defer cancel()
 
-	raw, err := dtc.CompleteNoThink(decompCtx, strings.TrimSpace(prompts.PlanTask), userContent, 2048)
+	raw, err := dtc.Complete(decompCtx, strings.TrimSpace(prompts.PlanTask), userContent, 2048)
 	if err != nil {
 		return nil, fmt.Errorf("plan decomposition: %w", err)
 	}

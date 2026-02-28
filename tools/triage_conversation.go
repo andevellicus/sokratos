@@ -95,9 +95,8 @@ type TriageConfig struct {
 	EmbedEndpoint string
 	EmbedModel    string
 	DTC           *DeepThinkerClient
-	SubagentFn    memory.SubagentFunc
-	QueueFn       memory.WorkQueueFunc       // background work queue for quality enrichment
-	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking variant for entity extraction
+	QueueFn       memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
+	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
 	Subagent      *SubagentClient
 	TriageGrammar string
 	RetryQueue    *RetryQueue // deferred triage retry queue (nil = drop on failure)
@@ -157,8 +156,8 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		EmbedEndpoint: cfg.EmbedEndpoint,
 		EmbedModel:    cfg.EmbedModel,
 	}
-	if cfg.SubagentFn != nil {
-		if _, saveErr := memory.CheckAndWriteWithContradiction(ctx, cfg.Pool, memReq, cfg.SubagentFn, cfg.BgGrammarFn, cfg.QueueFn); saveErr != nil {
+	if cfg.BgGrammarFn != nil {
+		if _, saveErr := memory.CheckAndWriteWithContradiction(ctx, cfg.Pool, memReq, cfg.BgGrammarFn, cfg.QueueFn); saveErr != nil {
 			logger.Log.Warnf("[triage:%s] save failed: %v", req.DomainTag, saveErr)
 			return nil // save failed but triage succeeded — don't retry
 		}

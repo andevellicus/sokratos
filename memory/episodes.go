@@ -144,6 +144,9 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 		raw, err := synthesize(ctx, episodeSynthesisPrompt, sb.String())
 		if err != nil {
 			logger.Log.Warnf("[memory] episode synthesis failed for cluster of %d: %v", len(cluster), err)
+			LogFailedOp(db, "episode_synthesis", fmt.Sprintf("cluster of %d memories", len(cluster)), err, map[string]any{
+				"constituent_ids": constituentIDs,
+			})
 			continue
 		}
 

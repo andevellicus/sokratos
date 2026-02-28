@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -173,6 +174,116 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (ChatResult, error) 
 	return ChatResult{Message: raw.Choices[0].Message}, nil
 }
 
+// ChatStreamCallback is called for each content token during streaming.
+// Return false to abort the stream early (accumulated content is still returned).
+type ChatStreamCallback func(token string) bool
+
+// streamDelta represents a single SSE chunk from the streaming API.
+type streamDelta struct {
+	Choices []struct {
+		Delta struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+}
+
+// ChatStream sends a streaming chat request, calling onToken for each content
+// delta. Returns the accumulated ChatResult when the stream completes.
+// If the callback returns false, the stream is aborted and accumulated content
+// is returned with a nil error.
+func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onToken ChatStreamCallback) (ChatResult, error) {
+	req.Stream = true
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return ChatResult{}, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return ChatResult{}, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(httpReq)
+	if err != nil {
+		return ChatResult{}, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ChatResult{}, fmt.Errorf("llm server returned status %d", resp.StatusCode)
+	}
+
+	var content strings.Builder   // visible content tokens
+	var reasoning strings.Builder // thinking/reasoning tokens (separate field)
+	scanner := bufio.NewScanner(resp.Body)
+	// Allow up to 256KB per SSE line (default 64KB may be too small for some chunks).
+	scanner.Buffer(make([]byte, 0, 256*1024), 256*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// SSE format: empty lines are separators, "data: " prefix carries payload.
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+
+		// Stream end sentinel.
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk streamDelta
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue // skip malformed chunks
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		// Accumulate reasoning_content separately — never forward to callback.
+		// llama-server sends Qwen3 thinking via this field (without <think> tags).
+		if rc := chunk.Choices[0].Delta.ReasoningContent; rc != "" {
+			reasoning.WriteString(rc)
+		}
+
+		delta := chunk.Choices[0].Delta.Content
+		if delta == "" {
+			continue
+		}
+
+		content.WriteString(delta)
+
+		if onToken != nil && !onToken(delta) {
+			// Callback requested abort.
+			break
+		}
+	}
+
+	// Reconstruct full output with <think> tags so StripThinkTags works.
+	var full strings.Builder
+	if reasoning.Len() > 0 {
+		full.WriteString("<think>")
+		full.WriteString(reasoning.String())
+		full.WriteString("</think>")
+	}
+	full.WriteString(content.String())
+
+	if err := scanner.Err(); err != nil {
+		return ChatResult{Message: Message{Role: "assistant", Content: full.String()}}, fmt.Errorf("stream scan: %w", err)
+	}
+
+	return ChatResult{Message: Message{Role: "assistant", Content: full.String()}}, nil
+}
+
 const maxToolRounds = 15
 const defaultMaxToolResultLen = 2000 // truncate individual tool results to stay within context
 
@@ -195,6 +306,7 @@ type QueryOrchestratorOpts struct {
 	MaxToolResultLen   int              // max chars per tool result (0 = default 2000)
 	MaxWebSources      int              // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
+	OnStreamChunk      func(token string) // called for post-think content during final (non-tool) response streaming; nil = non-streaming
 }
 
 // QueryOrchestrator sends a prompt to the given model, executing tool calls as
@@ -273,6 +385,9 @@ func QueryOrchestrator(ctx context.Context, client *Client, model, prompt string
 		}
 
 		raw := strings.TrimSpace(resp.Message.Content)
+		if thinking := textutil.ExtractThinkContent(raw); thinking != "" {
+			logger.Log.Infof("[llm:thinking] %s", thinking)
+		}
 		content := textutil.StripThinkTags(raw)
 		logger.Log.Infof("[llm] %s", content)
 		stripped := textutil.StripCodeFences(content)
@@ -298,7 +413,10 @@ func QueryOrchestrator(ctx context.Context, client *Client, model, prompt string
 						truncLen = opts.MaxToolResultLen
 					}
 					if len(result) > truncLen {
-						result = result[:truncLen] + "\n... (truncated)"
+						origLen := len(result)
+						result = result[:truncLen] + fmt.Sprintf(
+							"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
+							truncLen, origLen)
 					}
 					messages = append(messages, Message{Role: "user", Content: "Tool result: " + result})
 				}

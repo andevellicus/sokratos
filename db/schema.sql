@@ -156,3 +156,14 @@ CREATE INDEX IF NOT EXISTS background_tasks_status_idx
     ON background_tasks (status) WHERE status = 'running';
 
 ALTER TABLE background_tasks ADD COLUMN IF NOT EXISTS priority INT DEFAULT 5;
+
+CREATE TABLE IF NOT EXISTS failed_operations (
+    id BIGSERIAL PRIMARY KEY,
+    op_type VARCHAR(50) NOT NULL,
+    label TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    context_data JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_failed_operations_created ON failed_operations (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_failed_operations_type ON failed_operations (op_type);

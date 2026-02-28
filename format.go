@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf16"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 var (
@@ -78,3 +82,286 @@ func escapeHTML(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	return s
 }
+
+// thinkBlockRe extracts <think>...</think> blocks from LLM output.
+var thinkBlockRe = regexp.MustCompile(`(?s)<think>(.*?)</think>`)
+
+// extractThinking separates thinking content from the visible response.
+// Returns (thinking, reply) where thinking is the raw text inside <think> tags
+// and reply is the response with think blocks removed.
+func extractThinking(raw string) (thinking, reply string) {
+	matches := thinkBlockRe.FindAllStringSubmatch(raw, -1)
+	if len(matches) == 0 {
+		return "", raw
+	}
+	var parts []string
+	for _, m := range matches {
+		if t := strings.TrimSpace(m[1]); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	thinking = strings.Join(parts, "\n\n")
+	reply = strings.TrimSpace(thinkBlockRe.ReplaceAllString(raw, ""))
+	return thinking, reply
+}
+
+const thinkingMaxLen = 2000 // truncate thinking to stay within message limits
+
+// telegramEntity is a Bot API MessageEntity with expandable_blockquote support.
+// The library's tgbotapi.MessageEntity lacks this type, so we use our own for
+// JSON serialization via the entities parameter.
+type telegramEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+	URL    string `json:"url,omitempty"`
+}
+
+// utf16Len returns the length of s in UTF-16 code units (what Telegram uses for offsets).
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// mdToEntities converts Markdown text to plain text + Telegram entity array.
+// Handles bold, italic, strikethrough, inline code, code blocks, and links.
+func mdToEntities(md string) (string, []telegramEntity) {
+	var entities []telegramEntity
+
+	// 1. Extract code blocks → placeholders, recording entities.
+	type placeholder struct {
+		plain    string
+		entities []telegramEntity // entities relative to this block's start
+	}
+	var codeBlocks []placeholder
+	s := codeBlockRe.ReplaceAllStringFunc(md, func(match string) string {
+		inner := codeBlockRe.FindStringSubmatch(match)[1]
+		idx := len(codeBlocks)
+		codeBlocks = append(codeBlocks, placeholder{
+			plain:    inner,
+			entities: []telegramEntity{{Type: "pre", Offset: 0, Length: utf16Len(inner)}},
+		})
+		return fmt.Sprintf("\x00CB%d\x00", idx)
+	})
+
+	// 2. Extract inline code → placeholders.
+	var inlineCodes []placeholder
+	s = inlineCodeRe.ReplaceAllStringFunc(s, func(match string) string {
+		inner := inlineCodeRe.FindStringSubmatch(match)[1]
+		idx := len(inlineCodes)
+		inlineCodes = append(inlineCodes, placeholder{
+			plain:    inner,
+			entities: []telegramEntity{{Type: "code", Offset: 0, Length: utf16Len(inner)}},
+		})
+		return fmt.Sprintf("\x00IC%d\x00", idx)
+	})
+
+	// 3. Process inline formatting in a single left-to-right pass.
+	// Each match is found at its position in the current string, so
+	// entity offsets are always correct relative to the final output.
+	s = processAllInlineFormatting(s, &entities)
+
+	// 4. Restore code block placeholders, adjusting offsets.
+	for i, cb := range codeBlocks {
+		ph := fmt.Sprintf("\x00CB%d\x00", i)
+		idx := strings.Index(s, ph)
+		if idx < 0 {
+			continue
+		}
+		baseOffset := utf16Len(s[:idx])
+		for _, e := range cb.entities {
+			e.Offset += baseOffset
+			entities = append(entities, e)
+		}
+		s = strings.Replace(s, ph, cb.plain, 1)
+	}
+
+	// 5. Restore inline code placeholders, adjusting offsets.
+	for i, ic := range inlineCodes {
+		ph := fmt.Sprintf("\x00IC%d\x00", i)
+		idx := strings.Index(s, ph)
+		if idx < 0 {
+			continue
+		}
+		baseOffset := utf16Len(s[:idx])
+		for _, e := range ic.entities {
+			e.Offset += baseOffset
+			entities = append(entities, e)
+		}
+		s = strings.Replace(s, ph, ic.plain, 1)
+	}
+
+	return s, entities
+}
+
+// inlineMatch describes a single formatting match to process.
+type inlineMatch struct {
+	replaceStart int
+	replaceEnd   int
+	inner        string
+	entityType   string
+	url          string
+}
+
+// processAllInlineFormatting finds the leftmost formatting match (bold, italic,
+// strikethrough, or link), strips its delimiters, records the entity, and repeats.
+// Processing one match at a time ensures entity offsets are always relative to the
+// current string state, avoiding the offset drift that multi-pass processing causes
+// when emojis (UTF-16 surrogate pairs) are present.
+func processAllInlineFormatting(s string, entities *[]telegramEntity) string {
+	for {
+		var best *inlineMatch
+
+		// Bold: **text**
+		if loc := boldRe.FindStringIndex(s); loc != nil {
+			if sub := boldRe.FindStringSubmatch(s); len(sub) >= 2 {
+				m := &inlineMatch{replaceStart: loc[0], replaceEnd: loc[1], inner: sub[1], entityType: "bold"}
+				if best == nil || m.replaceStart < best.replaceStart {
+					best = m
+				}
+			}
+		}
+
+		// Strikethrough: ~~text~~
+		if loc := strikeRe.FindStringIndex(s); loc != nil {
+			if sub := strikeRe.FindStringSubmatch(s); len(sub) >= 2 {
+				m := &inlineMatch{replaceStart: loc[0], replaceEnd: loc[1], inner: sub[1], entityType: "strikethrough"}
+				if best == nil || m.replaceStart < best.replaceStart {
+					best = m
+				}
+			}
+		}
+
+		// Links: [text](url)
+		if loc := linkRe.FindStringIndex(s); loc != nil {
+			if sub := linkRe.FindStringSubmatch(s); len(sub) >= 3 {
+				m := &inlineMatch{replaceStart: loc[0], replaceEnd: loc[1], inner: sub[1], entityType: "text_link", url: sub[2]}
+				if best == nil || m.replaceStart < best.replaceStart {
+					best = m
+				}
+			}
+		}
+
+		// Italic: *text* (boundary-aware to avoid matching **)
+		if loc := italicRe.FindStringIndex(s); loc != nil {
+			if sub := italicRe.FindStringSubmatch(s); len(sub) >= 2 {
+				matchStr := s[loc[0]:loc[1]]
+				firstStar := strings.Index(matchStr, "*")
+				lastStar := strings.LastIndex(matchStr, "*")
+				m := &inlineMatch{
+					replaceStart: loc[0] + firstStar,
+					replaceEnd:   loc[0] + lastStar + 1,
+					inner:        sub[1],
+					entityType:   "italic",
+				}
+				if best == nil || m.replaceStart < best.replaceStart {
+					best = m
+				}
+			}
+		}
+
+		if best == nil {
+			break
+		}
+
+		offset := utf16Len(s[:best.replaceStart])
+		*entities = append(*entities, telegramEntity{
+			Type:   best.entityType,
+			Offset: offset,
+			Length: utf16Len(best.inner),
+			URL:    best.url,
+		})
+		s = s[:best.replaceStart] + best.inner + s[best.replaceEnd:]
+	}
+	return s
+}
+
+// formattedMessage holds plain text + entities for sending via the Bot API
+// entities parameter (no parse_mode).
+type formattedMessage struct {
+	Text     string
+	Entities []telegramEntity
+}
+
+// formatWithThinking builds a formattedMessage from raw LLM output.
+// The reply is markdown-formatted via entities. If thinking is present,
+// it's appended as an expandable_blockquote (collapsed by default) with
+// a bold "Thoughts" header — the collapsed preview shows just the header.
+func formatWithThinking(raw string) formattedMessage {
+	thinking, reply := extractThinking(raw)
+	text, entities := mdToEntities(reply)
+
+	if thinking == "" {
+		return formattedMessage{Text: text, Entities: entities}
+	}
+
+	if len(thinking) > thinkingMaxLen {
+		thinking = thinking[:thinkingMaxLen] + "..."
+	}
+
+	// Append thinking section after the reply.
+	thinkHeader := "Thoughts"
+	thinkSection := thinkHeader + "\n" + thinking
+	separator := "\n\n"
+	text += separator + thinkSection
+
+	// Entity offsets for the appended section.
+	sectionOffset := utf16Len(text) - utf16Len(thinkSection)
+
+	// expandable_blockquote covering the entire "Thoughts\n<thinking>" section.
+	entities = append(entities, telegramEntity{
+		Type:   "expandable_blockquote",
+		Offset: sectionOffset,
+		Length: utf16Len(thinkSection),
+	})
+
+	// Bold on just "Thoughts" header inside the blockquote.
+	entities = append(entities, telegramEntity{
+		Type:   "bold",
+		Offset: sectionOffset,
+		Length: utf16Len(thinkHeader),
+	})
+
+	return formattedMessage{Text: text, Entities: entities}
+}
+
+// sendFormatted sends a formattedMessage via the Bot API using raw params
+// (bypassing the library's MessageEntity struct which lacks expandable_blockquote).
+// Falls back to plain text on error.
+func sendFormatted(bot *tgbotapi.BotAPI, chatID int64, replyTo int, fm formattedMessage) (tgbotapi.Message, error) {
+	params := tgbotapi.Params{
+		"chat_id": fmt.Sprintf("%d", chatID),
+		"text":    fm.Text,
+	}
+	if replyTo != 0 {
+		params["reply_to_message_id"] = fmt.Sprintf("%d", replyTo)
+	}
+	if len(fm.Entities) > 0 {
+		b, _ := json.Marshal(fm.Entities)
+		params["entities"] = string(b)
+	}
+	resp, err := bot.MakeRequest("sendMessage", params)
+	if err != nil {
+		return tgbotapi.Message{}, err
+	}
+	var msg tgbotapi.Message
+	if err := json.Unmarshal(resp.Result, &msg); err != nil {
+		return tgbotapi.Message{}, err
+	}
+	return msg, nil
+}
+
+// editFormatted edits an existing message with a formattedMessage using raw params.
+func editFormatted(bot *tgbotapi.BotAPI, chatID int64, msgID int, fm formattedMessage) error {
+	params := tgbotapi.Params{
+		"chat_id":    fmt.Sprintf("%d", chatID),
+		"message_id": fmt.Sprintf("%d", msgID),
+		"text":       fm.Text,
+	}
+	if len(fm.Entities) > 0 {
+		b, _ := json.Marshal(fm.Entities)
+		params["entities"] = string(b)
+	}
+	_, err := bot.MakeRequest("editMessageText", params)
+	return err
+}
+

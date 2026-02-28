@@ -109,9 +109,10 @@ func (sc *SubagentClient) TryComplete(ctx context.Context, systemPrompt, userCon
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userContent},
 		},
-		Temperature: 0.1,
-		MaxTokens:   maxTokens,
-		Think:       thinkFalse,
+		Temperature:     0.1,
+		MaxTokens:       maxTokens,
+		Think:           thinkFalse,
+		ReasoningFormat: "deepseek",
 	}
 
 	body, err := json.Marshal(payload)
@@ -161,10 +162,11 @@ func (sc *SubagentClient) TryCompleteWithGrammar(ctx context.Context, systemProm
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userContent},
 		},
-		Temperature: 0.1,
-		MaxTokens:   maxTokens,
-		Think:       thinkFalse,
-		Grammar:     grammar,
+		Temperature:     0.1,
+		MaxTokens:       maxTokens,
+		Think:           thinkFalse,
+		Grammar:         grammar,
+		ReasoningFormat: "deepseek",
 	}
 
 	body, err := json.Marshal(payload)
@@ -208,10 +210,11 @@ func (sc *SubagentClient) complete(ctx context.Context, systemPrompt, userConten
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userContent},
 		},
-		Temperature: 0.1,
-		MaxTokens:   maxTokens,
-		Think:       thinkFalse,
-		Grammar:     grammar,
+		Temperature:     0.1,
+		MaxTokens:       maxTokens,
+		Think:           thinkFalse,
+		Grammar:         grammar,
+		ReasoningFormat: "deepseek",
 	}
 
 	body, err := json.Marshal(payload)
@@ -304,12 +307,13 @@ func (sc *SubagentClient) CompleteMultiTurnWithGrammar(ctx context.Context, mess
 	}
 
 	payload := dtcRequest{
-		Model:       sc.Model,
-		Messages:    messages,
-		Temperature: 0.1,
-		MaxTokens:   maxTokens,
-		Think:       thinkFalse,
-		Grammar:     grammar,
+		Model:           sc.Model,
+		Messages:        messages,
+		Temperature:     0.1,
+		MaxTokens:       maxTokens,
+		Think:           thinkFalse,
+		Grammar:         grammar,
+		ReasoningFormat: "deepseek",
 	}
 
 	body, err := json.Marshal(payload)
