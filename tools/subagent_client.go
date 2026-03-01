@@ -288,6 +288,55 @@ func (sc *SubagentClient) processWorkQueue() {
 	}
 }
 
+// CompleteMultiTurnNoReasoning sends a full message array with a GBNF grammar
+// constraint but WITHOUT reasoning_format. This forces Flash to put all output
+// into the content field where grammar enforcement is applied, avoiding the
+// reasoning_content bypass that causes prose instead of structured JSON.
+func (sc *SubagentClient) CompleteMultiTurnNoReasoning(ctx context.Context, messages []dtcMessage, grammar string, maxTokens int) (string, error) {
+	if err := sc.cb.check(); err != nil {
+		return "", err
+	}
+
+	if err := sc.acquire(ctx); err != nil {
+		return "", fmt.Errorf("subagent semaphore: %w", err)
+	}
+	defer sc.release()
+
+	if err := sc.ensureLoaded(ctx); err != nil {
+		sc.cb.recordFailureIfServer(err)
+		return "", fmt.Errorf("subagent model not available: %w", err)
+	}
+
+	payload := dtcRequest{
+		Model:       sc.Model,
+		Messages:    messages,
+		Temperature: 0.1,
+		MaxTokens:   maxTokens,
+		Think:       thinkFalse,
+		Grammar:     grammar,
+		// No ReasoningFormat — forces all output into content field.
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	result, err := sc.doRequest(ctx, body)
+	if err != nil {
+		sc.cb.recordFailureIfServer(err)
+		return "", err
+	}
+
+	if result == "" {
+		sc.cb.recordFailure()
+		return "", fmt.Errorf("subagent returned empty response (server may be overloaded)")
+	}
+
+	sc.cb.recordSuccess()
+	return result, nil
+}
+
 // CompleteMultiTurnWithGrammar sends a full message array (for multi-turn tool
 // execution) with a GBNF grammar constraint. Unlike Complete, this accepts
 // arbitrary message sequences instead of just system+user.

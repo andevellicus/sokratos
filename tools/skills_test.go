@@ -130,7 +130,7 @@ func TestValidateSkillSource(t *testing.T) {
 func TestExecuteSkill_ReturnStatement(t *testing.T) {
 	source := `var result = args.a * args.b; return "product=" + result;`
 	args := json.RawMessage(`{"a": 5, "b": 6}`)
-	result, err := ExecuteSkill(context.Background(), "test_return", source, args)
+	result, err := ExecuteSkill(context.Background(), "test_return", source, "", args)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestNeedsIIFEWrap(t *testing.T) {
 func TestExecuteSkill_BasicArithmetic(t *testing.T) {
 	source := `var result = args.a + args.b; "sum=" + result;`
 	args := json.RawMessage(`{"a": 3, "b": 4}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, args)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestExecuteSkill_BasicArithmetic(t *testing.T) {
 func TestExecuteSkill_DefaultArgs(t *testing.T) {
 	source := `var c = args.currency || "usd"; c;`
 	args := json.RawMessage(`{}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, args)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestExecuteSkill_DefaultArgs(t *testing.T) {
 func TestExecuteSkill_RuntimeError(t *testing.T) {
 	source := `null.foo;`
 	args := json.RawMessage(`{}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, args)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args)
 	if err != nil {
 		t.Fatalf("expected soft error, got hard error: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	}
 
 	// Execute the loaded skill.
-	result, err := ExecuteSkill(context.Background(), s.Manifest.Name, s.Source, json.RawMessage(`{"city":"Tokyo"}`))
+	result, err := ExecuteSkill(context.Background(), s.Manifest.Name, s.Source, "", json.RawMessage(`{"city":"Tokyo"}`))
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}

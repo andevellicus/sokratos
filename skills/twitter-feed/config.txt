@@ -1,0 +1,11 @@
+# Twitter Feed Configuration
+# Edit this file to change accounts and topics — takes effect immediately.
+
+[accounts]
+karpathy
+ylecun
+JNIS_BMJ
+
+[topics]
+AI research
+

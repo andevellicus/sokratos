@@ -35,6 +35,7 @@ type Skill struct {
 	Manifest SkillManifest
 	Params   []ParamSchema
 	Source   string // handler.js content
+	Dir      string // skill directory (for config.txt loading)
 }
 
 // LoadSkills discovers and loads all skills from the given directory.
@@ -91,6 +92,7 @@ func LoadSkills(dir string) ([]Skill, error) {
 			Manifest: manifest,
 			Params:   params,
 			Source:   string(source),
+			Dir:      skillDir,
 		})
 		logger.Log.Infof("[skills] loaded skill: %s", skillName)
 	}
@@ -239,13 +241,21 @@ func parseParamsTable(body string) []ParamSchema {
 }
 
 // RegisterSkill creates a ToolFunc closure wrapping ExecuteSkill and registers
-// the skill in the tool registry.
+// the skill in the tool registry. The handler.js source is read from disk on
+// each invocation so edits take effect immediately without a restart.
 func RegisterSkill(registry *Registry, skill Skill) {
 	name := skill.Manifest.Name
-	source := skill.Source
+	source := skill.Source // fallback if dir is empty (e.g. create_skill test)
+	dir := skill.Dir
 
 	fn := func(ctx context.Context, args json.RawMessage) (string, error) {
-		return ExecuteSkill(ctx, name, source, args)
+		currentSource := source
+		if dir != "" {
+			if data, err := os.ReadFile(filepath.Join(dir, "scripts", "handler.js")); err == nil {
+				currentSource = string(data)
+			}
+		}
+		return ExecuteSkill(ctx, name, currentSource, dir, args)
 	}
 
 	schema := ToolSchema{
@@ -260,8 +270,9 @@ func RegisterSkill(registry *Registry, skill Skill) {
 
 // ExecuteSkill creates a fresh goja runtime, injects args and the HTTP bridge,
 // and executes the skill's JavaScript source. Returns the last expression value
-// as a string.
-func ExecuteSkill(ctx context.Context, name, source string, args json.RawMessage) (string, error) {
+// as a string. If dir is non-empty and contains a config.txt, its contents are
+// injected as the skill_config global string (read fresh each call).
+func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMessage) (string, error) {
 	vm := goja.New()
 
 	// Inject args as a global object.
@@ -275,6 +286,15 @@ func ExecuteSkill(ctx context.Context, name, source string, args json.RawMessage
 		argsObj = map[string]any{}
 	}
 	vm.Set("args", argsObj)
+
+	// Inject skill_config from config.txt (read fresh each call so edits take effect immediately).
+	var skillConfig string
+	if dir != "" {
+		if data, err := os.ReadFile(filepath.Join(dir, "config.txt")); err == nil {
+			skillConfig = string(data)
+		}
+	}
+	vm.Set("skill_config", skillConfig)
 
 	// Bind the HTTP bridge.
 	vm.Set("http_request", func(call goja.FunctionCall) goja.Value {
@@ -526,4 +546,76 @@ func GenerateSkillMD(name, description string, params []ParamSchema) string {
 	}
 
 	return b.String()
+}
+
+// SyncSkills scans the skills directory, compares against the registry, and
+// handles new, removed, and changed skills. It tracks SKILL.md mtimes in the
+// provided cache to detect schema changes. Returns true if any changes were
+// applied (and the grammar was rebuilt).
+func SyncSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, mtimeCache map[string]time.Time) bool {
+	diskSkills, err := LoadSkills(skillsDir)
+	if err != nil {
+		logger.Log.Warnf("[skills] hot-reload: failed to load skills: %v", err)
+		return false
+	}
+
+	// Index disk skills by name.
+	onDisk := make(map[string]Skill, len(diskSkills))
+	for _, s := range diskSkills {
+		onDisk[s.Manifest.Name] = s
+	}
+
+	// Index registered skills by name.
+	registered := make(map[string]struct{})
+	for _, s := range registry.Schemas() {
+		if s.IsSkill {
+			registered[s.Name] = struct{}{}
+		}
+	}
+
+	var added, removed, updated []string
+
+	// Detect new and updated skills.
+	for name, skill := range onDisk {
+		mdPath := filepath.Join(skill.Dir, "SKILL.md")
+		info, err := os.Stat(mdPath)
+		if err != nil {
+			continue
+		}
+		diskMtime := info.ModTime()
+
+		if _, ok := registered[name]; !ok {
+			// New skill on disk, not in registry.
+			RegisterSkill(registry, skill)
+			mtimeCache[name] = diskMtime
+			added = append(added, name)
+		} else if cached, ok := mtimeCache[name]; !ok {
+			// First sync after startup — just populate the cache.
+			mtimeCache[name] = diskMtime
+		} else if diskMtime.After(cached) {
+			// SKILL.md changed — re-register.
+			registry.Unregister(name)
+			RegisterSkill(registry, skill)
+			mtimeCache[name] = diskMtime
+			updated = append(updated, name)
+		}
+	}
+
+	// Detect removed skills.
+	for name := range registered {
+		if _, ok := onDisk[name]; !ok {
+			registry.Unregister(name)
+			delete(mtimeCache, name)
+			removed = append(removed, name)
+		}
+	}
+
+	changed := len(added) + len(removed) + len(updated)
+	if changed == 0 {
+		return false
+	}
+
+	rebuildGrammar()
+	logger.Log.Infof("[skills] hot-reload: added %v, removed %v, updated %v", added, removed, updated)
+	return true
 }

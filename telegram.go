@@ -6,29 +6,11 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
-
-// parseAllowedIDs parses a comma-separated list of Telegram user IDs.
-func parseAllowedIDs(raw string) map[int64]struct{} {
-	allowed := make(map[int64]struct{})
-	for _, s := range strings.Split(raw, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		id, err := strconv.ParseInt(s, 10, 64)
-		if err != nil {
-			continue
-		}
-		allowed[id] = struct{}{}
-	}
-	return allowed
-}
 
 func senderTag(from *tgbotapi.User) string {
 	if from.UserName != "" {

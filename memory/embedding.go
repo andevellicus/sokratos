@@ -33,9 +33,11 @@ type embeddedChunk struct {
 	Embedding []float32
 }
 
-// GetEmbedding calls an OpenAI-compatible /v1/embeddings endpoint and returns the vector.
-func GetEmbedding(ctx context.Context, endpoint string, model string, text string) ([]float32, error) {
-	body, err := json.Marshal(embeddingReq{Input: text, Model: model})
+// doEmbeddingRequest marshals input, sends the HTTP request to the embedding
+// endpoint, checks the response status, and decodes the result. Shared by
+// GetEmbedding and GetEmbeddings.
+func doEmbeddingRequest(ctx context.Context, endpoint, model string, input any) (*embeddingResp, error) {
+	body, err := json.Marshal(embeddingReq{Input: input, Model: model})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embedding request: %w", err)
 	}
@@ -62,47 +64,31 @@ func GetEmbedding(ctx context.Context, endpoint string, model string, text strin
 		return nil, fmt.Errorf("decode embedding response: %w", err)
 	}
 
+	return &raw, nil
+}
+
+// GetEmbedding calls an OpenAI-compatible /v1/embeddings endpoint and returns the vector.
+func GetEmbedding(ctx context.Context, endpoint string, model string, text string) ([]float32, error) {
+	raw, err := doEmbeddingRequest(ctx, endpoint, model, text)
+	if err != nil {
+		return nil, err
+	}
 	if len(raw.Data) == 0 {
 		return nil, fmt.Errorf("embedding server returned empty data array")
 	}
-
 	return raw.Data[0].Embedding, nil
 }
 
 // GetEmbeddings calls an OpenAI-compatible /v1/embeddings endpoint with an
 // array of texts and returns all embedding vectors in one request.
 func GetEmbeddings(ctx context.Context, endpoint string, model string, texts []string) ([][]float32, error) {
-	body, err := json.Marshal(embeddingReq{Input: texts, Model: model})
+	raw, err := doEmbeddingRequest(ctx, endpoint, model, texts)
 	if err != nil {
-		return nil, fmt.Errorf("marshal batch embedding request: %w", err)
+		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/v1/embeddings", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create batch embedding request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := embeddingHTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("batch embedding request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("embedding server returned status %d: %s", resp.StatusCode, bytes.TrimSpace(errBody))
-	}
-
-	var raw embeddingResp
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("decode batch embedding response: %w", err)
-	}
-
 	if len(raw.Data) != len(texts) {
 		return nil, fmt.Errorf("embedding server returned %d vectors for %d inputs", len(raw.Data), len(texts))
 	}
-
 	result := make([][]float32, len(raw.Data))
 	for i, d := range raw.Data {
 		result[i] = d.Embedding

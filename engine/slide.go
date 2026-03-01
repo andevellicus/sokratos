@@ -83,16 +83,17 @@ func SlideAndArchiveContext(
 	// A timestamp header gives the distillation model temporal context.
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Conversation archived %s]\n", timefmt.Now())
-	var lastToolName string
 	for _, m := range msgs[1:safeIndex] {
+		// Skip tool calls and tool results entirely — the assistant's
+		// natural language response already synthesizes them, and
+		// including tool artifacts causes the distillation model to
+		// infer junk facts from infrastructure (tool names, routine
+		// schedules, search queries, etc.).
 		if m.Role == "assistant" && isToolCallContent(m.Content) {
 			continue
 		}
-		// Track tool names from assistant messages for breadcrumb labels.
-		if m.Role == "assistant" {
-			if name := extractToolName(m.Content); name != "" {
-				lastToolName = name
-			}
+		if isToolMessage(m) {
+			continue
 		}
 		content := m.Content
 		content = stripAgentState(content)
@@ -101,16 +102,6 @@ func SlideAndArchiveContext(
 		content = strings.TrimSpace(content)
 		if content == "" {
 			continue
-		}
-		// Tool results: condense to a one-line breadcrumb with tool name.
-		if isToolMessage(m) {
-			firstLine, _, _ := strings.Cut(content, "\n")
-			if lastToolName != "" {
-				content = fmt.Sprintf("[%s → %s]", lastToolName, strings.TrimPrefix(firstLine, "Tool result: "))
-				lastToolName = ""
-			} else {
-				content = firstLine
-			}
 		}
 		if !m.Time.IsZero() {
 			fmt.Fprintf(&b, "[%s] %s: %s\n", timefmt.FormatDateTime(m.Time), m.Role, content)
@@ -138,23 +129,6 @@ func stripAgentState(s string) string {
 		return s[:idx]
 	}
 	return s
-}
-
-// extractToolName pulls the tool name from the first <TOOL_INTENT>tool_name: ...
-// tag in an assistant message. Returns "" if no tag is found.
-func extractToolName(content string) string {
-	const open = "<TOOL_INTENT>"
-	idx := strings.Index(content, open)
-	if idx < 0 {
-		return ""
-	}
-	after := content[idx+len(open):]
-	colonIdx := strings.Index(after, ":")
-	closeIdx := strings.Index(after, "</")
-	if colonIdx < 0 || (closeIdx >= 0 && closeIdx < colonIdx) {
-		return ""
-	}
-	return strings.TrimSpace(after[:colonIdx])
 }
 
 // isSafeBoundary returns true if the message is a safe place to cut:

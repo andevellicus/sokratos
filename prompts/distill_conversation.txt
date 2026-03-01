@@ -14,6 +14,19 @@ A lasting fact is something that would still be true and useful weeks or months 
 - Greetings, small talk, banter ("hey", "thanks", "how are you")
 - Assistant advice, explanations, or suggestions (these are the assistant's words, not the user's)
 - Tool usage artifacts, search results, system messages
+- The existence, naming, or mechanical behavior of tools, skills, or routines
+  (e.g., "The user has a tool called twitter-feed", "The user ran search_web",
+  "The user has a routine to check Twitter"). Treat tools, skills, and routines
+  as invisible infrastructure — they are never facts about the user.
+- Preferences inferred solely from tool usage rather than explicit statements
+  (e.g., if the user asks for weather in a city, do NOT conclude "The user is
+  interested in weather forecasts for X" — that's a transient request, not a
+  lasting fact. Only save location preferences when the user explicitly states
+  they live there, are moving there, or considers it their city.)
+- Incomplete identity references — if a fact involves a social account, email
+  address, or username, you MUST include the actual identifier (e.g., "@ylecun"),
+  not just the display name. If the identifier is absent from the conversation,
+  do not produce the fact.
 - Questions the user asked without revealing personal information
 - Transient requests ("set a timer", "what's the weather", "summarize this")
 - The assistant's reasoning or chain of thought

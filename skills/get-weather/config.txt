@@ -1,0 +1,2 @@
+# Default location for weather queries
+Greenville, SC

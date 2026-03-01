@@ -1,0 +1,12 @@
+# News Configuration
+# Edit this file to change sources and topics — takes effect immediately.
+
+[sources]
+arstechnica.com
+theverge.com
+apnews.com
+reuters.com
+
+[topics]
+AI research
+World news

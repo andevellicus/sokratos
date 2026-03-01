@@ -3,18 +3,18 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"net/url"
-	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	"sokratos/calendar"
+	"sokratos/config"
 	"sokratos/db"
 	"sokratos/engine"
 	"sokratos/gmail"
@@ -24,120 +24,69 @@ import (
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
+	"sokratos/timeouts"
 	"sokratos/tools"
 )
 
-// --- appConfig ---
+// --- Fallback Map ---
 
-// appConfig holds all parsed environment configuration.
-type appConfig struct {
-	TelegramToken string
-	AllowedIDs    map[int64]struct{}
-
-	LLMURL   string
-	LLMModel string
-
-	SearxngURL string
-
-	EmbedURL   string
-	EmbedModel string
-
-	DeepThinkerURL   string
-	DeepThinkerModel string
-
-	Text2SQLURL string
-
-	SubagentURL   string
-	SubagentModel string
-	SubagentSlots int
-
-	MaxWebSources     int
-	MemorySearchLimit int
-	MaxToolResultLen  int
-
-	ConsolidationMemoryLimit int
-	HeartbeatInterval        time.Duration
-
-	CognitiveBufferThreshold int
-	LullDuration             time.Duration
-	CognitiveCeiling         time.Duration
-
-	MemoryStalenessDays       int
-	ReflectionMemoryThreshold int
-
-	MaintenanceInterval time.Duration
-	DBMaxConns          int
-	DBMinConns          int
-	DBMaxConnLifetime   time.Duration
-	DBMaxConnIdleTime   time.Duration
-	DBHealthCheckPeriod time.Duration
-	Text2SQLModel       string
-	Text2SQLKeepAlive   string
-	ConfirmationTimeout time.Duration
-	EmailCheckLookback  string
-	EmailDisplayBatch   int
-
-	DatabaseURL string
-
-	GmailCredsPath    string
-	GmailTokenPath    string
-	CalendarTokenPath string
-}
-
-// loadConfig parses all environment variables into an appConfig struct.
-func loadConfig() *appConfig {
-	return &appConfig{
-		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
-		AllowedIDs:    parseAllowedIDs(os.Getenv("ALLOWED_TELEGRAM_IDS")),
-
-		LLMURL:   envString("LLM_URL", "http://localhost:11434"),
-		LLMModel: os.Getenv("LLM_MODEL"),
-
-		SearxngURL: os.Getenv("SEARXNG_URL"),
-
-		EmbedURL:   os.Getenv("EMBEDDING_URL"),
-		EmbedModel: os.Getenv("EMBEDDING_MODEL"),
-
-		DeepThinkerURL:   os.Getenv("DEEP_THINKER_URL"),
-		DeepThinkerModel: os.Getenv("DEEP_THINKER_MODEL"),
-
-		Text2SQLURL: os.Getenv("TEXT2SQL_URL"),
-
-		SubagentURL:   os.Getenv("SUBAGENT_URL"),
-		SubagentModel: os.Getenv("SUBAGENT_MODEL"),
-		SubagentSlots: envInt("SUBAGENT_SLOTS", 2),
-
-		MaxWebSources: envInt("MAX_WEB_SOURCES", 2),
-		MemorySearchLimit:     envInt("MEMORY_SEARCH_LIMIT", 10),
-		MaxToolResultLen:      envInt("MAX_TOOL_RESULT_LEN", 2000),
-
-		ConsolidationMemoryLimit: envInt("CONSOLIDATION_MEMORY_LIMIT", 50),
-		HeartbeatInterval:        envDuration("HEARTBEAT_INTERVAL", 5*time.Minute),
-
-		CognitiveBufferThreshold: envInt("COGNITIVE_BUFFER_THRESHOLD", 20),
-		LullDuration:             envDuration("LULL_DURATION", 20*time.Minute),
-		CognitiveCeiling:         envDuration("COGNITIVE_CEILING", 4*time.Hour),
-
-		MemoryStalenessDays:       envInt("MEMORY_STALENESS_DAYS", 90),
-		ReflectionMemoryThreshold: envInt("REFLECTION_MEMORY_THRESHOLD", 50),
-
-		MaintenanceInterval: envDuration("MAINTENANCE_INTERVAL", 30*time.Minute),
-		DBMaxConns:          envInt("DB_MAX_CONNS", 20),
-		DBMinConns:          envInt("DB_MIN_CONNS", 2),
-		DBMaxConnLifetime:   envDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute),
-		DBMaxConnIdleTime:   envDuration("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
-		DBHealthCheckPeriod: envDuration("DB_HEALTH_CHECK_PERIOD", 30*time.Second),
-		Text2SQLModel:       envString("TEXT2SQL_MODEL", "Arctic-Text2SQL-R1-7B.Q8_0"),
-		Text2SQLKeepAlive:   envString("TEXT2SQL_KEEP_ALIVE", "30s"),
-		ConfirmationTimeout: envDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
-		EmailCheckLookback:  envString("EMAIL_CHECK_LOOKBACK", "newer_than:1h"),
-		EmailDisplayBatch:   envInt("EMAIL_DISPLAY_BATCH", 5),
-
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-
-		GmailCredsPath:    envString("GMAIL_CREDENTIALS_PATH", ".credentials/credentials.json"),
-		GmailTokenPath:    envString("GMAIL_TOKEN_PATH", ".credentials/token.json"),
-		CalendarTokenPath: envString("CALENDAR_TOKEN_PATH", ".credentials/calendar_token.json"),
+// buildFallbackMap returns the deterministic fallback chains for tools that
+// have known-good alternatives. This prevents the orchestrator from wasting
+// rounds retrying tools that are likely to keep failing.
+func buildFallbackMap() llm.FallbackMap {
+	return llm.FallbackMap{
+		"get-weather": {
+			FallbackTool: "search_web",
+			ArgsTransform: func(_ string, originalArgs json.RawMessage, _ string) json.RawMessage {
+				var args struct {
+					Location string `json:"location"`
+				}
+				if err := json.Unmarshal(originalArgs, &args); err != nil || args.Location == "" {
+					args.Location = "current location"
+				}
+				b, _ := json.Marshal(map[string]string{"query": "weather " + args.Location})
+				return b
+			},
+		},
+		"get-news": {
+			FallbackTool: "search_web",
+			ArgsTransform: func(_ string, originalArgs json.RawMessage, _ string) json.RawMessage {
+				var args struct {
+					Topics string `json:"topics"`
+					Query  string `json:"query"`
+				}
+				json.Unmarshal(originalArgs, &args)
+				q := args.Topics
+				if q == "" {
+					q = args.Query
+				}
+				if q == "" {
+					q = "latest news"
+				}
+				b, _ := json.Marshal(map[string]string{"query": q + " news"})
+				return b
+			},
+		},
+		"twitter-feed": {
+			FallbackTool:   "search_web",
+			TriggerPattern: regexp.MustCompile(`(?i)timeout|no results|error|failed|deadline`),
+			ArgsTransform: func(_ string, originalArgs json.RawMessage, _ string) json.RawMessage {
+				var args struct {
+					Accounts string `json:"accounts"`
+					Topics   string `json:"topics"`
+				}
+				json.Unmarshal(originalArgs, &args)
+				q := args.Topics
+				if q == "" {
+					q = args.Accounts
+				}
+				if q == "" {
+					q = "trending"
+				}
+				b, _ := json.Marshal(map[string]string{"query": "site:x.com " + q})
+				return b
+			},
+		},
 	}
 }
 
@@ -160,7 +109,7 @@ type serviceBundle struct {
 	TriageRetryQueue *tools.RetryQueue
 }
 
-func initServices(cfg *appConfig) *serviceBundle {
+func initServices(cfg *config.AppConfig) *serviceBundle {
 	// Database.
 	if cfg.DatabaseURL != "" {
 		if err := db.Connect(context.Background(), cfg.DatabaseURL, db.DBPoolConfig{
@@ -305,313 +254,6 @@ func initServices(cfg *appConfig) *serviceBundle {
 	}
 }
 
-// --- Tool Registration (grouped by domain) ---
-
-func registerCoreTools(registry *tools.Registry, stateMgr *engine.StateManager) {
-	registry.Register("update_state", tools.NewUpdateState(stateMgr), tools.ToolSchema{
-		Name: "update_state",
-		Params: []tools.ParamSchema{
-			{Name: "status", Type: "string", Required: true},
-			{Name: "task", Type: "string", Required: true},
-		},
-	})
-	registry.Register("set_preference", tools.NewSetPreference(stateMgr), tools.ToolSchema{
-		Name: "set_preference",
-		Params: []tools.ParamSchema{
-			{Name: "key", Type: "string", Required: true},
-			{Name: "value", Type: "string", Required: true},
-		},
-	})
-}
-
-func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan chan struct{}, text2sqlURL, text2sqlModel, text2sqlKeepAlive string) {
-	if pool == nil {
-		return
-	}
-	registry.Register("add_task", tools.NewAddTask(pool, interruptChan), tools.ToolSchema{
-		Name: "add_task",
-		Params: []tools.ParamSchema{
-			{Name: "task", Type: "string", Required: true},
-			{Name: "due_at", Type: "string", Required: false},
-			{Name: "recur", Type: "string", Required: false},
-		},
-	})
-	registry.Register("complete_task", tools.NewCompleteTask(pool, interruptChan), tools.ToolSchema{
-		Name:   "complete_task",
-		Params: []tools.ParamSchema{{Name: "task_id", Type: "number", Required: false}},
-	})
-	registry.Register("manage_routines", tools.NewManageRoutines(pool), tools.ToolSchema{
-		Name: "manage_routines",
-		Params: []tools.ParamSchema{
-			{Name: "action", Type: "string", Required: true},
-			{Name: "name", Type: "string", Required: true},
-			{Name: "interval", Type: "string", Required: false},
-			{Name: "instruction", Type: "string", Required: false},
-		},
-	})
-	if text2sqlURL != "" {
-		registry.Register("ask_database", tools.NewAskDatabase(pool, text2sqlURL, text2sqlModel, text2sqlKeepAlive), tools.ToolSchema{
-			Name:   "ask_database",
-			Params: []tools.ParamSchema{{Name: "natural_language_query", Type: "string", Required: true}},
-		})
-	}
-}
-
-func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *tools.TriageConfig, emailLookback string, emailDisplayBatch int) {
-	if gmail.Service != nil {
-		registry.Register("search_email", tools.NewSearchEmail(gmail.Service, pool, triageCfg, emailLookback, emailDisplayBatch), tools.ToolSchema{
-			Name: "search_email",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: false},
-				{Name: "time_min", Type: "string", Required: false},
-				{Name: "time_max", Type: "string", Required: false},
-				{Name: "max_results", Type: "number", Required: false},
-			},
-		})
-	}
-	if gmail.Service != nil {
-		registry.Register("send_email", tools.NewSendEmail(gmail.Service), tools.ToolSchema{
-			Name: "send_email",
-			Params: []tools.ParamSchema{
-				{Name: "to", Type: "string", Required: true},
-				{Name: "subject", Type: "string", Required: true},
-				{Name: "body", Type: "string", Required: true},
-			},
-		})
-	}
-}
-
-func registerWebTools(registry *tools.Registry, searxngURL string) {
-	if searxngURL != "" {
-		registry.Register("search_web", tools.NewSearchWeb(searxngURL), tools.ToolSchema{
-			Name: "search_web",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: true},
-				{Name: "max_results", Type: "number", Required: false},
-			},
-		})
-	}
-	registry.Register("read_url", tools.NewReadURL(), tools.ToolSchema{
-		Name: "read_url",
-		Params: []tools.ParamSchema{
-			{Name: "url", Type: "string", Required: true},
-			{Name: "max_chars", Type: "number", Required: false},
-		},
-	})
-}
-
-func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
-	if calendar.Service != nil {
-		registry.Register("search_calendar", tools.NewSearchCalendar(calendar.Service, pool), tools.ToolSchema{
-			Name: "search_calendar",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: false},
-				{Name: "time_min", Type: "string", Required: false},
-				{Name: "time_max", Type: "string", Required: false},
-				{Name: "max_results", Type: "number", Required: false},
-			},
-		})
-	}
-	if calendar.Service != nil {
-		registry.Register("create_event", tools.NewCreateEvent(calendar.Service), tools.ToolSchema{
-			Name: "create_event",
-			Params: []tools.ParamSchema{
-				{Name: "title", Type: "string", Required: true},
-				{Name: "start", Type: "string", Required: true},
-				{Name: "end", Type: "string", Required: false},
-				{Name: "description", Type: "string", Required: false},
-				{Name: "location", Type: "string", Required: false},
-				{Name: "attendees", Type: "array", Required: false},
-			},
-		})
-	}
-}
-
-func registerAITools(registry *tools.Registry, dtc *tools.DeepThinkerClient) {
-	if dtc != nil {
-		registry.Register("consult_deep_thinker", tools.NewConsultDeepThinker(dtc), tools.ToolSchema{
-			Name: "consult_deep_thinker",
-			Params: []tools.ParamSchema{
-				{Name: "problem_statement", Type: "string", Required: true},
-				{Name: "max_tokens", Type: "number", Required: false},
-			},
-		})
-	}
-}
-
-// registerDelegateTask registers delegate_task AFTER all delegatable tools
-// are already registered so the grammar is built with their schemas. Core
-// tools (search_email, search_calendar, search_memory, save_memory) are
-// always available; user-created skills are added dynamically via
-// rebuildGrammar. Returns the DelegateConfig for live updates.
-func registerDelegateTask(registry *tools.Registry, subagent *tools.SubagentClient) *tools.DelegateConfig {
-	if subagent == nil {
-		return nil
-	}
-	coreTools := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url"}
-	schemas := registry.SchemasForTools(coreTools)
-	g := grammar.BuildSubagentToolGrammar(schemas)
-	dc := tools.NewDelegateConfig(coreTools, g)
-	registry.Register("delegate_task", tools.NewDelegateTask(subagent, registry, dc), tools.ToolSchema{
-		Name: "delegate_task",
-		Params: []tools.ParamSchema{
-			{Name: "directive", Type: "string", Required: true},
-			{Name: "context", Type: "string", Required: false},
-		},
-	})
-	return dc
-}
-
-func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGrammar tools.GrammarRebuildFunc) {
-	skills, err := tools.LoadSkills(skillsDir)
-	if err != nil {
-		logger.Log.Warnf("Failed to load skills: %v", err)
-	}
-	for _, skill := range skills {
-		tools.RegisterSkill(registry, skill)
-	}
-	registry.Register("create_skill", tools.NewCreateSkill(registry, skillsDir, rebuildGrammar), tools.ToolSchema{
-		Name: "create_skill",
-		Params: []tools.ParamSchema{
-			{Name: "name", Type: "string", Required: true},
-			{Name: "description", Type: "string", Required: true},
-			{Name: "params", Type: "string", Required: false},
-			{Name: "code", Type: "string", Required: true},
-			{Name: "test_args", Type: "string", Required: true},
-		},
-	})
-	registry.Register("manage_skills", tools.NewManageSkills(registry, skillsDir, rebuildGrammar), tools.ToolSchema{
-		Name: "manage_skills",
-		Params: []tools.ParamSchema{
-			{Name: "action", Type: "string", Required: true},
-			{Name: "name", Type: "string", Required: false},
-		},
-	})
-}
-
-func registerPlanTools(registry *tools.Registry, dtc *tools.DeepThinkerClient,
-	subagent *tools.SubagentClient, dc *tools.DelegateConfig,
-	btr *tools.BackgroundTaskRunner) {
-
-	if dtc == nil || subagent == nil || dc == nil {
-		logger.Log.Warn("[startup] plan_and_execute disabled: missing dtc, subagent, or delegate config")
-		return
-	}
-
-	registry.Register("plan_and_execute", tools.NewPlanAndExecute(dtc, subagent, dc, registry, btr), tools.ToolSchema{
-		Name: "plan_and_execute",
-		Params: []tools.ParamSchema{
-			{Name: "directive", Type: "string", Required: true},
-			{Name: "context", Type: "string", Required: false},
-			{Name: "background", Type: "boolean", Required: false},
-			{Name: "priority", Type: "number", Required: false},
-		},
-	})
-
-	if btr != nil {
-		registry.Register("check_background_task", tools.NewCheckBackgroundTask(btr), tools.ToolSchema{
-			Name: "check_background_task",
-			Params: []tools.ParamSchema{
-				{Name: "task_id", Type: "number", Required: false},
-				{Name: "action", Type: "string", Required: false},
-			},
-		})
-	}
-}
-
-// collectInternalHosts extracts host:port pairs from configured service URLs
-// for the skill HTTP bridge allowlist.
-func collectInternalHosts(cfg *appConfig) []string {
-	var hosts []string
-	for _, raw := range []string{cfg.SearxngURL, cfg.EmbedURL} {
-		if raw == "" {
-			continue
-		}
-		u, err := url.Parse(raw)
-		if err != nil {
-			continue
-		}
-		if h := u.Host; h != "" {
-			hosts = append(hosts, h)
-		}
-	}
-	return hosts
-}
-
-func registerTools(cfg *appConfig, svc *serviceBundle) (*tools.Registry, *tools.TriageConfig, *tools.DelegateConfig) {
-	registry := tools.NewRegistry()
-
-	registerCoreTools(registry, svc.StateMgr)
-	registerDBTools(registry, db.Pool, svc.InterruptChan, cfg.Text2SQLURL, cfg.Text2SQLModel, cfg.Text2SQLKeepAlive)
-	registerAITools(registry, svc.DTC)
-
-	if db.Pool != nil && cfg.EmbedURL != "" {
-		registry.Register("search_memory", tools.NewSearchMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.Subagent, cfg.MemorySearchLimit), tools.ToolSchema{
-			Name: "search_memory",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: true},
-				{Name: "tags", Type: "array", Required: false},
-				{Name: "start_date", Type: "string", Required: false},
-				{Name: "end_date", Type: "string", Required: false},
-				{Name: "memory_type", Type: "string", Required: false},
-			},
-		})
-		registry.Register("save_memory", tools.NewSaveMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.BgGrammarFunc, svc.GrammarFunc, svc.QueueFunc), tools.ToolSchema{
-			Name: "save_memory",
-			Params: []tools.ParamSchema{
-				{Name: "summary", Type: "string", Required: true},
-				{Name: "tags", Type: "array", Required: false},
-				{Name: "category", Type: "string", Required: false},
-				{Name: "salience_score", Type: "number", Required: false},
-				{Name: "memory_type", Type: "string", Required: false},
-			},
-		})
-	}
-	if db.Pool != nil && cfg.EmbedURL != "" {
-		registry.Register("forget_topic", tools.NewForgetTopic(db.Pool, cfg.EmbedURL, cfg.EmbedModel), tools.ToolSchema{
-			Name: "forget_topic",
-			Params: []tools.ParamSchema{
-				{Name: "topic", Type: "string", Required: true},
-				{Name: "confirm", Type: "boolean", Required: false},
-			},
-		})
-	}
-	// bootstrap_profile is registered post-engine (needs eng.RefreshProfile callback).
-	// See the block after initEngine().
-
-	// Build email triage config if dependencies are available.
-	// TriageGrammar is left empty here and set after initLLM builds the grammar.
-	var emailTriageCfg *tools.TriageConfig
-	if db.Pool != nil && cfg.EmbedURL != "" && (svc.DTC != nil || svc.Subagent != nil) {
-		emailTriageCfg = &tools.TriageConfig{
-			Pool:          db.Pool,
-			EmbedEndpoint: cfg.EmbedURL,
-			EmbedModel:    cfg.EmbedModel,
-			DTC:           svc.DTC,
-			QueueFn:       svc.QueueFunc,
-			BgGrammarFn:   svc.BgGrammarFunc,
-			Subagent:      svc.Subagent,
-			RetryQueue:    svc.TriageRetryQueue,
-		}
-	}
-
-	registerGmailTools(registry, db.Pool, emailTriageCfg, cfg.EmailCheckLookback, cfg.EmailDisplayBatch)
-	registerCalendarTools(registry, db.Pool)
-	registerWebTools(registry, cfg.SearxngURL)
-
-	registry.Register("run_code", tools.NewRunCode(), tools.ToolSchema{
-		Name: "run_code",
-		Params: []tools.ParamSchema{
-			{Name: "code", Type: "string", Required: true},
-		},
-	})
-
-	// Register delegate_task after all delegatable tools are available.
-	delegateConfig := registerDelegateTask(registry, svc.Subagent)
-
-	return registry, emailTriageCfg, delegateConfig
-}
-
 // --- LLM Initialization ---
 
 // llmBundle holds LLM-related initialization results.
@@ -623,7 +265,7 @@ type llmBundle struct {
 	TrimFn        func([]llm.Message) []llm.Message
 }
 
-func initLLM(cfg *appConfig, registry *tools.Registry) *llmBundle {
+func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	toolGrammar := grammar.BuildToolGrammar(registry.Schemas())
 	trimFn := func(msgs []llm.Message) []llm.Message {
 		return engine.TrimMessages(msgs, 12)
@@ -632,9 +274,16 @@ func initLLM(cfg *appConfig, registry *tools.Registry) *llmBundle {
 	llmClient := llm.NewClient(cfg.LLMURL)
 
 	// Always create ToolAgentConfig for supervisor mode (parseToolIntent replaces
-	// the former dedicated tool agent LLM).
+	// the former dedicated tool agent LLM). Start with the compact index; it will
+	// be rebuilt with the full compact index + dynamic skill descriptions by
+	// rebuildGrammar() after all tools are registered.
+	compactIndex := registry.CompactIndex()
+	toolDescs := strings.Replace(prompts.ToolsCompact, "%TOOL_INDEX%", compactIndex, 1)
+	if dynDescs := registry.DynamicToolDescriptions(); dynDescs != "" {
+		toolDescs += "\n" + dynDescs
+	}
 	toolAgentConfig := &llm.ToolAgentConfig{
-		ToolDescriptions: prompts.Tools,
+		ToolDescriptions: toolDescs,
 	}
 
 	// Build triage grammar once for conversation triage via subagent.
@@ -662,7 +311,7 @@ func initLLM(cfg *appConfig, registry *tools.Registry) *llmBundle {
 
 // --- Engine Initialization ---
 
-func initEngine(cfg *appConfig, svc *serviceBundle, lb *llmBundle, registry *tools.Registry) *engine.Engine {
+func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, registry *tools.Registry, fallbacks llm.FallbackMap) *engine.Engine {
 	var mu sync.Mutex
 
 	// Build ConsolidateFunc closure if dependencies are available.
@@ -682,6 +331,7 @@ func initEngine(cfg *appConfig, svc *serviceBundle, lb *llmBundle, registry *too
 			Model:            cfg.LLMModel,
 			Grammar:          lb.ToolGrammar,
 			ToolAgent:        lb.ToolAgent,
+			Fallbacks:        fallbacks,
 			MaxToolResultLen: cfg.MaxToolResultLen,
 			MaxWebSources:    cfg.MaxWebSources,
 		},
@@ -743,14 +393,14 @@ func initEngine(cfg *appConfig, svc *serviceBundle, lb *llmBundle, registry *too
 
 // --- Startup Tasks ---
 
-func runStartupTasks(cfg *appConfig) {
+func runStartupTasks(cfg *config.AppConfig) {
 	if db.Pool == nil {
 		return
 	}
 
 	// Migrate personality traits from monolithic profile (one-time, synchronous).
 	if cfg.EmbedURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeouts.PersonalityMigration)
 		if err := tools.MigrateProfileToPersonality(ctx, db.Pool, cfg.EmbedURL, cfg.EmbedModel); err != nil {
 			logger.Log.Warnf("[startup] personality migration failed: %v", err)
 		}
@@ -762,30 +412,6 @@ func runStartupTasks(cfg *appConfig) {
 
 	// Cleanup and initial consolidation are now deferred to OnFirstTick in
 	// the engine, so Z1 is free for interactive requests during startup.
-}
-
-// seedDefaultRoutines ensures pre-defined routines exist in the database.
-// Uses ON CONFLICT DO NOTHING so manually modified routines are preserved.
-func seedDefaultRoutines() {
-	defaults := []struct {
-		Name        string
-		Interval    string
-		Instruction string
-	}{
-		{"check-calendar", "4 hours", "Check upcoming calendar events using check_calendar. Alert about any events today or tomorrow."},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, r := range defaults {
-		_, err := db.Pool.Exec(ctx,
-			`INSERT INTO routines (name, interval_duration, instruction)
-			 VALUES ($1, $2::interval, $3)
-			 ON CONFLICT (name) DO NOTHING`,
-			r.Name, r.Interval, r.Instruction)
-		if err != nil {
-			logger.Log.Warnf("[startup] failed to seed routine %s: %v", r.Name, err)
-		}
-	}
 }
 
 // --- Main ---
@@ -800,7 +426,7 @@ func main() {
 	}
 	defer logger.Close()
 
-	cfg := loadConfig()
+	cfg := config.Load()
 	if cfg.TelegramToken == "" {
 		logger.Log.Fatal("TELEGRAM_BOT_TOKEN is not set")
 	}
@@ -809,6 +435,11 @@ func main() {
 	defer db.Close()
 
 	registry, emailTriageCfg, delegateConfig := registerTools(cfg, svc)
+
+	// Deterministic fallback chains: when a tool fails, automatically try a
+	// known-good alternative instead of burning orchestrator rounds on retries.
+	fallbacks := buildFallbackMap()
+
 	lb := initLLM(cfg, registry)
 
 	// Set the triage grammar now that initLLM has built it. The NewSearchEmail
@@ -825,7 +456,7 @@ func main() {
 		}
 	}
 
-	eng := initEngine(cfg, svc, lb, registry)
+	eng := initEngine(cfg, svc, lb, registry, fallbacks)
 
 	// Background task runner (needs engine.SendFunc).
 	var bgRunner *tools.BackgroundTaskRunner
@@ -845,12 +476,13 @@ func main() {
 		}
 		registry.Register("bootstrap_profile", tools.NewBootstrapProfile(
 			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
-			envString("AGENT_NAME", "Sokratos"), bootstrapSend, func() {
+			cfg.AgentName, bootstrapSend, func() {
 				eng.RefreshProfile()
 				eng.RefreshPersonality()
 			},
 		), tools.ToolSchema{
-			Name: "bootstrap_profile",
+			Name:        "bootstrap_profile",
+			Description: "Generate initial identity profile via deep thinker (async)",
 		})
 		registry.Register("consolidate_memory", tools.NewConsolidateMemory(
 			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
@@ -859,14 +491,16 @@ func main() {
 				eng.RefreshPersonality()
 			},
 		), tools.ToolSchema{
-			Name: "consolidate_memory",
+			Name:        "consolidate_memory",
+			Description: "Trigger memory consolidation and profile update",
 		})
 	}
 	if db.Pool != nil {
 		registry.Register("manage_personality", tools.NewManagePersonality(db.Pool, func() {
 			eng.RefreshPersonality()
 		}), tools.ToolSchema{
-			Name: "manage_personality",
+			Name:        "manage_personality",
+			Description: "View and evolve personality traits (set/remove/list)",
 			Params: []tools.ParamSchema{
 				{Name: "action", Type: "string", Required: true},
 				{Name: "category", Type: "string", Required: false},
@@ -883,17 +517,17 @@ func main() {
 		lb.ToolGrammar = newGrammar
 		eng.LLM.Grammar = newGrammar
 
-		// Rebuild tool descriptions: static core tools + dynamic skill descriptions.
-		dynDescs := registry.DynamicToolDescriptions()
-		toolDescs := prompts.Tools
-		if dynDescs != "" {
-			toolDescs += "\n" + dynDescs
+		// Rebuild tool descriptions: compact index + dynamic skill descriptions.
+		compactIdx := registry.CompactIndex()
+		td := strings.Replace(prompts.ToolsCompact, "%TOOL_INDEX%", compactIdx, 1)
+		if dynDescs := registry.DynamicToolDescriptions(); dynDescs != "" {
+			td += "\n" + dynDescs
 		}
 		if lb.ToolAgent != nil {
-			lb.ToolAgent.ToolDescriptions = toolDescs
+			lb.ToolAgent.ToolDescriptions = td
 		}
 		if eng.LLM.ToolAgent != nil {
-			eng.LLM.ToolAgent.ToolDescriptions = toolDescs
+			eng.LLM.ToolAgent.ToolDescriptions = td
 		}
 
 		// Update delegate_task's grammar and allowed-tools to include skills.
@@ -914,6 +548,21 @@ func main() {
 	registerSkillTools(registry, "skills", rebuildGrammar)
 	registerPlanTools(registry, svc.DTC, svc.Subagent, delegateConfig, bgRunner)
 	rebuildGrammar() // include disk-loaded skills + plan tools in grammar
+
+	// Wire hot-reload: sync skills + routines from disk on each heartbeat.
+	skillMtimes := map[string]time.Time{}
+	routineMtimes := map[string]time.Time{}
+	eng.SyncFunc = func() {
+		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes)
+		syncRoutineFiles("routines", routineMtimes)
+	}
+
+	// Wire curiosity function for proactive research during cognitive lulls.
+	if bgRunner != nil && svc.DTC != nil && svc.Subagent != nil && delegateConfig != nil {
+		eng.Cognitive.CuriosityFunc = func(directive string, priority int) (int64, error) {
+			return tools.LaunchBackgroundPlan(bgRunner, svc.DTC, svc.Subagent, delegateConfig, registry, directive, priority)
+		}
+	}
 
 	runStartupTasks(cfg)
 
@@ -1031,6 +680,12 @@ func main() {
 			pfCancel()
 		}
 
+		// Phase 2.5: Build temporal context (DB query — outside the lock).
+		var temporalCtx string
+		if db.Pool != nil {
+			temporalCtx = engine.BuildTemporalContext(context.Background(), db.Pool)
+		}
+
 		// Phase 3: Lock for string snapshots + orchestrator serialization.
 		streamer := newStreamSender(svc.Bot, chatID, msg.MessageID, typingCancel)
 		eng.Mu.Lock()
@@ -1042,9 +697,11 @@ func main() {
 			Grammar:            lb.ToolGrammar,
 			PersonalityContent: personalityContent,
 			ProfileContent:     profileContent,
+			TemporalContext:    temporalCtx,
 			MaxToolResultLen:   cfg.MaxToolResultLen,
 			MaxWebSources:      cfg.MaxWebSources,
 			ToolAgent:          lb.ToolAgent,
+			Fallbacks:          fallbacks,
 			OnStreamChunk:      streamer.OnChunk,
 		})
 		eng.Mu.Unlock()

@@ -88,7 +88,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			return "Invalid JSON in test_args", nil
 		}
 
-		testResult, err := ExecuteSkill(ctx, a.Name, a.Code, testArgsRaw)
+		testResult, err := ExecuteSkill(ctx, a.Name, a.Code, "", testArgsRaw)
 		if err != nil {
 			return fmt.Sprintf("Skill failed test execution: %v", err), nil
 		}

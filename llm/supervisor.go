@@ -15,6 +15,79 @@ import (
 	"sokratos/timefmt"
 )
 
+// softErrorPatterns are substrings that indicate a tool returned a soft error
+// (user-facing failure message returned as result string, not a Go error).
+var softErrorPatterns = []string{
+	"error", "failed", "timeout", "deadline exceeded", "unavailable",
+	"not found", "no results", "could not",
+}
+
+// isToolSoftError returns true when a tool result string indicates a
+// user-facing failure (soft error convention: return "error message", nil).
+func isToolSoftError(result string) bool {
+	lower := strings.ToLower(result)
+	for _, pat := range softErrorPatterns {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchFallback checks whether a failed tool has a configured fallback and
+// whether the failure message matches the trigger pattern (if any).
+func matchFallback(fallbacks FallbackMap, toolName, failureMsg string) (FallbackDef, bool) {
+	if fallbacks == nil {
+		return FallbackDef{}, false
+	}
+	fb, ok := fallbacks[toolName]
+	if !ok {
+		return FallbackDef{}, false
+	}
+	if fb.TriggerPattern != nil && !fb.TriggerPattern.MatchString(failureMsg) {
+		return FallbackDef{}, false
+	}
+	return fb, true
+}
+
+// extractToolNameAndArgs pulls the tool name and raw arguments from a parsed
+// tool-call JSON string. Returns empty values on parse failure.
+func extractToolNameAndArgs(toolJSON string) (string, json.RawMessage) {
+	var tc struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal([]byte(toolJSON), &tc); err != nil {
+		return "", nil
+	}
+	return tc.Name, tc.Arguments
+}
+
+// buildToolJSON constructs a canonical tool-call JSON string from name and args.
+func buildToolJSON(name string, args json.RawMessage) string {
+	tc := struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}{Name: name, Arguments: args}
+	b, _ := json.Marshal(tc)
+	return string(b)
+}
+
+// toolHint returns a brief contextual hint for tool errors where no fallback
+// is configured, helping the orchestrator recover without wasting rounds.
+func toolHint(toolName string) string {
+	if strings.HasPrefix(toolName, "get-") || strings.HasPrefix(toolName, "twitter-") {
+		return "\nHint: consider using search_web as a fallback."
+	}
+	switch toolName {
+	case "search_email", "search_calendar":
+		return "\nHint: try broadening the query or adjusting time bounds."
+	case "search_memory":
+		return "\nHint: try different keywords or broader terms."
+	}
+	return ""
+}
+
 // toolIntentCodeRe matches <TOOL_INTENT>...<CODE>...</CODE> with an optional
 // </TOOL_INTENT> after it. The captured group INCLUDES the </CODE> tag so
 // parseToolIntent can extract the code block properly.
@@ -310,6 +383,9 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	if opts != nil && opts.ProfileContent != "" {
 		sysContent += "\n\n## Identity Card\n" + opts.ProfileContent
 	}
+	if opts != nil && opts.TemporalContext != "" {
+		sysContent += "\n\n" + opts.TemporalContext
+	}
 
 	// NO /no_think appended — thinking works freely in supervisor mode.
 
@@ -402,21 +478,85 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 			// Execute the tool.
 			if toolExec != nil {
 				result, execErr := toolExec(ctx, []byte(toolJSON))
+				toolName, originalArgs := extractToolNameAndArgs(toolJSON)
+
+				// Determine failure and build the failure message.
+				var failureMsg string
+				isFailed := false
 				if execErr != nil {
-					messages = append(messages, Message{Role: "user", Content: "Tool error: " + execErr.Error()})
-				} else {
-					truncLen := defaultMaxToolResultLen
-					if opts != nil && opts.MaxToolResultLen > 0 {
-						truncLen = opts.MaxToolResultLen
-					}
-					if len(result) > truncLen {
-						origLen := len(result)
-						result = result[:truncLen] + fmt.Sprintf(
-							"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
-							truncLen, origLen)
-					}
-					messages = append(messages, Message{Role: "user", Content: "Tool result: " + result})
+					failureMsg = execErr.Error()
+					isFailed = true
+				} else if isToolSoftError(result) {
+					failureMsg = result
+					isFailed = true
 				}
+
+				// Try deterministic fallback if the tool failed.
+				var fallbacks FallbackMap
+				if opts != nil {
+					fallbacks = opts.Fallbacks
+				}
+				if isFailed {
+					if fb, ok := matchFallback(fallbacks, toolName, failureMsg); ok {
+						// Execute fallback tool.
+						fbArgs := fb.ArgsTransform(toolName, originalArgs, failureMsg)
+						fbJSON := buildToolJSON(fb.FallbackTool, fbArgs)
+						logger.Log.Infof("[llm:supervisor] auto-fallback: %s failed, trying %s", toolName, fb.FallbackTool)
+						fbResult, fbErr := toolExec(ctx, []byte(fbJSON))
+						if fbErr != nil {
+							messages = append(messages, Message{Role: "user", Content: fmt.Sprintf(
+								"Tool result [auto-fallback]: %s failed (%s). Fallback to %s also failed: %s",
+								toolName, failureMsg, fb.FallbackTool, fbErr.Error())})
+						} else {
+							truncLen := defaultMaxToolResultLen
+							if opts != nil && opts.MaxToolResultLen > 0 {
+								truncLen = opts.MaxToolResultLen
+							}
+							if len(fbResult) > truncLen {
+								origLen := len(fbResult)
+								fbResult = fbResult[:truncLen] + fmt.Sprintf(
+									"\n... (truncated: showing %d of %d chars)",
+									truncLen, origLen)
+							}
+							messages = append(messages, Message{Role: "user", Content: fmt.Sprintf(
+								"Tool result [auto-fallback]: %s failed (%s). Fallback to %s:\n%s",
+								toolName, failureMsg, fb.FallbackTool, fbResult)})
+						}
+						continue
+					}
+
+					// No fallback configured — inject hint if available.
+					hint := toolHint(toolName)
+					if execErr != nil {
+						messages = append(messages, Message{Role: "user", Content: "Tool error: " + execErr.Error() + hint})
+					} else {
+						truncLen := defaultMaxToolResultLen
+						if opts != nil && opts.MaxToolResultLen > 0 {
+							truncLen = opts.MaxToolResultLen
+						}
+						if len(result) > truncLen {
+							origLen := len(result)
+							result = result[:truncLen] + fmt.Sprintf(
+								"\n... (truncated: showing %d of %d chars)",
+								truncLen, origLen)
+						}
+						messages = append(messages, Message{Role: "user", Content: "Tool result: " + result + hint})
+					}
+					continue
+				}
+
+				// Success path.
+				truncLen := defaultMaxToolResultLen
+				if opts != nil && opts.MaxToolResultLen > 0 {
+					truncLen = opts.MaxToolResultLen
+				}
+				if len(result) > truncLen {
+					origLen := len(result)
+					result = result[:truncLen] + fmt.Sprintf(
+						"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
+						truncLen, origLen)
+				}
+				messages = append(messages, Message{Role: "user", Content: "Tool result: " + result})
 				continue
 			}
 		}

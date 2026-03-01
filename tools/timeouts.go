@@ -8,16 +8,16 @@ import (
 
 const (
 	// --- Network & HTTP ---
-	TimeoutSearXNG  = 15 * time.Second
-	TimeoutURLFetch = 30 * time.Second
+	TimeoutSearXNG   = 15 * time.Second
+	TimeoutURLFetch  = 30 * time.Second
 	TimeoutSkillHTTP = 15 * time.Second
 
 	// --- LLM Backend ---
-	TimeoutDeepThinker = 4 * time.Minute
-	TimeoutSubagent    = 30 * time.Second
+	TimeoutDeepThinker  = 4 * time.Minute
+	TimeoutSubagent     = 30 * time.Second
 	TimeoutSubagentCall = 10 * time.Second
-	TimeoutGatekeeper  = 30 * time.Second
-	TimeoutText2SQL    = 2 * time.Minute
+	TimeoutGatekeeper   = 30 * time.Second
+	TimeoutText2SQL     = 2 * time.Minute
 	TimeoutDistillation = timeouts.Distillation
 
 	// --- Memory & Triage ---
@@ -31,11 +31,14 @@ const (
 	TimeoutInitConsolidation  = 3 * time.Minute
 
 	// --- Tasks & Skills ---
-	TimeoutTaskExtraction    = 15 * time.Second
-	TimeoutSkillExec         = 30 * time.Second
+	TimeoutTaskExtraction = 15 * time.Second
+	TimeoutSkillExec      = 30 * time.Second
 
 	// --- Bootstrap ---
 	TimeoutBootstrapProfile = 3 * time.Minute
+
+	// --- Consolidation ---
+	TimeoutConsolidationDefault = 10 * time.Minute
 
 	// --- Plan Execution ---
 	TimeoutPlanDecomposition = 60 * time.Second

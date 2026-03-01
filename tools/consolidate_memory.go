@@ -283,7 +283,7 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 		if opts.Timeout > 0 {
 			reqCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
 		} else {
-			reqCtx, cancel = context.WithTimeout(ctx, 10*time.Minute)
+			reqCtx, cancel = context.WithTimeout(ctx, TimeoutConsolidationDefault)
 		}
 		raw, cErr := dtc.Complete(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
 		cancel()

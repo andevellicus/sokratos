@@ -421,6 +421,22 @@ func (btr *BackgroundTaskRunner) List(ctx context.Context) (string, error) {
 	return b.String(), nil
 }
 
+// LaunchBackgroundPlan decomposes a directive via DTC and launches it as a
+// background task. Returns the task ID. Used by the curiosity engine.
+func LaunchBackgroundPlan(btr *BackgroundTaskRunner, dtc *DeepThinkerClient,
+	sc *SubagentClient, dc *DelegateConfig, registry *Registry,
+	directive string, priority int) (int64, error) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanDecomposition)
+	defer cancel()
+
+	plan, err := decomposePlan(ctx, dtc, directive, "")
+	if err != nil {
+		return 0, fmt.Errorf("curiosity plan decomposition: %w", err)
+	}
+	return btr.Start(directive, priority, plan.Steps, sc, dc, registry)
+}
+
 // --- Tool constructors ---
 
 // NewPlanAndExecute returns a ToolFunc that decomposes a directive into steps

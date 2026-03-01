@@ -100,13 +100,47 @@ func (r *Registry) SchemasForTools(names []string) []ToolSchema {
 	return schemas
 }
 
-// DynamicToolDescriptions returns formatted descriptions for tools that have a
-// non-empty Description field (typically runtime-registered skills). These are
-// appended to the static prompts.Tools content for the tool agent's system prompt.
+// CompactIndex returns a compact one-line-per-tool index for the system prompt.
+// Required params are starred. The "respond" meta-tool is excluded (handled
+// separately by the supervisor prompt).
+func (r *Registry) CompactIndex() string {
+	var b strings.Builder
+	for _, s := range r.schemas {
+		if s.Name == "respond" {
+			continue
+		}
+		b.WriteString("- ")
+		b.WriteString(s.Name)
+		if len(s.Params) > 0 {
+			b.WriteString("(")
+			for i, p := range s.Params {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				if p.Required {
+					b.WriteString("*")
+				}
+				b.WriteString(p.Name)
+			}
+			b.WriteString(")")
+		}
+		if s.Description != "" {
+			b.WriteString(" — ")
+			b.WriteString(s.Description)
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// DynamicToolDescriptions returns formatted descriptions for skill tools
+// (IsSkill=true with a non-empty Description). These provide detailed argument
+// info for runtime-registered skills that the orchestrator hasn't seen in
+// training data. Appended after the compact tool index in the system prompt.
 func (r *Registry) DynamicToolDescriptions() string {
 	var b strings.Builder
 	for _, s := range r.schemas {
-		if s.Description == "" {
+		if !s.IsSkill || s.Description == "" {
 			continue
 		}
 		b.WriteString("- ")

@@ -1,0 +1,12 @@
+interval: 12 hours
+---
+Fetch tweets and send me a digest of the most interesting items.
+
+Steps:
+1. Call twitter-feed with no arguments — it reads accounts and topics from its config file automatically
+2. Review my personality traits and interests to understand what I care about
+3. From the results, select the 5-7 most relevant items based on my interests
+4. Filter out: memes, political arguments, rage-bait, fluff, and anything not aligned with my interests
+5. Send me a clean digest. Format each item as: title, one-line summary of why it's interesting, and URL
+
+If no items pass the filter, do not send a message.

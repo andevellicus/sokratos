@@ -83,7 +83,10 @@ func (e *Engine) runCognitiveIfTriggered() {
 	// 3. Profile consolidation.
 	e.runProfileConsolidation()
 
-	// 4. Refresh cached profile and personality.
+	// 4. Proactive curiosity.
+	e.runCuriosityIfReady()
+
+	// 5. Refresh cached profile and personality.
 	e.RefreshProfile()
 	e.RefreshPersonality()
 

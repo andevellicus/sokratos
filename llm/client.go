@@ -287,6 +287,19 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onToken ChatSt
 const maxToolRounds = 15
 const defaultMaxToolResultLen = 2000 // truncate individual tool results to stay within context
 
+// FallbackDef describes a deterministic fallback tool to invoke when a primary
+// tool fails. ArgsTransform builds new args from the original call context.
+// TriggerPattern, when non-nil, restricts fallback to failures matching the
+// pattern; nil means trigger on any failure.
+type FallbackDef struct {
+	FallbackTool   string
+	ArgsTransform  func(toolName string, originalArgs json.RawMessage, failureMsg string) json.RawMessage
+	TriggerPattern *regexp.Regexp // nil = trigger on any failure
+}
+
+// FallbackMap maps primary tool names to their fallback definitions.
+type FallbackMap map[string]FallbackDef
+
 var systemPromptBase = strings.TrimSpace(prompts.System)
 
 // ToolAgentConfig holds the configuration for the supervisor pattern. When set,
@@ -303,9 +316,11 @@ type QueryOrchestratorOpts struct {
 	Grammar            string           // GBNF grammar to constrain output (only applied when thinking is off)
 	PersonalityContent string           // personality traits markdown — injected into system prompt before profile
 	ProfileContent     string           // identity profile JSON — injected into system prompt if non-empty
+	TemporalContext    string           // XML temporal context — injected after profile
 	MaxToolResultLen   int              // max chars per tool result (0 = default 2000)
 	MaxWebSources      int              // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
+	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
 	OnStreamChunk      func(token string) // called for post-think content during final (non-tool) response streaming; nil = non-streaming
 }
 
@@ -335,6 +350,9 @@ func QueryOrchestrator(ctx context.Context, client *Client, model, prompt string
 	}
 	if opts != nil && opts.ProfileContent != "" {
 		sysContent += "\n\n## Identity Card\n" + opts.ProfileContent
+	}
+	if opts != nil && opts.TemporalContext != "" {
+		sysContent += "\n\n" + opts.TemporalContext
 	}
 
 	if !client.EnableThinking {
