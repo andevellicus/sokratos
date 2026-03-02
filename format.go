@@ -13,7 +13,7 @@ import (
 var (
 	codeBlockRe  = regexp.MustCompile("(?s)```\\w*\n?(.*?)```")
 	inlineCodeRe = regexp.MustCompile("`([^`\n]+)`")
-	headingRe    = regexp.MustCompile(`(?m)^#{1,3}\s+(.+)$`)
+	headingRe    = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
 	boldRe       = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	italicRe     = regexp.MustCompile(`(?:^|[^*])\*([^*]+?)\*(?:[^*]|$)`)
 	strikeRe     = regexp.MustCompile(`~~(.+?)~~`)
@@ -87,29 +87,6 @@ func escapeHTML(s string) string {
 	return s
 }
 
-// thinkBlockRe extracts <think>...</think> blocks from LLM output.
-var thinkBlockRe = regexp.MustCompile(`(?s)<think>(.*?)</think>`)
-
-// extractThinking separates thinking content from the visible response.
-// Returns (thinking, reply) where thinking is the raw text inside <think> tags
-// and reply is the response with think blocks removed.
-func extractThinking(raw string) (thinking, reply string) {
-	matches := thinkBlockRe.FindAllStringSubmatch(raw, -1)
-	if len(matches) == 0 {
-		return "", raw
-	}
-	var parts []string
-	for _, m := range matches {
-		if t := strings.TrimSpace(m[1]); t != "" {
-			parts = append(parts, t)
-		}
-	}
-	thinking = strings.Join(parts, "\n\n")
-	reply = strings.TrimSpace(thinkBlockRe.ReplaceAllString(raw, ""))
-	return thinking, reply
-}
-
-const thinkingMaxLen = 2000 // truncate thinking to stay within message limits
 
 // telegramEntity is a Bot API MessageEntity with expandable_blockquote support.
 // The library's tgbotapi.MessageEntity lacks this type, so we use our own for
@@ -289,45 +266,10 @@ type formattedMessage struct {
 	Entities []telegramEntity
 }
 
-// formatWithThinking builds a formattedMessage from raw LLM output.
-// The reply is markdown-formatted via entities. If thinking is present,
-// it's appended as an expandable_blockquote (collapsed by default) with
-// a bold "Thoughts" header — the collapsed preview shows just the header.
-func formatWithThinking(raw string) formattedMessage {
-	thinking, reply := extractThinking(raw)
+// formatReply builds a formattedMessage by converting Markdown to
+// plain text + Telegram entities. Thinking is logged server-side only.
+func formatReply(reply string) formattedMessage {
 	text, entities := mdToEntities(reply)
-
-	if thinking == "" {
-		return formattedMessage{Text: text, Entities: entities}
-	}
-
-	if len(thinking) > thinkingMaxLen {
-		thinking = thinking[:thinkingMaxLen] + "..."
-	}
-
-	// Append thinking section after the reply.
-	thinkHeader := "Thoughts"
-	thinkSection := thinkHeader + "\n" + thinking
-	separator := "\n\n"
-	text += separator + thinkSection
-
-	// Entity offsets for the appended section.
-	sectionOffset := utf16Len(text) - utf16Len(thinkSection)
-
-	// expandable_blockquote covering the entire "Thoughts\n<thinking>" section.
-	entities = append(entities, telegramEntity{
-		Type:   "expandable_blockquote",
-		Offset: sectionOffset,
-		Length: utf16Len(thinkSection),
-	})
-
-	// Bold on just "Thoughts" header inside the blockquote.
-	entities = append(entities, telegramEntity{
-		Type:   "bold",
-		Offset: sectionOffset,
-		Length: utf16Len(thinkHeader),
-	})
-
 	return formattedMessage{Text: text, Entities: entities}
 }
 

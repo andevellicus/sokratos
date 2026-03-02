@@ -39,7 +39,7 @@ func retryConversationTriage(cfg TriageConfig, triageInput, exchange string, too
 		DomainTag:     "conversation",
 		MemoryType:    "general",
 		Source:        "conversation",
-		MaxTriageLen:  4000,
+		MaxTriageLen:  8000,
 		ShouldSave: func(r *triageResult) bool {
 			return r.SalienceScore >= threshold
 		},
@@ -58,7 +58,7 @@ func retryEmailTriage(cfg TriageConfig, triageInput, formatted string) error {
 		DomainTag:     "email",
 		MemoryType:    "email",
 		Source:        "email",
-		MaxTriageLen:  4000,
+		MaxTriageLen:  8000,
 		ShouldSave: func(r *triageResult) bool {
 			if r.Save != nil && !*r.Save {
 				return false

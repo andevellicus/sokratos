@@ -313,7 +313,7 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 	// Build email triage config if dependencies are available.
 	// TriageGrammar is left empty here and set after initLLM builds the grammar.
 	var emailTriageCfg *tools.TriageConfig
-	if db.Pool != nil && cfg.EmbedURL != "" && (svc.DTC != nil || svc.Subagent != nil) {
+	if db.Pool != nil && cfg.EmbedURL != "" && svc.DTC != nil {
 		emailTriageCfg = &tools.TriageConfig{
 			Pool:          db.Pool,
 			EmbedEndpoint: cfg.EmbedURL,
@@ -321,7 +321,6 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 			DTC:           svc.DTC,
 			QueueFn:       svc.QueueFunc,
 			BgGrammarFn:   svc.BgGrammarFunc,
-			Subagent:      svc.Subagent,
 			RetryQueue:    svc.TriageRetryQueue,
 		}
 	}

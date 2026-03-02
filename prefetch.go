@@ -14,12 +14,11 @@ import (
 	"sokratos/tools"
 )
 
-// prefetchResult holds the subconscious prefetch output: a system message
-// with retrieved context, plus the memory IDs for usefulness feedback.
+// prefetchResult holds the subconscious prefetch output: retrieved memory
+// content plus the memory IDs for usefulness feedback.
 type prefetchResult struct {
-	Message   *llm.Message
 	IDs       []int64
-	Summaries string // formatted memory summaries for usefulness evaluation
+	Summaries string // formatted memory summaries for system prompt injection + usefulness evaluation
 }
 
 // subconsciousPrefetch embeds the user's message and retrieves semantically
@@ -55,7 +54,6 @@ func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, emb
 		return nil
 	}
 	return &prefetchResult{
-		Message:   &llm.Message{Role: "user", Content: pf.Content},
 		IDs:       pf.IDs,
 		Summaries: pf.Content,
 	}

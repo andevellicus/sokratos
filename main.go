@@ -258,13 +258,11 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 type llmBundle struct {
 	Client        *llm.Client
 	ToolAgent     *llm.ToolAgentConfig
-	ToolGrammar   string
 	TriageGrammar string
 	TrimFn        func([]llm.Message) []llm.Message
 }
 
 func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
-	toolGrammar := grammar.BuildToolGrammar(registry.Schemas())
 	trimFn := func(msgs []llm.Message) []llm.Message {
 		return engine.TrimMessages(msgs, 12)
 	}
@@ -301,7 +299,6 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	return &llmBundle{
 		Client:        llmClient,
 		ToolAgent:     toolAgentConfig,
-		ToolGrammar:   toolGrammar,
 		TriageGrammar: triageGrammar,
 		TrimFn:        trimFn,
 	}
@@ -327,7 +324,6 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		LLM: engine.LLMConfig{
 			Client:           lb.Client,
 			Model:            cfg.LLMModel,
-			Grammar:          lb.ToolGrammar,
 			ToolAgent:        lb.ToolAgent,
 			Fallbacks:        fallbacks,
 			MaxToolResultLen: cfg.MaxToolResultLen,
@@ -504,10 +500,6 @@ func main() {
 
 	// Build grammar rebuild callback capturing registry + lb + eng.
 	rebuildGrammar := func() {
-		newGrammar := grammar.BuildToolGrammar(registry.Schemas())
-		lb.ToolGrammar = newGrammar
-		eng.LLM.Grammar = newGrammar
-
 		// Rebuild tool descriptions: compact index + dynamic skill descriptions.
 		compactIdx := registry.CompactIndex()
 		td := strings.Replace(prompts.ToolsCompact, "%TOOL_INDEX%", compactIdx, 1)
@@ -702,15 +694,13 @@ func main() {
 		history := svc.StateMgr.ReadMessages()
 
 		// Phase 2: Prefetch (network I/O — no engine state needed).
-		inferHistory := history
+		var prefetchContent string
 		var prefetchIDs []int64
 		var prefetchSummaries string
 		if db.Pool != nil && cfg.EmbedURL != "" && strings.TrimSpace(msgText) != "" {
 			pfCtx, pfCancel := context.WithTimeout(context.Background(), tools.TimeoutPrefetch)
 			if pf := subconsciousPrefetch(pfCtx, db.Pool, cfg.EmbedURL, cfg.EmbedModel, msgText, history); pf != nil {
-				inferHistory = make([]llm.Message, len(history), len(history)+1)
-				copy(inferHistory, history)
-				inferHistory = append(inferHistory, *pf.Message)
+				prefetchContent = pf.Summaries
 				prefetchIDs = pf.IDs
 				prefetchSummaries = pf.Summaries
 			}
@@ -724,22 +714,20 @@ func main() {
 		}
 
 		// Phase 3: Lock for string snapshots + orchestrator serialization.
-		streamer := newStreamSender(svc.Bot, chatID, msg.MessageID, typingCancel)
 		eng.Mu.Lock()
 		personalityContent := eng.PersonalityContent
 		profileContent := eng.ProfileContent
 		reply, msgs, err := llm.QueryOrchestrator(context.Background(), lb.Client, cfg.LLMModel, userPrompt, confirmExec, lb.TrimFn, &llm.QueryOrchestratorOpts{
 			Parts:              visionParts,
-			History:            inferHistory,
-			Grammar:            lb.ToolGrammar,
+			History:            history,
 			PersonalityContent: personalityContent,
 			ProfileContent:     profileContent,
 			TemporalContext:    temporalCtx,
+			PrefetchContent:    prefetchContent,
 			MaxToolResultLen:   cfg.MaxToolResultLen,
 			MaxWebSources:      cfg.MaxWebSources,
 			ToolAgent:          lb.ToolAgent,
 			Fallbacks:          fallbacks,
-			OnStreamChunk:      streamer.OnChunk,
 		})
 		eng.Mu.Unlock()
 		typingCancel()
@@ -755,14 +743,8 @@ func main() {
 		}
 
 		if err == nil && db.Pool != nil && cfg.EmbedURL != "" && svc.DTC != nil {
-			exchange := fmt.Sprintf("user: %s\nassistant: %s", msgText, reply)
-			toolsUsed := false
-			for _, m := range msgs {
-				if strings.HasPrefix(m.Content, "Tool result: ") {
-					toolsUsed = true
-					break
-				}
-			}
+			toolCtx, toolsUsed := summarizeToolContext(msgs)
+			exchange := toolCtx + fmt.Sprintf("user: %s\nassistant: %s", msgText, reply)
 			tools.TriageAndSaveConversationAsync(*emailTriageCfg, exchange, toolsUsed)
 		}
 
@@ -782,29 +764,19 @@ func main() {
 
 		// Don't send orchestrator control tags to the user.
 		if strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
-			streamer.Delete() // clean up any partial message
 			continue
 		}
 
-		// Extract the raw assistant message (with think tags) for spoiler display.
-		var rawAssistant string
-		for i := len(msgs) - 1; i >= 0; i-- {
-			if msgs[i].Role == "assistant" {
-				rawAssistant = msgs[i].Content
-				break
-			}
-		}
-
-		// If streaming happened, finalize with formatted text; otherwise send normally.
-		if !streamer.Finalize(rawAssistant) {
-			fm := formatWithThinking(rawAssistant)
-			if _, err := sendFormatted(svc.Bot, chatID, msg.MessageID, fm); err != nil {
-				logger.Log.Warnf("Entity send failed, falling back to plain text: %v", err)
-				replyMsg := tgbotapi.NewMessage(chatID, reply)
-				replyMsg.ReplyToMessageID = msg.MessageID
-				if _, err := svc.Bot.Send(replyMsg); err != nil {
-					logger.Log.Errorf("Error sending message: %v", err)
-				}
+		// Format reply with entity-based markdown. `reply` already includes
+		// accumulated intermediate text from tool-call rounds (prepended by
+		// the supervisor). Thinking is logged in the supervisor, not shown in UI.
+		fm := formatReply(reply)
+		if _, err := sendFormatted(svc.Bot, chatID, msg.MessageID, fm); err != nil {
+			logger.Log.Warnf("Entity send failed, falling back to plain text: %v", err)
+			replyMsg := tgbotapi.NewMessage(chatID, reply)
+			replyMsg.ReplyToMessageID = msg.MessageID
+			if _, err := svc.Bot.Send(replyMsg); err != nil {
+				logger.Log.Errorf("Error sending message: %v", err)
 			}
 		}
 	}

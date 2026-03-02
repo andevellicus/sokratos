@@ -26,7 +26,6 @@ type GatekeeperClient interface {
 type LLMConfig struct {
 	Client           *llm.Client
 	Model            string
-	Grammar          string               // GBNF grammar for tool-call constraint
 	ToolAgent        *llm.ToolAgentConfig // when set, enables the supervisor pattern
 	Fallbacks        llm.FallbackMap      // deterministic fallback chains for failed tools
 	MaxToolResultLen int                  // max chars per tool result (0 = default 2000)
@@ -108,7 +107,6 @@ func (e *Engine) withOrchestratorLock(fn func()) {
 // all orchestrator call sites (heartbeat, routines, scheduled tasks).
 func (e *Engine) baseOrchestratorOpts() *llm.QueryOrchestratorOpts {
 	return &llm.QueryOrchestratorOpts{
-		Grammar:            e.LLM.Grammar,
 		PersonalityContent: e.PersonalityContent,
 		ProfileContent:     e.ProfileContent,
 		TemporalContext:    e.TemporalContent,

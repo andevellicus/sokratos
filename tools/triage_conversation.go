@@ -11,6 +11,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/textutil"
 	"sokratos/memory"
 	"sokratos/prompts"
 )
@@ -25,26 +26,23 @@ type triageResult struct {
 	ParadigmShift bool     `json:"paradigm_shift,omitempty"`
 }
 
-// TriageViaSubagent sends content to the subagent with a GBNF-constrained
-// grammar and parses the result into a triageResult. Falls back to safe
-// defaults on parse failure.
-func TriageViaSubagent(ctx context.Context, sc *SubagentClient, triageGrammar, systemPrompt, content string, maxLen int) (*triageResult, error) {
+// TriageViaDTC sends content to the deep thinker (Qwen3.5-27B, no thinking)
+// with a GBNF grammar constraint and parses the result into a triageResult.
+// Falls back to safe defaults on parse failure.
+func TriageViaDTC(ctx context.Context, dtc *DeepThinkerClient, triageGrammar, systemPrompt, content string, maxLen int) (*triageResult, error) {
 	if len(content) > maxLen {
-		content = content[:maxLen] + "..."
+		content = textutil.Truncate(content, maxLen)
 	}
 
-	raw, err := sc.CompleteWithGrammar(ctx, systemPrompt, content, triageGrammar, 2048)
+	raw, err := dtc.CompleteNoThinkWithGrammar(ctx, systemPrompt, content, triageGrammar, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("subagent triage request: %w", err)
+		return nil, fmt.Errorf("dtc triage request: %w", err)
 	}
 
 	var result triageResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		logger.Log.Warnf("[conversation_triage] subagent parse failure, using fallback: %v (raw: %s)", err, raw)
-		summary := content
-		if len(summary) > 200 {
-			summary = summary[:200] + "..."
-		}
+		logger.Log.Warnf("[conversation_triage] dtc parse failure, using fallback: %v (raw: %s)", err, raw)
+		summary := textutil.Truncate(content, 200)
 		return &triageResult{
 			SalienceScore: 5,
 			Summary:       summary,
@@ -97,7 +95,7 @@ func truncateAssistantReply(exchange string, maxReplyLen int) string {
 	if len(reply) <= maxReplyLen {
 		return exchange
 	}
-	return exchange[:replyStart] + reply[:maxReplyLen] + "..."
+	return exchange[:replyStart] + textutil.Truncate(reply, maxReplyLen)
 }
 
 // TriageConfig groups dependencies for conversation triage and memory save.
@@ -108,7 +106,6 @@ type TriageConfig struct {
 	DTC                *DeepThinkerClient
 	QueueFn            memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
 	BgGrammarFn        memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
-	Subagent           *SubagentClient
 	TriageGrammar      string
 	RetryQueue         *RetryQueue // deferred triage retry queue (nil = drop on failure)
 	ProfileRefreshFunc func()      // called after paradigm shift to refresh engine profile + personality
@@ -125,17 +122,17 @@ type TriageSaveRequest struct {
 	MemoryType    string     // "general" or "email"
 	Source        string     // "conversation" or "email"
 	SourceDate    *time.Time // optional: for email source dates
-	MaxTriageLen  int        // max chars for triage input (typically 4000)
+	MaxTriageLen  int        // max chars for triage input (typically 8000)
 	ShouldSave    func(result *triageResult) bool
 }
 
 // triageAndSave is the core triage-then-save pipeline used by both async
-// and retry paths for conversation and email triage. It triages via subagent,
-// checks the domain-specific ShouldSave predicate, builds and saves the memory,
-// and optionally triggers paradigm shift detection.
+// and retry paths for conversation and email triage. It triages via DTC
+// (Qwen3.5-27B, no thinking), checks the domain-specific ShouldSave predicate,
+// builds and saves the memory, and optionally triggers paradigm shift detection.
 func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest) error {
-	if cfg.Subagent == nil || cfg.TriageGrammar == "" {
-		return fmt.Errorf("subagent not configured")
+	if cfg.DTC == nil || cfg.TriageGrammar == "" {
+		return fmt.Errorf("DTC not configured for triage")
 	}
 
 	// Context-aware triage: check if similar memories already exist.
@@ -162,7 +159,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		}
 	}
 
-	result, err := TriageViaSubagent(ctx, cfg.Subagent, cfg.TriageGrammar, req.TriagePrompt, triageInput, req.MaxTriageLen)
+	result, err := TriageViaDTC(ctx, cfg.DTC, cfg.TriageGrammar, req.TriagePrompt, triageInput, req.MaxTriageLen)
 	if err != nil {
 		return err
 	}
@@ -175,10 +172,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 	// Store summary first (dominates the embedding model's 512-token window)
 	// followed by the full source for internal analysis (contradiction detection,
 	// consolidation). A 2000-char safety cap prevents copy-paste bombs.
-	sourceContent := req.SourceContent
-	if len(sourceContent) > 2000 {
-		sourceContent = sourceContent[:2000] + "..."
-	}
+	sourceContent := textutil.Truncate(req.SourceContent, 2000)
 	text := fmt.Sprintf("%s\n\n%s:\n%s", result.Summary, req.SourceLabel, sourceContent)
 	tags := append([]string{req.DomainTag}, result.Tags...)
 
@@ -241,7 +235,7 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 			return
 		}
 
-		triageInput := truncateAssistantReply(exchange, 300)
+		triageInput := truncateAssistantReply(exchange, 800)
 
 		threshold := float64(3)
 		if !toolsUsed {
@@ -256,7 +250,7 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 			DomainTag:     "conversation",
 			MemoryType:    "general",
 			Source:        "conversation",
-			MaxTriageLen:  4000,
+			MaxTriageLen:  8000,
 			ShouldSave: func(r *triageResult) bool {
 				if r.Save != nil {
 					logger.Log.Debugf("[conversation_triage] save=%v (score=%.0f)", *r.Save, r.SalienceScore)

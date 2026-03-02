@@ -14,8 +14,8 @@ Usage rules:
 - If a skill fails or returns irrelevant results, try search_web as fallback.
 
 ## Examples
-<TOOL_INTENT>get-weather: {"location": "Greenville, SC"}</TOOL_INTENT>
-<TOOL_INTENT>search_memory: {"query": "wife name family"}</TOOL_INTENT>
+<TOOL_INTENT>get-weather: {"location": "New York, NY"}</TOOL_INTENT>
+<TOOL_INTENT>search_memory: {"query": "favorite hobby weekend"}</TOOL_INTENT>
 <TOOL_INTENT>search_calendar: {"time_min": "2026-03-01T00:00:00Z", "time_max": "2026-03-02T00:00:00Z"}</TOOL_INTENT>
 <TOOL_INTENT>consolidate_memory: {}</TOOL_INTENT>
-<TOOL_INTENT>search_web: {"query": "weather Greenville SC"}</TOOL_INTENT>
+<TOOL_INTENT>search_web: {"query": "latest Python release features"}</TOOL_INTENT>

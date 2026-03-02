@@ -9,6 +9,8 @@ import (
 
 	cal "google.golang.org/api/calendar/v3"
 
+	"sokratos/textutil"
+
 	"sokratos/timefmt"
 )
 
@@ -298,10 +300,7 @@ func FormatEventSummary(e Event) string {
 		fmt.Fprintf(&b, "Status: %s\n", e.Status)
 	}
 
-	desc := e.Description
-	if len(desc) > 500 {
-		desc = desc[:500] + "..."
-	}
+	desc := textutil.Truncate(e.Description, 500)
 	if desc != "" {
 		fmt.Fprintf(&b, "\n%s", desc)
 	}

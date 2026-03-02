@@ -128,7 +128,7 @@ func triageAndSaveEmailAsync(cfg TriageConfig, email gmail.Email) {
 			MemoryType:    "email",
 			Source:        "email",
 			SourceDate:    &sourceDate,
-			MaxTriageLen:  4000,
+			MaxTriageLen:  8000,
 			ShouldSave: func(r *triageResult) bool {
 				if r.Save != nil && !*r.Save {
 					return false

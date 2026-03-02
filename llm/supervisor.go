@@ -104,6 +104,15 @@ var closingToolIntentRe = regexp.MustCompile(`<[/\\]TOOL_INT[A-Z]*>`)
 // truncated tags, etc.).
 var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)<[/\\]?TOOL_INT[A-Z]*>`)
 
+// stripToolIntentTags removes all <TOOL_INTENT>...</TOOL_INTENT> blocks from
+// a string, returning only the surrounding prose. Used to preserve substantive
+// text from intermediate supervisor rounds that also contain a tool call.
+func stripToolIntentTags(s string) string {
+	s = toolIntentCodeRe.ReplaceAllString(s, "")
+	s = toolIntentRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
+
 // extractToolIntent extracts the content of the first <TOOL_INTENT> tag.
 // It tries the CODE-block pattern first, then falls back to the simple one.
 func extractToolIntent(s string) (string, bool) {
@@ -129,7 +138,7 @@ func buildSupervisorSystemPrompt(toolDescs string) string {
 	// Replace tool-call JSON format instructions with TOOL_INTENT tag instructions.
 	sp = strings.Replace(sp,
 		"- Call ONE tool per turn. Output ONLY the JSON object, nothing else:\n  {\"name\":\"<tool_name>\",\"arguments\":{}}\n- No markdown code fences around tool calls.",
-		"- When you need to use a tool, wrap your intent in XML tags. You MUST use the closing tag </TOOL_INTENT> (with a forward slash):\n  <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>\n  A dedicated tool agent will translate your intent into a structured call.\n- ALWAYS include the arguments JSON object, even if empty: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>\n- Call ONE tool per turn. You may include reasoning and context outside the tags.",
+		"- When you need to use a tool, wrap your intent in XML tags. You MUST use the closing tag </TOOL_INTENT> (with a forward slash):\n  <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>\n  A dedicated tool agent will translate your intent into a structured call.\n- ALWAYS include the arguments JSON object, even if empty: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>\n- Call ONE tool per turn. You may include reasoning and context outside the tags.\n- IMPORTANT: Any text you write alongside a TOOL_INTENT tag IS shown to the user. After the tool executes, do NOT repeat or rephrase what you already said — only add genuinely new information from the tool result.",
 		1)
 
 	// Replace respond tool instruction with plain text response instruction.
@@ -239,123 +248,6 @@ func parseToolIntent(intent string) (string, bool) {
 	return string(result), true
 }
 
-// streamPhase tracks which phase the streaming state machine is in.
-type streamPhase int
-
-const (
-	phaseThink  streamPhase = iota // buffering inside <think>...</think>
-	phaseProbe                     // buffering first N chars post-think, checking for <TOOL_INTENT
-	phaseStream                    // forwarding tokens to the callback
-	phaseMuted                     // tool intent detected, stop forwarding
-)
-
-const probeChars = 50 // chars to buffer in probe phase before committing to stream
-
-// streamState is a state machine that decides which tokens from the LLM stream
-// should be forwarded to the user via the OnStreamChunk callback. It handles:
-// - Suppressing <think>...</think> blocks
-// - Probing the first few chars after think to detect tool intents
-// - Forwarding user-visible content
-// - Muting once a <TOOL_INTENT> tag is detected
-type streamState struct {
-	callback  func(token string)
-	phase     streamPhase
-	acc       strings.Builder // full accumulated output (including think blocks)
-	postThink strings.Builder // accumulated content after </think>
-}
-
-// newStreamState creates a stream state machine with the given callback.
-func newStreamState(callback func(token string)) *streamState {
-	return &streamState{
-		callback: callback,
-		phase:    phaseThink,
-	}
-}
-
-// onToken processes a single token from the LLM stream. Returns false to abort
-// the stream (when tool intent is fully detected in muted phase).
-func (ss *streamState) onToken(token string) bool {
-	ss.acc.WriteString(token)
-	full := ss.acc.String()
-
-	switch ss.phase {
-	case phaseThink:
-		// Check if we've exited the think block.
-		if strings.Contains(full, "</think>") {
-			// Extract everything after the last </think>.
-			idx := strings.LastIndex(full, "</think>")
-			post := full[idx+len("</think>"):]
-			ss.postThink.WriteString(post)
-			ss.phase = phaseProbe
-			// Fall through to probe logic.
-			return ss.probeCheck()
-		}
-		// Still in think block. But if there's no <think> tag at all and we
-		// have some content, the model may not be using think blocks this round.
-		if !strings.Contains(full, "<think>") && len(full) > 20 {
-			// No think block — treat everything as post-think.
-			ss.postThink.WriteString(full)
-			ss.phase = phaseProbe
-			return ss.probeCheck()
-		}
-		return true
-
-	case phaseProbe:
-		ss.postThink.WriteString(token)
-		return ss.probeCheck()
-
-	case phaseStream:
-		ss.postThink.WriteString(token)
-		ss.callback(token)
-		// Late tool intent check (rare but possible).
-		if strings.Contains(ss.postThink.String(), "<TOOL_INTENT") {
-			ss.phase = phaseMuted
-			return true // keep reading to get the full intent
-		}
-		return true
-
-	case phaseMuted:
-		// Keep accumulating until the full intent is captured.
-		// Check for closing tag to abort early.
-		if strings.Contains(full, "</TOOL_INTENT>") || strings.Contains(full, "</CODE>") {
-			return false // abort stream, we have the full intent
-		}
-		return true
-	}
-
-	return true
-}
-
-// probeCheck is called during the probe phase to decide whether to transition
-// to streaming or muting.
-func (ss *streamState) probeCheck() bool {
-	post := ss.postThink.String()
-
-	// Check for tool intent in buffered content.
-	if strings.Contains(post, "<TOOL_INTENT") {
-		ss.phase = phaseMuted
-		return true // keep reading to get the full intent
-	}
-
-	// If we've buffered enough without seeing a tool intent, start streaming.
-	if len(post) >= probeChars {
-		ss.phase = phaseStream
-		// Flush the buffered post-think content.
-		trimmed := strings.TrimLeft(post, " \t\n\r")
-		if trimmed != "" {
-			ss.callback(trimmed)
-		}
-		return true
-	}
-
-	return true
-}
-
-// streamed returns true if the state machine reached the streaming phase
-// (meaning some content was sent to the user).
-func (ss *streamState) streamed() bool {
-	return ss.phase == phaseStream || (ss.phase == phaseMuted && ss.postThink.Len() >= probeChars)
-}
 
 // querySupervisor implements the multi-agent supervisor pattern. The
 // orchestrator (e.g. Qwen3-VL) runs without grammar and produces free-form
@@ -386,8 +278,9 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	if opts != nil && opts.TemporalContext != "" {
 		sysContent += "\n\n" + opts.TemporalContext
 	}
-
-	// NO /no_think appended — thinking works freely in supervisor mode.
+	if opts != nil && opts.PrefetchContent != "" {
+		sysContent += "\n\n" + opts.PrefetchContent
+	}
 
 	userMsg := Message{Role: "user", Content: prompt}
 	if opts != nil && len(opts.Parts) > 0 {
@@ -403,40 +296,32 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	historyLen := len(messages)
 	messages = append(messages, userMsg)
 
+	// Accumulate substantive prose from intermediate rounds that also contain
+	// a tool intent. Without this, text like "Ah, my apologies — Clair Obscur
+	// is a turn-based RPG..." gets swallowed when it accompanies a save_memory
+	// intent, and only the final round's text (often filler) is returned.
+	var intermediateText []string
+
 	for range maxToolRounds {
 		sent := messages
 		if trimFn != nil {
 			sent = trimFn(messages)
 		}
-		// Rolling timestamp capstone. Marked as system context so the model
-		// doesn't treat it as a user message requiring a response.
-		timeCapstone := Message{
-			Role:    "user",
-			Content: "[SYSTEM CONTEXT — not a user message, do not respond to this] Current time: " + timefmt.FormatNatural(time.Now()),
+		// Inject current time into the system prompt so the model has
+		// temporal awareness without a fake user message it might respond to.
+		sent = append([]Message{}, sent...)
+		sent[0] = Message{
+			Role:    sent[0].Role,
+			Content: sent[0].Content + "\n\nCurrent time: " + timefmt.FormatNatural(time.Now()),
 		}
-		sent = append(sent, timeCapstone)
 
-		// Call orchestrator WITHOUT grammar. Use streaming when a callback
-		// is provided so the user sees tokens progressively.
 		chatReq := ChatRequest{
 			Model:    model,
 			Messages: sent,
 		}
-		var resp ChatResult
-		var ss *streamState
-		if opts != nil && opts.OnStreamChunk != nil {
-			ss = newStreamState(opts.OnStreamChunk)
-			var sErr error
-			resp, sErr = client.ChatStream(ctx, chatReq, ss.onToken)
-			if sErr != nil {
-				return "", messages[historyLen:], sErr
-			}
-		} else {
-			var cErr error
-			resp, cErr = client.Chat(ctx, chatReq)
-			if cErr != nil {
-				return "", messages[historyLen:], cErr
-			}
+		resp, cErr := client.Chat(ctx, chatReq)
+		if cErr != nil {
+			return "", messages[historyLen:], cErr
 		}
 
 		raw := strings.TrimSpace(resp.Message.Content)
@@ -452,6 +337,11 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 
 		// Check for tool intent.
 		if intent, ok := extractToolIntent(content); ok {
+			// Preserve any substantive prose that accompanies the tool intent.
+			if prose := stripToolIntentTags(content); prose != "" {
+				intermediateText = append(intermediateText, prose)
+			}
+
 			// If the intent is just a bare tool name without arguments,
 			// push back to the orchestrator so it retries with proper args.
 			if !strings.Contains(intent, ":") && !strings.Contains(intent, "{") {
@@ -562,6 +452,16 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		}
 
 		// No tool intent — this is the final response.
+		// Prepend any substantive text from intermediate tool-call rounds
+		// so the user sees the full response, not just the final round.
+		if len(intermediateText) > 0 {
+			accumulated := strings.Join(intermediateText, "\n\n")
+			if content != "" {
+				content = accumulated + "\n\n" + content
+			} else {
+				content = accumulated
+			}
+		}
 		messages = append(messages, Message{Role: "assistant", Content: raw})
 		return content, messages[historyLen:], nil
 	}

@@ -174,7 +174,7 @@ func isTransientDTCError(err error) bool {
 
 // bootstrapAttempt runs one DTC call + parse cycle. Returns (result, state).
 func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), attempt int) (string, bootstrapResult) {
-	raw, err := dtc.Complete(ctx, prompt, userContent, 8192)
+	raw, err := dtc.CompleteNoThink(ctx, prompt, userContent, 8192)
 	if err != nil {
 		logger.Log.Errorf("[bootstrap] deep thinker call failed: %v", err)
 		if isTransientDTCError(err) {

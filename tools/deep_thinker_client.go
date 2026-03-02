@@ -38,7 +38,7 @@ func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 // thinking; reasoning_format "deepseek" makes llama-server split <think> blocks
 // into reasoning_content, keeping the content field clean.
 func (d *DeepThinkerClient) Complete(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error) {
-	return d.complete(ctx, systemPrompt, userContent, maxTokens, true)
+	return d.complete(ctx, systemPrompt, userContent, maxTokens, true, "")
 }
 
 // CompleteNoThink is like Complete but disables chain-of-thought reasoning via
@@ -46,14 +46,21 @@ func (d *DeepThinkerClient) Complete(ctx context.Context, systemPrompt, userCont
 // output with zero reasoning tokens, making this the preferred path for
 // structured output tasks (consolidation JSON, plan decomposition, etc.).
 func (d *DeepThinkerClient) CompleteNoThink(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error) {
-	return d.complete(ctx, systemPrompt, userContent, maxTokens, false)
+	return d.complete(ctx, systemPrompt, userContent, maxTokens, false, "")
 }
 
-// complete is the internal implementation shared by Complete and CompleteNoThink.
-// enableThinking controls Qwen3.5's Jinja template via chat_template_kwargs.
-// reasoning_format "deepseek" is always set so llama-server correctly separates
-// any <think> output from the content field.
-func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userContent string, maxTokens int, enableThinking bool) (string, error) {
+// CompleteNoThinkWithGrammar is like CompleteNoThink but adds a GBNF grammar
+// constraint to guarantee structured output (e.g. triage JSON). Thinking is
+// disabled so all tokens go toward the constrained output.
+func (d *DeepThinkerClient) CompleteNoThinkWithGrammar(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error) {
+	return d.complete(ctx, systemPrompt, userContent, maxTokens, false, grammar)
+}
+
+// complete is the internal implementation shared by Complete, CompleteNoThink,
+// and CompleteNoThinkWithGrammar. enableThinking controls Qwen3.5's Jinja
+// template via chat_template_kwargs. reasoning_format "deepseek" is always set
+// so llama-server correctly separates any <think> output from the content field.
+func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userContent string, maxTokens int, enableThinking bool, grammar string) (string, error) {
 	if err := d.cb.check(); err != nil {
 		return "", err
 	}
@@ -79,6 +86,7 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 		},
 		Temperature:     0.1,
 		MaxTokens:       maxTokens,
+		Grammar:         grammar,
 		ReasoningFormat: "deepseek",
 		ChatTemplateKwargs: map[string]any{
 			"enable_thinking": enableThinking,

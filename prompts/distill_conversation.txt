@@ -24,7 +24,7 @@ A lasting fact is something that would still be true and useful weeks or months 
   lasting fact. Only save location preferences when the user explicitly states
   they live there, are moving there, or considers it their city.)
 - Incomplete identity references — if a fact involves a social account, email
-  address, or username, you MUST include the actual identifier (e.g., "@ylecun"),
+  address, or username, you MUST include the actual identifier (e.g., "@handle"),
   not just the display name. If the identifier is absent from the conversation,
   do not produce the fact.
 - Questions the user asked without revealing personal information

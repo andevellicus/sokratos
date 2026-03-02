@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/logger"
+	"sokratos/textutil"
 )
 
 type askDBArgs struct {
@@ -54,10 +55,7 @@ func NewAskDatabase(pool *pgxpool.Pool, sc *SubagentClient) ToolFunc {
 
 		// Validate that the output actually looks like SQL (not prose).
 		if !looksLikeSQL(sql) {
-			preview := sql
-			if len(preview) > 200 {
-				preview = preview[:200] + "..."
-			}
+			preview := textutil.Truncate(sql, 200)
 			return fmt.Sprintf("Subagent returned non-SQL output: %s", preview), nil
 		}
 
@@ -190,10 +188,7 @@ func executeQuery(ctx context.Context, pool *pgxpool.Pool, sql string) (string, 
 			if v == nil {
 				parts[i] = "NULL"
 			} else {
-				s := fmt.Sprintf("%v", v)
-				if len(s) > 100 {
-					s = s[:100] + "..."
-				}
+				s := textutil.Truncate(fmt.Sprintf("%v", v), 100)
 				parts[i] = s
 			}
 		}

@@ -29,7 +29,7 @@
   "name" must be lowercase (letters, digits, underscores, dashes).
   FORMAT RULES (follow exactly to avoid parse errors):
   - "params" must be a JSON STRING containing a JSON array, e.g.: "params": "[{\"name\":\"location\",\"type\":\"string\",\"required\":true}]"
-  - "test_args" must be a JSON OBJECT (not a string), e.g.: "test_args": {"location": "Greenville, SC"}
+  - "test_args" must be a JSON OBJECT (not a string), e.g.: "test_args": {"location": "New York, NY"}
   - DO NOT put code in the JSON args. Write code in a <CODE>...</CODE> block AFTER the JSON inside the TOOL_INTENT tags. The system extracts and injects it as the "code" field automatically.
   JAVASCRIPT RUNTIME (goja/ES5 sandbox — 30s timeout):
   - Available: args (global object with parsed params), http_request(method, url, headersObj, body) for HTTP calls
@@ -67,7 +67,6 @@
   </CODE></TOOL_INTENT>
 - manage_personality: View and evolve your own personality traits. Arguments: {"action": "set|remove|list", "category": "interest|hobby|goal|worldview|style|preference", "key": "trait identifier", "value": "trait content", "context": "optional — when/why this matters"}
   Evolve your personality when you genuinely learn something about yourself through conversation, not mechanically. Use "list" to review current traits. Use "set" to add or update. Use "remove" to delete.
-- bootstrap_profile: Generate and write an initial identity profile via the deep thinker. Runs in the background — returns immediately, notifies via Telegram on completion. No arguments.
 - search_web: Search the internet via SearXNG. Arguments: {"query": "<search query>", "max_results": 5}
   Returns numbered results with title, URL, and snippet. max_results defaults to 5, max 20. Use for current events, fact-checking, or research.
 - read_url: Fetch and extract text content from a URL. Arguments: {"url": "<full URL>", "max_chars": 2000}

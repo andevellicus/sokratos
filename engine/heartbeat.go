@@ -6,40 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"sokratos/llm"
 	"sokratos/logger"
-	"sokratos/memory"
+	"sokratos/textutil"
 	"sokratos/timefmt"
 	"sokratos/timeouts"
 )
-
-// heartbeatPrefetch embeds the current task and retrieves semantically similar
-// memories as background context for the heartbeat. Returns nil if the current
-// task is empty, embedding fails, or no memories match.
-func (e *Engine) heartbeatPrefetch(ctx context.Context) *llm.Message {
-	task := e.SM.GetState().CurrentTask
-	if strings.TrimSpace(task) == "" {
-		return nil
-	}
-
-	embedCtx, cancel := context.WithTimeout(ctx, timeouts.Embedding)
-	defer cancel()
-
-	pf := memory.Prefetch(embedCtx, e.DB, e.EmbedEndpoint, e.EmbedModel, task, task, 3)
-	if pf == nil {
-		return nil
-	}
-
-	// Bump retrieval stats in background.
-	go func() {
-		bCtx, bCancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
-		defer bCancel()
-		memory.TrackRetrieval(bCtx, e.DB, pf.IDs)
-	}()
-
-	logger.Log.Infof("[engine] heartbeat prefetch injected %d memories", len(pf.IDs))
-	return &llm.Message{Role: "user", Content: pf.Content}
-}
 
 // dueRoutine represents a single routine row that's due for execution.
 type dueRoutine struct {
@@ -277,10 +248,7 @@ func (hc heartbeatContext) toXML() string {
 			if bt.ErrMsg != nil && *bt.ErrMsg != "" {
 				errAttr = fmt.Sprintf(" error=%q", *bt.ErrMsg)
 			}
-			dir := bt.Directive
-			if len(dir) > 80 {
-				dir = dir[:77] + "..."
-			}
+			dir := textutil.Truncate(bt.Directive, 77)
 			fmt.Fprintf(&b, "    <bg_task id=\"%d\" status=\"%s\" priority=\"%d\" progress=\"%s\"%s>%s</bg_task>\n",
 				bt.ID, bt.Status, bt.Priority, bt.Progress, errAttr, dir)
 		}

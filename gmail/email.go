@@ -8,6 +8,8 @@ import (
 
 	gm "google.golang.org/api/gmail/v1"
 
+	"sokratos/textutil"
+
 	"sokratos/timefmt"
 )
 
@@ -83,10 +85,7 @@ func FetchEmails(svc *gm.Service, query string, maxResults int64) ([]Email, erro
 // FormatEmailSummary returns a human-readable summary of an email,
 // with the body truncated at 500 characters.
 func FormatEmailSummary(e Email) string {
-	body := e.Body
-	if len(body) > 500 {
-		body = body[:500] + "..."
-	}
+	body := textutil.Truncate(e.Body, 500)
 	if body == "" {
 		body = e.Snippet
 	}

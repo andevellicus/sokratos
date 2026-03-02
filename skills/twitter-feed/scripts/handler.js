@@ -14,11 +14,26 @@ if (accounts.length === 0 && topics.length === 0) {
     return "No accounts or topics configured. Edit skills/twitter-feed/config.toml or pass accounts/topics as arguments.";
 }
 
+// Load previously seen tweet URLs from persistent kv store.
+// Stored as JSON array of URLs, pruned to last 200 to avoid unbounded growth.
+var seenKey = "seen_urls";
+var seenList = [];
+try {
+    var raw = kv_get(seenKey);
+    if (raw) seenList = JSON.parse(raw);
+} catch(e) { seenList = []; }
+
+// Build a lookup dict from persisted list + this invocation.
 var seen = {};
+for (var k = 0; k < seenList.length; k++) {
+    seen[seenList[k]] = true;
+}
+
 var results = [];
+var newUrls = [];
 
 function searchSearxng(query) {
-    var url = "http://localhost:9000/search?format=json&time_range=week&q=" + encodeURIComponent(query);
+    var url = "http://localhost:9000/search?format=json&time_range=day&q=" + encodeURIComponent(query);
     var resp = http_request("GET", url, {}, "");
     if (resp.status !== 200) return [];
     var data = JSON.parse(resp.body);
@@ -41,23 +56,31 @@ function extractDate(content) {
     return match ? match[1] : "";
 }
 
+// Clean up snippet text: strip leading relative date prefix
+function cleanSnippet(content) {
+    return (content || "").replace(/^\d+ \w+ ago\s*/, "").trim();
+}
+
+function addResult(h) {
+    if (!h.url || !isStatusURL(h.url) || seen[h.url]) return false;
+    seen[h.url] = true;
+    newUrls.push(h.url);
+    results.push({
+        author: extractAuthor(h.url),
+        link: h.url,
+        summary: h.title || "",
+        content: cleanSnippet(h.content),
+        date: extractDate(h.content || "")
+    });
+    return true;
+}
+
 for (var i = 0; i < accounts.length; i++) {
     var handle = accounts[i].replace(/^@/, "");
     var hits = searchSearxng("site:x.com/" + handle + "/status");
     var added = 0;
     for (var j = 0; j < hits.length && added < count; j++) {
-        var h = hits[j];
-        if (h.url && isStatusURL(h.url) && !seen[h.url]) {
-            seen[h.url] = true;
-            results.push({
-                author: extractAuthor(h.url),
-                text: h.title || "",
-                snippet: h.content || "",
-                url: h.url,
-                date: extractDate(h.content || "")
-            });
-            added++;
-        }
+        if (addResult(hits[j])) added++;
     }
 }
 
@@ -65,21 +88,19 @@ for (var i = 0; i < topics.length; i++) {
     var hits = searchSearxng("site:x.com " + topics[i]);
     var added = 0;
     for (var j = 0; j < hits.length && added < count; j++) {
-        var h = hits[j];
-        if (h.url && isStatusURL(h.url) && !seen[h.url]) {
-            seen[h.url] = true;
-            results.push({
-                author: extractAuthor(h.url),
-                text: h.title || "",
-                snippet: h.content || "",
-                url: h.url,
-                date: extractDate(h.content || "")
-            });
-            added++;
-        }
+        if (addResult(hits[j])) added++;
     }
 }
 
-if (results.length === 0) return "No tweets found.";
+// Persist newly seen URLs (append to list, cap at 200).
+if (newUrls.length > 0) {
+    var updated = seenList.concat(newUrls);
+    if (updated.length > 200) {
+        updated = updated.slice(updated.length - 200);
+    }
+    kv_set(seenKey, JSON.stringify(updated));
+}
+
+if (results.length === 0) return "No new tweets since last check.";
 
 return {count: results.length, tweets: results};

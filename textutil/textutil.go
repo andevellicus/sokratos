@@ -3,12 +3,18 @@ package textutil
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
-// Truncate returns s unchanged if len(s) <= n, otherwise returns s[:n] + "...".
+// Truncate returns s unchanged if len(s) <= n, otherwise truncates to at most
+// n bytes at a valid UTF-8 rune boundary and appends "...".
 func Truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Back off to avoid splitting a multi-byte UTF-8 character.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }
