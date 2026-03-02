@@ -1,17 +1,13 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"sokratos/httputil"
 	"sokratos/logger"
 )
 
@@ -19,33 +15,11 @@ type askDBArgs struct {
 	Query string `json:"natural_language_query"`
 }
 
-type text2sqlRequest struct {
-	Model     string        `json:"model"`
-	Messages  []text2sqlMsg `json:"messages"`
-	Stream    bool          `json:"stream"`
-	KeepAlive string        `json:"keep_alive,omitempty"` // auto-unload after this duration (e.g. "30s")
-}
-
-type text2sqlMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type text2sqlResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-}
-
 // NewAskDatabase returns a ToolFunc that translates a natural language query
-// into PostgreSQL via the Arctic-Text2SQL model, executes it, and returns the
-// results. The database schema is fetched dynamically from information_schema
-// so the SQL model always sees the current table definitions.
-func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL, text2sqlModel, keepAlive string) ToolFunc {
-	httpClient := httputil.NewClient(TimeoutText2SQL)
-
+// into PostgreSQL via the subagent, executes it, and returns the results.
+// The database schema is fetched dynamically from information_schema so the
+// model always sees the current table definitions.
+func NewAskDatabase(pool *pgxpool.Pool, sc *SubagentClient) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a askDBArgs
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -66,52 +40,16 @@ func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL, text2sqlModel, keepAlive st
 			"The database has these tables:\n\n" + schemaDDL +
 			"\n\nOutput ONLY the SQL statement. Do not include any explanations or formatting."
 
-		reqBody := text2sqlRequest{
-			Model: text2sqlModel,
-			Messages: []text2sqlMsg{
-				{Role: "system", Content: systemPrompt},
-				{Role: "user", Content: a.Query},
-			},
-			Stream:    false,
-			KeepAlive: keepAlive,
-		}
-
-		body, err := json.Marshal(reqBody)
+		result, err := sc.Complete(ctx, systemPrompt, a.Query, 512)
 		if err != nil {
-			return fmt.Sprintf("failed to marshal request: %v", err), nil
+			return fmt.Sprintf("SQL generation failed: %v", err), nil
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, text2sqlURL+"/v1/chat/completions", bytes.NewReader(body))
-		if err != nil {
-			return fmt.Sprintf("failed to create request: %v", err), nil
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := httpClient.Do(httpReq)
-		if err != nil {
-			return fmt.Sprintf("Text2SQL model request failed (is the model loaded?): %v", err), nil
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(resp.Body)
-			return fmt.Sprintf("Text2SQL model returned status %d: %s", resp.StatusCode, string(respBody)), nil
-		}
-
-		var t2sResp text2sqlResponse
-		if err := json.NewDecoder(resp.Body).Decode(&t2sResp); err != nil {
-			return fmt.Sprintf("failed to decode Text2SQL response: %v", err), nil
-		}
-
-		if len(t2sResp.Choices) == 0 {
-			return "Text2SQL model returned no output.", nil
-		}
-
-		sql := strings.TrimSpace(t2sResp.Choices[0].Message.Content)
+		sql := strings.TrimSpace(result)
 		sql = stripSQLFences(sql)
 
 		if sql == "" {
-			return "Text2SQL model returned empty SQL.", nil
+			return "Subagent returned empty SQL.", nil
 		}
 
 		// Validate that the output actually looks like SQL (not prose).
@@ -120,7 +58,7 @@ func NewAskDatabase(pool *pgxpool.Pool, text2sqlURL, text2sqlModel, keepAlive st
 			if len(preview) > 200 {
 				preview = preview[:200] + "..."
 			}
-			return fmt.Sprintf("Text2SQL model returned non-SQL output: %s", preview), nil
+			return fmt.Sprintf("Subagent returned non-SQL output: %s", preview), nil
 		}
 
 		logger.Log.Infof("[ask_database] generated SQL: %s", sql)
@@ -198,7 +136,7 @@ func fetchSchemaDDL(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 }
 
 // looksLikeSQL returns true if the string starts with a recognized SQL keyword.
-// Used to catch the failure mode where the Text2SQL model generates prose instead of SQL.
+// Used to catch the failure mode where the model generates prose instead of SQL.
 func looksLikeSQL(s string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(s))
 	for _, kw := range []string{"SELECT ", "WITH ", "EXPLAIN "} {
@@ -275,4 +213,3 @@ func executeQuery(ctx context.Context, pool *pgxpool.Pool, sql string) (string, 
 
 	return b.String(), nil
 }
-

@@ -8,11 +8,22 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
 )
+
+// triageResult is the structured output from a triage call.
+type triageResult struct {
+	SalienceScore float64  `json:"salience_score"`
+	Summary       string   `json:"summary"`
+	Category      string   `json:"category"`
+	Tags          []string `json:"tags"`
+	Save          *bool    `json:"save,omitempty"`
+	ParadigmShift bool     `json:"paradigm_shift,omitempty"`
+}
 
 // TriageViaSubagent sends content to the subagent with a GBNF-constrained
 // grammar and parses the result into a triageResult. Falls back to safe
@@ -91,15 +102,16 @@ func truncateAssistantReply(exchange string, maxReplyLen int) string {
 
 // TriageConfig groups dependencies for conversation triage and memory save.
 type TriageConfig struct {
-	Pool          *pgxpool.Pool
-	EmbedEndpoint string
-	EmbedModel    string
-	DTC           *DeepThinkerClient
-	QueueFn       memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
-	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
-	Subagent      *SubagentClient
-	TriageGrammar string
-	RetryQueue    *RetryQueue // deferred triage retry queue (nil = drop on failure)
+	Pool               *pgxpool.Pool
+	EmbedEndpoint      string
+	EmbedModel         string
+	DTC                *DeepThinkerClient
+	QueueFn            memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
+	BgGrammarFn        memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
+	Subagent           *SubagentClient
+	TriageGrammar      string
+	RetryQueue         *RetryQueue // deferred triage retry queue (nil = drop on failure)
+	ProfileRefreshFunc func()      // called after paradigm shift to refresh engine profile + personality
 }
 
 // TriageSaveRequest encapsulates all parameters for a triage-then-save operation.
@@ -126,7 +138,31 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		return fmt.Errorf("subagent not configured")
 	}
 
-	result, err := TriageViaSubagent(ctx, cfg.Subagent, cfg.TriageGrammar, req.TriagePrompt, req.TriageInput, req.MaxTriageLen)
+	// Context-aware triage: check if similar memories already exist.
+	// If coverage is high, annotate the triage input to raise the bar.
+	triageInput := req.TriageInput
+	if cfg.EmbedEndpoint != "" && cfg.Pool != nil {
+		snippet := triageInput
+		if len(snippet) > 500 {
+			snippet = snippet[:500]
+		}
+		emb, embErr := memory.GetEmbedding(ctx, cfg.EmbedEndpoint, cfg.EmbedModel, snippet)
+		if embErr == nil {
+			var count int
+			_ = cfg.Pool.QueryRow(ctx,
+				`SELECT COUNT(*) FROM memories
+				 WHERE superseded_by IS NULL
+				   AND (embedding <=> $1) < 0.3
+				   AND memory_type NOT IN ('identity', 'reflection')`,
+				pgvector.NewVector(emb),
+			).Scan(&count)
+			if count >= 3 {
+				triageInput += fmt.Sprintf("\n[Memory coverage: %d similar memories exist. Only save if genuinely NEW information.]", count)
+			}
+		}
+	}
+
+	result, err := TriageViaSubagent(ctx, cfg.Subagent, cfg.TriageGrammar, req.TriagePrompt, triageInput, req.MaxTriageLen)
 	if err != nil {
 		return err
 	}
@@ -169,7 +205,21 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		req.DomainTag, result.SalienceScore, result.Category, tags, result.Summary)
 
 	if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {
-		GenerateTransitionMemoryAsync(cfg.Pool, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.DTC, result.Summary, tags)
+		go func() {
+			psCtx, psCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer psCancel()
+			// 1. Synchronous transition memory generation.
+			if _, err := generateTransitionMemory(psCtx, cfg.Pool, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.DTC, result.Summary, tags); err != nil {
+				logger.Log.Warnf("[triage:%s] paradigm shift transition failed: %v", req.DomainTag, err)
+				return
+			}
+			// 2. Immediate mini-consolidation to update profile.
+			ConsolidateImmediate(psCtx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.BgGrammarFn)
+			// 3. Refresh engine state so updated profile is used immediately.
+			if cfg.ProfileRefreshFunc != nil {
+				cfg.ProfileRefreshFunc()
+			}
+		}()
 	}
 	return nil
 }
@@ -184,6 +234,12 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
 		defer cancel()
+
+		stripped := strings.TrimSpace(exchange)
+		if len(stripped) < 20 {
+			logger.Log.Debugf("[conversation_triage] skipped trivial exchange (%d chars)", len(stripped))
+			return
+		}
 
 		triageInput := truncateAssistantReply(exchange, 300)
 

@@ -150,7 +150,7 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 			continue
 		}
 
-		// Extract narrative from JSON (strips reasoning preamble from Z1 output).
+		// Extract narrative from JSON (strips reasoning preamble from DTC output).
 		cleaned := textutil.CleanLLMJSON(raw)
 		var episodeOut struct {
 			Summary string `json:"summary"`
@@ -220,6 +220,15 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 		if txErr = tx.Commit(ctx); txErr != nil {
 			logger.Log.Warnf("[memory] episode transaction commit failed: %v", txErr)
 			continue
+		}
+
+		// Deprioritize constituent memories so the episode is preferred in retrieval.
+		// Reduces salience by 40% — constituents retain detail but rank lower.
+		if _, depErr := db.Exec(ctx,
+			`UPDATE memories SET salience = salience * 0.6 WHERE id = ANY($1)`,
+			constituentIDs,
+		); depErr != nil {
+			logger.Log.Warnf("[memory] episode constituent deprioritization failed: %v", depErr)
 		}
 
 		episodeCount++

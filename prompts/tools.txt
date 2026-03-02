@@ -35,7 +35,12 @@
   - Available: args (global object with parsed params), http_request(method, url, headersObj, body) for HTTP calls
   - NOT available: fetch, XMLHttpRequest, DOMParser, Buffer, process, console, require, setTimeout, setInterval, Node.js APIs, browser APIs
   - http_request returns {status: number, body: string, headers: object}. It is synchronous — do NOT use await/async with it.
-  - Use return to produce the skill result. Return a string or object (objects are auto-JSON-serialized).
+  RETURN FORMAT CONTRACT — skills are the data layer; YOU are the presentation layer:
+  - Return raw structured JSON — do NOT summarize or format inside the skill. You interpret the data and write the user-facing response.
+  - For list results, always include a top-level "count" field: return {count: results.length, items: results};
+    The "count" field enables silent_if_empty routines to skip you entirely when there's no data.
+  - On error, return a descriptive string: return "Failed to fetch data: " + resp.status;
+  - Never return undefined or null — return an error string or {count: 0, items: []}.
   FREE API TIPS (no API keys needed):
   - Weather: use wttr.in — http_request("GET", "https://wttr.in/CityName?format=j1", {}, "")
   - Headlines: use RSS feeds parsed as text, not HTML scraping (no DOM parser)
@@ -67,12 +72,13 @@
   Returns numbered results with title, URL, and snippet. max_results defaults to 5, max 20. Use for current events, fact-checking, or research.
 - read_url: Fetch and extract text content from a URL. Arguments: {"url": "<full URL>", "max_chars": 2000}
   Strips HTML tags, scripts, and styles. Returns plain text truncated to max_chars (default 2000, max 10000). Use after search_web to read promising results.
-- delegate_task: Delegate a task to a lightweight subagent that can autonomously call read-only tools (search_email, search_calendar, search_memory). Arguments: {"directive": "<what to do>", "context": "<optional supporting data>"}
-  The subagent runs a multi-turn loop: it calls tools, reads results, and responds with a summary. Use for routine information-gathering tasks like "check for new emails", "find upcoming meetings", or "search memory for X". The subagent cannot write data or send messages — only search and read.
+- delegate_task: Delegate a task to a research subagent that autonomously searches, reads, and synthesizes information. Arguments: {"directive": "<what to do>", "context": "<optional supporting data>"}
+  The subagent runs a multi-turn loop with access to: search_web, read_url, search_email, search_calendar, search_memory, and all registered skills. It can search, read full articles, search again based on findings, and compile a summary — producing deeper results than a single search_web call.
+  Use for: "research X", "find the best Y", "what are my options for Z", "check for new emails", "summarize recent calendar events", or any information-gathering task. The subagent cannot write data or send messages — only search and read.
 - plan_and_execute: Decompose and execute complex multi-step tasks. Arguments: {"directive": "<what to accomplish>", "context": "<optional supporting data>", "background": false}
   Use for tasks that require 2+ sequential steps where later steps depend on earlier results (e.g., "research X, then compare with Y, then summarize"). The directive is decomposed into up to 6 concrete steps by the deep thinker, then each step is executed by a subagent with accumulated context from prior steps.
-  Set background=true to run asynchronously — planning happens immediately but execution runs in the background with Telegram notifications on completion. Use check_background_task to monitor.
-  Use delegate_task for simple single-step tasks. Use plan_and_execute for multi-step workflows.
+  Set background=true for any research task that doesn't need an immediate answer — the user will be notified via Telegram when complete. Prefer background=true when: the task involves 3+ sources, deep comparison, or the user says "when you get a chance" / "look into" / "research".
+  Use check_background_task to monitor progress.
 - check_background_task: Check status, list, or cancel background tasks. Arguments: {"task_id": 123, "action": "status"}
   Actions: "list" shows all running and recent tasks (no task_id needed). "status" (default) returns progress and results for a specific task. "cancel" stops a running task.
 - respond: Return your final answer to the user. Arguments: {"text": "<your response>"}

@@ -21,7 +21,7 @@ var thinkContentRe = regexp.MustCompile(`(?s)<think>(.*?)</think>`)
 
 // StripThinkTags removes reasoning blocks from LLM output. Handles two patterns:
 // 1. Matched <think>...</think> pairs (Qwen3 style)
-// 2. Orphaned </think> where <think> was injected by the chat template (GLM-Z1):
+// 2. Orphaned </think> where <think> was injected by the chat template:
 //    the response contains "[reasoning]</think>[actual content]" — strip up to </think>.
 func StripThinkTags(s string) string {
 	// First: strip matched <think>...</think> pairs.

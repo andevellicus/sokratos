@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -28,95 +29,159 @@ type bootstrapTrait struct {
 	Context  string `json:"context,omitempty"`
 }
 
-// NewBootstrapProfile returns a ToolFunc that generates a rich initial identity
-// profile via the deep thinker and writes it to the database. The heavy DTC
-// call runs in a background goroutine so the orchestrator can respond
-// immediately; sendFunc delivers a Telegram notification on completion.
-func NewBootstrapProfile(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, agentName string, sendFunc func(string), onProfile func()) ToolFunc {
-	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		// Check for existing profile.
-		existing, err := memory.GetIdentityProfile(ctx, pool)
-		if err != nil {
-			return fmt.Sprintf("Failed to read existing profile: %v", err), nil
-		}
-		if existing != "{}" {
-			logger.Log.Warn("[bootstrap] overwriting existing identity profile")
-		}
-
-		// Load prompt: file override or embedded default.
-		var prompt string
-		if p := os.Getenv("BOOTSTRAP_PROMPT_PATH"); p != "" {
-			data, err := os.ReadFile(p)
-			if err != nil {
-				return fmt.Sprintf("Failed to read bootstrap prompt from %s: %v", p, err), nil
-			}
-			prompt = string(data)
-		} else {
-			prompt = prompts.Bootstrap
-		}
-		prompt = strings.ReplaceAll(prompt, "%AGENT_NAME%", agentName)
-
-		// User content: file path > env var > default.
-		var userContent string
-		if p := os.Getenv("BOOTSTRAP_CONTEXT_PATH"); p != "" {
-			data, err := os.ReadFile(p)
-			if err != nil {
-				return fmt.Sprintf("Failed to read bootstrap context from %s: %v", p, err), nil
-			}
-			userContent = strings.TrimSpace(string(data))
-		} else if c := os.Getenv("BOOTSTRAP_CONTEXT"); c != "" {
-			userContent = c
-		} else {
-			userContent = "Generate your initial identity profile."
-		}
-
-		// Run the heavy DTC call in the background so the orchestrator
-		// can respond immediately ("on it") instead of blocking 2-3 min.
-		go bootstrapBackground(pool, dtc, embedEndpoint, embedModel, prompt, userContent, sendFunc, onProfile)
-
-		return "Profile generation started in the background. I'll notify you when it's ready.", nil
-	}
+// BootstrapConfig holds dependencies for the /bootstrap command.
+type BootstrapConfig struct {
+	Pool          *pgxpool.Pool
+	DTC           *DeepThinkerClient
+	EmbedEndpoint string
+	EmbedModel    string
+	AgentName     string
+	SendFunc      func(string) // Telegram notification on completion/failure
+	OnProfile     func()       // refresh engine profile/personality
 }
 
-// bootstrapBackground runs the deep thinker call and writes results. Called
-// as a goroutine from NewBootstrapProfile. Retries once on JSON parse failure.
-func bootstrapBackground(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, sendFunc func(string), onProfile func()) {
+// bootstrapResult classifies the outcome of a single bootstrap attempt.
+type bootstrapResult int
+
+const (
+	bsSuccess        bootstrapResult = iota // result string is non-empty
+	bsFatal                                 // non-retryable error (already logged)
+	bsRetryJSON                             // JSON parse failure — retry immediately
+	bsRetryTransient                        // transient DTC error — retry after backoff
+)
+
+// RunBootstrap generates an identity profile via the deep thinker. Intended
+// to be called as a goroutine from the /bootstrap command handler. Notifies
+// the user via SendFunc on completion or failure.
+func RunBootstrap(cfg BootstrapConfig) {
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutBootstrapProfile)
 	defer cancel()
 
-	const maxAttempts = 2
+	// Check for existing profile.
+	existing, err := memory.GetIdentityProfile(ctx, cfg.Pool)
+	if err != nil {
+		notify(cfg.SendFunc, fmt.Sprintf("Bootstrap failed: %v", err))
+		return
+	}
+	if existing != "{}" {
+		logger.Log.Warn("[bootstrap] overwriting existing identity profile")
+	}
+
+	// Load prompt: file override or embedded default.
+	prompt, err := loadBootstrapPrompt(cfg.AgentName)
+	if err != nil {
+		notify(cfg.SendFunc, fmt.Sprintf("Bootstrap failed: %v", err))
+		return
+	}
+	userContent := loadBootstrapContext()
+
+	// Retry loop: up to 4 attempts with exponential backoff for transient errors.
+	const maxAttempts = 4
+	backoff := 5 * time.Second
+
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		result, done := bootstrapAttempt(ctx, pool, dtc, embedEndpoint, embedModel, prompt, userContent, sendFunc, onProfile, attempt)
-		if done {
-			if result != "" && sendFunc != nil {
-				sendFunc(result)
+		result, state := bootstrapAttempt(ctx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, prompt, userContent, cfg.OnProfile, attempt)
+
+		switch state {
+		case bsSuccess:
+			notify(cfg.SendFunc, result)
+			return
+
+		case bsFatal:
+			// Non-retryable error — notify with the result message.
+			if result != "" {
+				notify(cfg.SendFunc, result)
+			} else {
+				notify(cfg.SendFunc, "Bootstrap failed — check the logs for details.")
 			}
 			return
-		}
-		// JSON parse failure — retry if we have attempts left.
-		if attempt < maxAttempts {
-			logger.Log.Warnf("[bootstrap] attempt %d failed, retrying...", attempt)
+
+		case bsRetryJSON:
+			if attempt < maxAttempts {
+				logger.Log.Warnf("[bootstrap] attempt %d: JSON parse failure, retrying...", attempt)
+			}
+
+		case bsRetryTransient:
+			if attempt < maxAttempts {
+				logger.Log.Warnf("[bootstrap] attempt %d: transient error, retrying in %s...", attempt, backoff)
+				select {
+				case <-ctx.Done():
+					notify(cfg.SendFunc, "Bootstrap timed out while waiting for the reasoning server.")
+					return
+				case <-time.After(backoff):
+					backoff *= 2
+				}
+			}
 		}
 	}
 
 	logger.Log.Errorf("[bootstrap] all %d attempts failed", maxAttempts)
+	notify(cfg.SendFunc, "Bootstrap failed after multiple attempts. Please check that the reasoning server is running and try again.")
+}
+
+// notify calls sendFunc if non-nil.
+func notify(sendFunc func(string), msg string) {
 	if sendFunc != nil {
-		sendFunc("Bootstrap failed after retries — the model couldn't produce valid JSON. Please try again later.")
+		sendFunc(msg)
 	}
 }
 
-// bootstrapAttempt runs one DTC call + parse cycle. Returns (result, done).
-// done=true means either success (result is non-empty) or a non-retryable error
-// (result is empty, error already sent via sendFunc). done=false means a JSON
-// parse failure that should be retried.
-func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, sendFunc func(string), onProfile func(), attempt int) (string, bool) {
+// loadBootstrapPrompt loads the bootstrap system prompt from a file override
+// or the embedded default, replacing %AGENT_NAME% with the agent name.
+func loadBootstrapPrompt(agentName string) (string, error) {
+	var prompt string
+	if p := os.Getenv("BOOTSTRAP_PROMPT_PATH"); p != "" {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return "", fmt.Errorf("failed to read bootstrap prompt from %s: %w", p, err)
+		}
+		prompt = string(data)
+	} else {
+		prompt = prompts.Bootstrap
+	}
+	return strings.ReplaceAll(prompt, "%AGENT_NAME%", agentName), nil
+}
+
+// loadBootstrapContext loads bootstrap user content from file, env var, or default.
+func loadBootstrapContext() string {
+	if p := os.Getenv("BOOTSTRAP_CONTEXT_PATH"); p != "" {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			logger.Log.Warnf("[bootstrap] failed to read context file %s: %v", p, err)
+			return "Generate your initial identity profile."
+		}
+		return strings.TrimSpace(string(data))
+	}
+	if c := os.Getenv("BOOTSTRAP_CONTEXT"); c != "" {
+		return c
+	}
+	return "Generate your initial identity profile."
+}
+
+// isTransientDTCError returns true for network-level errors that may resolve
+// on retry (server restarting, connection dropped, etc.).
+func isTransientDTCError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "no such host") ||
+		strings.Contains(s, "i/o timeout")
+}
+
+// bootstrapAttempt runs one DTC call + parse cycle. Returns (result, state).
+func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), attempt int) (string, bootstrapResult) {
 	raw, err := dtc.Complete(ctx, prompt, userContent, 8192)
 	if err != nil {
 		logger.Log.Errorf("[bootstrap] deep thinker call failed: %v", err)
-		if sendFunc != nil {
-			sendFunc("Bootstrap failed — the reasoning server timed out. Please try again later.")
+		if isTransientDTCError(err) {
+			return "", bsRetryTransient
 		}
-		return "", true // non-retryable
+		// Non-transient (e.g. context cancelled, malformed request).
+		return fmt.Sprintf("Bootstrap failed — reasoning server error: %v", err), bsFatal
 	}
 
 	logger.Log.Debugf("[bootstrap] raw DTC output (attempt %d, %d chars): %.500s", attempt, len(raw), raw)
@@ -131,16 +196,13 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerC
 		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, dual)
 		if bErr != nil {
 			logger.Log.Errorf("[bootstrap] failed: %v", bErr)
-			if sendFunc != nil {
-				sendFunc("Bootstrap failed — could not save profile. Check the logs for details.")
-			}
-			return "", true // non-retryable
+			return "Bootstrap failed — could not save profile. Check the logs for details.", bsFatal
 		}
 		logger.Log.Infof("[bootstrap] background bootstrap complete")
 		if onProfile != nil {
 			onProfile()
 		}
-		return result, true
+		return result, bsSuccess
 	}
 
 	// Fallback: treat entire output as a legacy profile.
@@ -148,7 +210,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerC
 	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
 		logger.Log.Errorf("[bootstrap] attempt %d: not valid JSON: %v", attempt, err)
 		logger.Log.Errorf("[bootstrap] attempt %d: cleaned output was: %.1000s", attempt, cleaned)
-		return "", false // retryable
+		return "", bsRetryJSON
 	}
 
 	pretty, _ := json.MarshalIndent(parsed, "", "  ")
@@ -156,17 +218,14 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerC
 
 	if err := memory.WriteIdentityProfile(ctx, pool, embedEndpoint, embedModel, profileJSON); err != nil {
 		logger.Log.Errorf("[bootstrap] write identity profile failed: %v", err)
-		if sendFunc != nil {
-			sendFunc("Bootstrap failed — could not save profile. Check the logs for details.")
-		}
-		return "", true // non-retryable
+		return "Bootstrap failed — could not save profile. Check the logs for details.", bsFatal
 	}
 
 	logger.Log.Infof("[bootstrap] identity profile generated and written (%d bytes, legacy format)", len(profileJSON))
 	if onProfile != nil {
 		onProfile()
 	}
-	return "Identity profile bootstrapped successfully.", true
+	return "Identity profile bootstrapped successfully.", bsSuccess
 }
 
 // bootstrapDual processes the dual-structure bootstrap output: writes personality

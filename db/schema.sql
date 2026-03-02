@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS routines (
     instruction TEXT NOT NULL
 );
 
+-- Structured routine fields: tool to call, goal for orchestrator, silent flag.
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS tool VARCHAR(255);
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS goal TEXT;
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS silent_if_empty BOOLEAN DEFAULT false;
+
 CREATE TABLE IF NOT EXISTS user_preferences (
     key VARCHAR(255) PRIMARY KEY,
     value TEXT NOT NULL,
@@ -167,3 +172,11 @@ CREATE TABLE IF NOT EXISTS failed_operations (
 );
 CREATE INDEX IF NOT EXISTS idx_failed_operations_created ON failed_operations (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_operations_type ON failed_operations (op_type);
+
+CREATE TABLE IF NOT EXISTS skill_kv (
+    skill_name TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (skill_name, key)
+);

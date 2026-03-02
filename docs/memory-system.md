@@ -21,7 +21,7 @@ Each memory row holds: `summary`, `embedding` (vector(1024)), `salience` (1–10
 
 All paths chunk content at **~1200 bytes** (`MaxChunkBytes`) before embedding. BGE-large-en-v1.5 has a 512-token context window; WordPiece tokenization ranges from ~4 bytes/token (plain English) down to ~2.8 bytes/token for structured/HTML content. 1200 bytes stays safely under the 512-token hard limit even for dense email content (~425 tokens at worst case).
 
-**Triage** produces a salience score (1–10), summary, category, and tags. All triage paths use the **subagent** (GLM-4.7-Flash) with a GBNF grammar constraint for structured JSON output. A unified `triageAndSave()` core function handles the post-triage pipeline (build text/tags, save with contradiction check, paradigm shift detection), with domain-specific logic in `ShouldSave` closures. Failures are enqueued to a background **retry queue** with exponential backoff. For conversation triage, tool-grounded exchanges use a salience threshold of 3; unverified parametric responses use a threshold of 5 to prevent hallucinated facts from entering memory. Email triage saves at salience >= 1 unless the model explicitly sets `save: false`. The scoring rubric: 1–3 = routine noise, 4–6 = temporal/project relevance, 7–8 = high value/identity, 9–10 = critical/permanent (life-altering only).
+**Triage** produces a salience score (1–10), summary, category, and tags. All triage paths use the **subagent** (Gemma3-4B-IT) with a GBNF grammar constraint for structured JSON output. A unified `triageAndSave()` core function handles the post-triage pipeline (build text/tags, save with contradiction check, paradigm shift detection), with domain-specific logic in `ShouldSave` closures. Failures are enqueued to a background **retry queue** with exponential backoff. For conversation triage, tool-grounded exchanges use a salience threshold of 3; unverified parametric responses use a threshold of 5 to prevent hallucinated facts from entering memory. Email triage saves at salience >= 1 unless the model explicitly sets `save: false`. The scoring rubric: 1–3 = routine noise, 4–6 = temporal/project relevance, 7–8 = high value/identity, 9–10 = critical/permanent (life-altering only).
 
 **Quality scoring** via the subagent produces specificity, uniqueness, entities, and confidence. A quality boost adjusts salience: `salience += (specificity+uniqueness)/2 * (1 - salience/10)`.
 
@@ -90,6 +90,11 @@ Synthesis layers are triggered by **event-driven cognitive processing** (`engine
 | `consult_deep_thinker` | `Complete` | on | Open-ended reasoning |
 | Triage (email/calendar/conversation) | Subagent `CompleteWithGrammar` | **off** | Structured classification (GBNF-constrained JSON) |
 | Consolidation (profile synthesis) | `CompleteNoThink` | **off** | Structured JSON transformation |
+| Plan decomposition | `CompleteNoThink` | **off** | Structured JSON (task plan) |
+| Replanning | `CompleteNoThink` | **off** | Structured JSON (revised steps) |
+| Complex plan steps | `Complete` | on | Reasoning/analysis |
+| Bootstrap profile | `Complete` | on | Quality-critical personality extraction |
+| Paradigm shift transition | `Complete` | on | Creative synthesis |
 | Episode synthesis | `Complete` (via SynthesizeFunc) | on | Narrative reasoning |
 | Reflection | `Complete` (via SynthesizeFunc) | on | Analytical meta-cognition |
 

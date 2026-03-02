@@ -36,8 +36,6 @@ func formatConfirmation(name string, args json.RawMessage) string {
 		}
 		_ = json.Unmarshal(args, &a)
 		return fmt.Sprintf("⚠️ Create skill %q\n%s", a.Name, a.Description)
-	case "bootstrap_profile":
-		return "⚠️ Generate and overwrite identity profile?"
 	default:
 		return fmt.Sprintf("⚠️ Execute %s?", name)
 	}

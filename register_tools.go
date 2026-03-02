@@ -36,7 +36,7 @@ func registerCoreTools(registry *tools.Registry, stateMgr *engine.StateManager) 
 	})
 }
 
-func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan chan struct{}, text2sqlURL, text2sqlModel, text2sqlKeepAlive string) {
+func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan chan struct{}, subagent *tools.SubagentClient) {
 	if pool == nil {
 		return
 	}
@@ -54,20 +54,23 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 		Description: "Mark current task done, advance queue",
 		Params:      []tools.ParamSchema{{Name: "task_id", Type: "number", Required: false}},
 	})
-	registry.Register("manage_routines", tools.NewManageRoutines(pool), tools.ToolSchema{
+	registry.Register("manage_routines", tools.NewManageRoutines(pool, &routineFileAdapter{path: "routines.toml"}), tools.ToolSchema{
 		Name:        "manage_routines",
 		Description: "Create, update, or delete autonomous routines",
 		Params: []tools.ParamSchema{
 			{Name: "action", Type: "string", Required: true},
 			{Name: "name", Type: "string", Required: true},
 			{Name: "interval", Type: "string", Required: false},
+			{Name: "tool", Type: "string", Required: false},
+			{Name: "goal", Type: "string", Required: false},
+			{Name: "silent_if_empty", Type: "boolean", Required: false},
 			{Name: "instruction", Type: "string", Required: false},
 		},
 	})
-	if text2sqlURL != "" {
-		registry.Register("ask_database", tools.NewAskDatabase(pool, text2sqlURL, text2sqlModel, text2sqlKeepAlive), tools.ToolSchema{
+	if subagent != nil {
+		registry.Register("ask_database", tools.NewAskDatabase(pool, subagent), tools.ToolSchema{
 			Name:        "ask_database",
-			Description: "Query or modify database using natural language (translated to SQL)",
+			Description: "Query the database using natural language (translated to SQL)",
 			Params:      []tools.ParamSchema{{Name: "natural_language_query", Type: "string", Required: true}},
 		})
 	}
@@ -149,9 +152,9 @@ func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
 	}
 }
 
-func registerAITools(registry *tools.Registry, dtc *tools.DeepThinkerClient) {
+func registerAITools(registry *tools.Registry, dtc *tools.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) {
 	if dtc != nil {
-		registry.Register("consult_deep_thinker", tools.NewConsultDeepThinker(dtc), tools.ToolSchema{
+		registry.Register("consult_deep_thinker", tools.NewConsultDeepThinker(dtc, pool, embedURL, embedModel), tools.ToolSchema{
 			Name:        "consult_deep_thinker",
 			Description: "Delegate complex reasoning to a dedicated deep-thinking model",
 			Params: []tools.ParamSchema{
@@ -186,15 +189,15 @@ func registerDelegateTask(registry *tools.Registry, subagent *tools.SubagentClie
 	return dc
 }
 
-func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGrammar tools.GrammarRebuildFunc) {
+func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGrammar tools.GrammarRebuildFunc, pool *pgxpool.Pool) {
 	skills, err := tools.LoadSkills(skillsDir)
 	if err != nil {
 		logger.Log.Warnf("Failed to load skills: %v", err)
 	}
 	for _, skill := range skills {
-		tools.RegisterSkill(registry, skill)
+		tools.RegisterSkill(registry, skill, pool)
 	}
-	registry.Register("create_skill", tools.NewCreateSkill(registry, skillsDir, rebuildGrammar), tools.ToolSchema{
+	registry.Register("create_skill", tools.NewCreateSkill(registry, skillsDir, rebuildGrammar, pool), tools.ToolSchema{
 		Name:        "create_skill",
 		Description: "Create a new JavaScript skill registered as a live tool",
 		Params: []tools.ParamSchema{
@@ -270,8 +273,8 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 	registry := tools.NewRegistry()
 
 	registerCoreTools(registry, svc.StateMgr)
-	registerDBTools(registry, db.Pool, svc.InterruptChan, cfg.Text2SQLURL, cfg.Text2SQLModel, cfg.Text2SQLKeepAlive)
-	registerAITools(registry, svc.DTC)
+	registerDBTools(registry, db.Pool, svc.InterruptChan, svc.Subagent)
+	registerAITools(registry, svc.DTC, db.Pool, cfg.EmbedURL, cfg.EmbedModel)
 
 	if db.Pool != nil && cfg.EmbedURL != "" {
 		registry.Register("search_memory", tools.NewSearchMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.Subagent, cfg.MemorySearchLimit), tools.ToolSchema{
@@ -307,9 +310,6 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 			},
 		})
 	}
-	// bootstrap_profile is registered post-engine (needs eng.RefreshProfile callback).
-	// See the block after initEngine().
-
 	// Build email triage config if dependencies are available.
 	// TriageGrammar is left empty here and set after initLLM builds the grammar.
 	var emailTriageCfg *tools.TriageConfig

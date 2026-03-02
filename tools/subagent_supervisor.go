@@ -29,7 +29,7 @@ const maxSubagentErrorRetries = 3
 func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 	systemPrompt string, directive string, toolExec SubagentToolExec, maxRounds int) (string, error) {
 
-	messages := []dtcMessage{
+	messages := []chatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: directive},
 	}
@@ -50,24 +50,10 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 			Text      string          `json:"text,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(raw), &decision); err != nil {
-			// Flash sometimes returns thinking text instead of grammar-constrained
-			// JSON (reasoning_content fallback). Try to extract JSON from it.
+			// Try cleaning LLM artifacts (code fences, trailing commas, etc.)
 			cleaned := textutil.CleanLLMJSON(raw)
 			if err2 := json.Unmarshal([]byte(cleaned), &decision); err2 != nil {
-				// Grammar bypass: Flash put prose into reasoning_content (which
-				// bypasses grammar enforcement). Retry without reasoning_format
-				// so all output goes into content where grammar is enforced.
-				logger.Log.Warnf("[subagent-supervisor] round %d: grammar bypass detected, retrying without reasoning_format", usedRounds)
-				raw, err = sc.CompleteMultiTurnNoReasoning(ctx, messages, grammar, 2048)
-				if err != nil {
-					return "", fmt.Errorf("subagent round %d (retry): %w", usedRounds, err)
-				}
-				if err3 := json.Unmarshal([]byte(raw), &decision); err3 != nil {
-					cleaned2 := textutil.CleanLLMJSON(raw)
-					if err4 := json.Unmarshal([]byte(cleaned2), &decision); err4 != nil {
-						return "", fmt.Errorf("parse subagent decision round %d (after retry): %w", usedRounds, err3)
-					}
-				}
+				return "", fmt.Errorf("parse subagent decision round %d: %w (raw: %.200s)", usedRounds, err, raw)
 			}
 		}
 
@@ -110,8 +96,8 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 		}
 
 		messages = append(messages,
-			dtcMessage{Role: "assistant", Content: raw},
-			dtcMessage{Role: "user", Content: "Tool result: " + toolResultMsg},
+			chatMessage{Role: "assistant", Content: raw},
+			chatMessage{Role: "user", Content: "Tool result: " + toolResultMsg},
 		)
 	}
 	return "", fmt.Errorf("subagent exceeded %d rounds", maxRounds)

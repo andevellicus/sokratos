@@ -22,3 +22,4 @@ Rules:
 - Do NOT include steps that the subagent cannot accomplish with its available tools.
 - If the directive is too vague to decompose, return a single step that gathers clarifying information.
 - Each step should produce a concrete result that subsequent steps can build upon.
+- Mark synthesis/analysis steps clearly (e.g., "Analyze the search results..." or "Synthesize findings...") — these will be routed to a stronger reasoning model. Information-gathering steps should come first.

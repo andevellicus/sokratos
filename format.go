@@ -13,6 +13,7 @@ import (
 var (
 	codeBlockRe  = regexp.MustCompile("(?s)```\\w*\n?(.*?)```")
 	inlineCodeRe = regexp.MustCompile("`([^`\n]+)`")
+	headingRe    = regexp.MustCompile(`(?m)^#{1,3}\s+(.+)$`)
 	boldRe       = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	italicRe     = regexp.MustCompile(`(?:^|[^*])\*([^*]+?)\*(?:[^*]|$)`)
 	strikeRe     = regexp.MustCompile(`~~(.+?)~~`)
@@ -43,13 +44,16 @@ func mdToTelegramHTML(md string) string {
 		return fmt.Sprintf("\x00IC%d\x00", idx)
 	})
 
-	// 3. Escape HTML entities in remaining text.
+	// 3. Headings: ### text → **text** (converted to bold before HTML escaping).
+	s = headingRe.ReplaceAllString(s, "**$1**")
+
+	// 4. Escape HTML entities in remaining text.
 	s = escapeHTML(s)
 
-	// 4. Bold: **text** → <b>text</b> (before italic).
+	// 5. Bold: **text** → <b>text</b> (before italic).
 	s = boldRe.ReplaceAllString(s, "<b>$1</b>")
 
-	// 5. Italic: *text* → <i>text</i>.
+	// 6. Italic: *text* → <i>text</i>.
 	s = italicRe.ReplaceAllStringFunc(s, func(match string) string {
 		sub := italicRe.FindStringSubmatch(match)
 		replacement := "<i>" + sub[1] + "</i>"
@@ -59,13 +63,13 @@ func mdToTelegramHTML(md string) string {
 		return prefix + replacement + suffix
 	})
 
-	// 6. Strikethrough: ~~text~~ → <s>text</s>.
+	// 7. Strikethrough: ~~text~~ → <s>text</s>.
 	s = strikeRe.ReplaceAllString(s, "<s>$1</s>")
 
-	// 7. Links: [text](url) → <a href="url">text</a>.
+	// 8. Links: [text](url) → <a href="url">text</a>.
 	s = linkRe.ReplaceAllString(s, `<a href="$2">$1</a>`)
 
-	// 8. Restore placeholders.
+	// 9. Restore placeholders.
 	for i, block := range codeBlocks {
 		s = strings.Replace(s, fmt.Sprintf("\x00CB%d\x00", i), block, 1)
 	}
@@ -155,12 +159,15 @@ func mdToEntities(md string) (string, []telegramEntity) {
 		return fmt.Sprintf("\x00IC%d\x00", idx)
 	})
 
-	// 3. Process inline formatting in a single left-to-right pass.
+	// 3. Headings: ### text → **text** (rendered as bold).
+	s = headingRe.ReplaceAllString(s, "**$1**")
+
+	// 4. Process inline formatting in a single left-to-right pass.
 	// Each match is found at its position in the current string, so
 	// entity offsets are always correct relative to the final output.
 	s = processAllInlineFormatting(s, &entities)
 
-	// 4. Restore code block placeholders, adjusting offsets.
+	// 5. Restore code block placeholders, adjusting offsets.
 	for i, cb := range codeBlocks {
 		ph := fmt.Sprintf("\x00CB%d\x00", i)
 		idx := strings.Index(s, ph)
@@ -175,7 +182,7 @@ func mdToEntities(md string) (string, []telegramEntity) {
 		s = strings.Replace(s, ph, cb.plain, 1)
 	}
 
-	// 5. Restore inline code placeholders, adjusting offsets.
+	// 6. Restore inline code placeholders, adjusting offsets.
 	for i, ic := range inlineCodes {
 		ph := fmt.Sprintf("\x00IC%d\x00", i)
 		idx := strings.Index(s, ph)

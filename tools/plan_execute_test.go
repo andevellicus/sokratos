@@ -9,7 +9,8 @@ import (
 
 func TestBuildStepSystemPrompt_NoPriorResults(t *testing.T) {
 	step := planStep{Description: "Search for recent news about Go 1.24"}
-	prompt := buildStepSystemPrompt("Research Go release notes", step, nil)
+	pad := &Scratchpad{}
+	prompt := buildStepSystemPrompt("Research Go release notes", step, pad)
 
 	if !strings.Contains(prompt, "Research Go release notes") {
 		t.Error("expected directive in prompt")
@@ -20,34 +21,96 @@ func TestBuildStepSystemPrompt_NoPriorResults(t *testing.T) {
 	if !strings.Contains(prompt, "## Rules") {
 		t.Error("expected rules section")
 	}
-	if strings.Contains(prompt, "## Results from Prior Steps") {
-		t.Error("should not contain prior results section when empty")
+	if strings.Contains(prompt, "## Context from Prior Steps") {
+		t.Error("should not contain context section when scratchpad is empty")
 	}
 }
 
-func TestBuildStepSystemPrompt_WithPriorResults(t *testing.T) {
+func TestBuildStepSystemPrompt_WithScratchpad(t *testing.T) {
 	step := planStep{Description: "Summarize findings"}
-	prior := []stepResult{
-		{Step: 1, Description: "Search emails", Result: "Found 3 emails", Success: true},
-		{Step: 2, Description: "Check calendar", Result: "step failed: timeout", Success: false},
-	}
+	pad := &Scratchpad{}
+	pad.Set("step_1", "Found 3 emails about Go releases")
+	pad.Set("step_2", "step failed: timeout")
+	pad.Set("failures", "Step 2 failed: timeout")
 
-	prompt := buildStepSystemPrompt("Daily briefing", step, prior)
+	prompt := buildStepSystemPrompt("Daily briefing", step, pad)
 
-	if !strings.Contains(prompt, "## Results from Prior Steps") {
-		t.Error("expected prior results section")
+	if !strings.Contains(prompt, "## Context from Prior Steps") {
+		t.Error("expected context section")
 	}
-	if !strings.Contains(prompt, "Step 1 [SUCCESS]") {
-		t.Error("expected SUCCESS label for step 1")
-	}
-	if !strings.Contains(prompt, "Step 2 [FAILED]") {
-		t.Error("expected FAILED label for step 2")
-	}
-	if !strings.Contains(prompt, "Found 3 emails") {
+	if !strings.Contains(prompt, "step_1: Found 3 emails") {
 		t.Error("expected step 1 result content")
 	}
-	if !strings.Contains(prompt, "step failed: timeout") {
-		t.Error("expected step 2 result content")
+	if !strings.Contains(prompt, "failures: Step 2 failed: timeout") {
+		t.Error("expected failures entry")
+	}
+}
+
+func TestScratchpad_SetGetTruncate(t *testing.T) {
+	pad := &Scratchpad{}
+	pad.Set("key1", "value1")
+	if got := pad.Get("key1"); got != "value1" {
+		t.Errorf("expected value1, got %q", got)
+	}
+	if got := pad.Get("missing"); got != "" {
+		t.Errorf("expected empty for missing key, got %q", got)
+	}
+
+	// Test overwrite.
+	pad.Set("key1", "updated")
+	if got := pad.Get("key1"); got != "updated" {
+		t.Errorf("expected updated, got %q", got)
+	}
+
+	// Test truncation (scratchpadBudget = 1500).
+	long := strings.Repeat("x", 2000)
+	pad.Set("long", long)
+	got := pad.Get("long")
+	if len(got) > scratchpadBudget+3 { // +3 for "..."
+		t.Errorf("expected truncation, got len=%d", len(got))
+	}
+}
+
+func TestScratchpad_FormatForPrompt(t *testing.T) {
+	pad := &Scratchpad{}
+	if got := pad.FormatForPrompt(); got != "" {
+		t.Errorf("expected empty string for empty scratchpad, got %q", got)
+	}
+
+	pad.Set("step_1", "result A")
+	pad.Set("step_2", "result B")
+	out := pad.FormatForPrompt()
+	if !strings.Contains(out, "- step_1: result A") {
+		t.Error("expected step_1 entry")
+	}
+	if !strings.Contains(out, "- step_2: result B") {
+		t.Error("expected step_2 entry")
+	}
+}
+
+func TestIsComplexStep(t *testing.T) {
+	cases := []struct {
+		name    string
+		step    planStep
+		complex bool
+	}{
+		{"simple search", planStep{Description: "Search for emails", ToolsNeeded: []string{"search_email"}}, false},
+		{"retrieval only", planStep{Description: "Analyze patterns in emails", ToolsNeeded: []string{"search_email", "search_memory"}}, false},
+		{"analyze keyword", planStep{Description: "Analyze the search results", ToolsNeeded: []string{}}, true},
+		{"synthesize keyword", planStep{Description: "Synthesize findings from previous steps"}, true},
+		{"compare keyword", planStep{Description: "Compare the two approaches"}, true},
+		{"consolidate keyword", planStep{Description: "Consolidate all data points"}, true},
+		{"no keywords", planStep{Description: "Look up the weather forecast"}, false},
+		{"no tools no keywords", planStep{Description: "Find the answer"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isComplexStep(tc.step)
+			if got != tc.complex {
+				t.Errorf("isComplexStep(%q, tools=%v) = %v, want %v",
+					tc.step.Description, tc.step.ToolsNeeded, got, tc.complex)
+			}
+		})
 	}
 }
 

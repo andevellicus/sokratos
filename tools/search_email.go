@@ -34,7 +34,7 @@ type searchEmailArgs struct {
 func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *TriageConfig, lookback string, displayBatch int) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a searchEmailArgs
-		if args != nil && len(args) > 2 {
+		if len(args) > 2 {
 			if err := json.Unmarshal(args, &a); err != nil {
 				return fmt.Sprintf("invalid arguments: %v", err), nil
 			}
@@ -46,7 +46,7 @@ func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *TriageConfig
 		}
 
 		// Search mode: pass-through to Gmail.
-		return searchGmail(ctx, svc, a)
+		return searchGmail(svc, a)
 	}
 }
 
@@ -146,7 +146,7 @@ func triageAndSaveEmailAsync(cfg TriageConfig, email gmail.Email) {
 }
 
 // searchGmail performs a direct Gmail API search with query and optional time filters.
-func searchGmail(ctx context.Context, svc *gm.Service, a searchEmailArgs) (string, error) {
+func searchGmail(svc *gm.Service, a searchEmailArgs) (string, error) {
 	maxResults := int64(10)
 	if a.MaxResults > 0 {
 		maxResults = int64(a.MaxResults)

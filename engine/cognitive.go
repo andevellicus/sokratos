@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"sokratos/logger"
@@ -139,5 +140,15 @@ func (e *Engine) triggerReflection() {
 		logger.Log.Warnf("[engine] reflection failed: %v", err)
 	} else if id > 0 {
 		logger.Log.Infof("[engine] reflection saved as memory id=%d", id)
+		// Inject reflection insight into conversation context for the orchestrator.
+		if e.ReflectionNotifyFunc != nil {
+			rCtx, rCancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
+			var summary string
+			qErr := e.DB.QueryRow(rCtx, `SELECT summary FROM memories WHERE id = $1`, id).Scan(&summary)
+			rCancel()
+			if qErr == nil && strings.TrimSpace(summary) != "" {
+				e.ReflectionNotifyFunc(summary)
+			}
+		}
 	}
 }

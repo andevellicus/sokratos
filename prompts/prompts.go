@@ -37,3 +37,12 @@ var Transition string
 
 //go:embed plan_task.txt
 var PlanTask string
+
+//go:embed replan_task.txt
+var ReplanTask string
+
+//go:embed heartbeat_mode.txt
+var HeartbeatMode string
+
+//go:embed routine_mode.txt
+var RoutineMode string

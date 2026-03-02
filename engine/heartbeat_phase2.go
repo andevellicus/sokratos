@@ -9,30 +9,14 @@ import (
 
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/prompts"
+	"sokratos/textutil"
 )
 
-// executivePromptBase is the template for the Phase 2 system message.
-// It contains a %s placeholder for staleness context (populated per-tick).
-const executivePromptBase = `You are running your autonomous background loop. Routines have already been executed for this tick. Review the <heartbeat_context> and determine if any proactive action is required.
-
-%s
-
-Priority order:
-1. Pending tasks that are overdue or due within 24 hours — take action if you can make progress without user input.
-2. If recent memories suggest something time-sensitive needs attention (upcoming travel, an open promise to follow up, an approaching deadline), address it.
-3. Only message the user if there is something they need to know or decide RIGHT NOW. Do not message the user to report that background tasks completed silently.
-
-ABSOLUTE RULES:
-- Do NOT continue, revisit, or follow up on previous conversations. The conversation is NOT your concern here.
-- Do NOT repeat information you have already told the user.
-- Do NOT summarize what happened in previous conversations.
-- Do NOT offer unsolicited help ("Would you like me to...", "I can also...").
-
-CRITICAL: You MUST respond with exactly ONE of these two formats — anything else will be sent directly to the user as a Telegram message:
-- If no action is needed: <NO_ACTION_REQUIRED>
-- If action is needed: <TOOL_INTENT>describe the exact action to take</TOOL_INTENT>
-
-Do NOT output status words like "idle", acknowledgements, or commentary. Your entire response must be one of the two tags above.`
+// executivePromptBase returns the Phase 2 system message template.
+// Uses the embedded heartbeat_mode.txt prompt which contains a %s placeholder
+// for staleness context (populated per-tick).
+var executivePromptBase = strings.TrimSpace(prompts.HeartbeatMode)
 
 // gatekeeperGrammar is a GBNF grammar constraining gatekeeper output to one of
 // three JSON decision shapes: no action, tool intent, or direct message.
@@ -58,6 +42,7 @@ Respond with exactly ONE JSON object:
 - {"action": "message", "text": "..."} — send a short message directly to the user (only for truly urgent, time-sensitive items).
 
 Rules:
+- Check <recent_actions> to avoid repeating actions already taken.
 - Do NOT continue, revisit, or follow up on previous conversations.
 - Do NOT repeat information the user already knows.
 - Do NOT offer unsolicited help.
@@ -135,7 +120,9 @@ func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, con
 		if orchestratorErr != nil {
 			logger.Log.Errorf("heartbeat: orchestrator error (gatekeeper-routed): %v", orchestratorErr)
 		} else if reply = strings.TrimSpace(reply); reply != "" && !strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
-			e.sendDeduped(reply, "proactive response (gatekeeper-routed)")
+			if e.sendDeduped(reply, "proactive response (gatekeeper-routed)") {
+				e.recordAction("heartbeat", textutil.Truncate(reply, 100))
+			}
 		}
 
 	case "message":
@@ -144,7 +131,9 @@ func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, con
 			logger.Log.Debug("heartbeat: gatekeeper returned empty message, ignoring")
 			break
 		}
-		e.sendDeduped(text, "gatekeeper message")
+		if e.sendDeduped(text, "gatekeeper message") {
+			e.recordAction("heartbeat", textutil.Truncate(text, 100))
+		}
 
 	default:
 		logger.Log.Warnf("heartbeat: gatekeeper returned unknown action %q, ignoring", decision.Action)
@@ -200,7 +189,9 @@ func (e *Engine) heartbeatPhase2Orchestrator(contextXML, stalenessNote string, c
 	case strings.Contains(reply, "<NO_ACTION_REQUIRED>"):
 		logger.Log.Info("heartbeat: no action required")
 	case strings.TrimSpace(reply) != "":
-		e.sendDeduped(strings.TrimSpace(reply), "proactive response")
+		if e.sendDeduped(strings.TrimSpace(reply), "proactive response") {
+			e.recordAction("heartbeat", textutil.Truncate(strings.TrimSpace(reply), 100))
+		}
 	default:
 		logger.Log.Debug("heartbeat: orchestrator produced unexpected output")
 	}

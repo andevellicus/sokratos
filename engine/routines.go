@@ -2,10 +2,13 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/prompts"
 	"sokratos/timeouts"
 )
 
@@ -17,7 +20,7 @@ func (e *Engine) executeDueRoutines() int {
 	defer cancel()
 
 	rows, err := e.DB.Query(queryCtx,
-		`SELECT id, name, instruction
+		`SELECT id, name, instruction, tool, goal, COALESCE(silent_if_empty, false)
 		 FROM routines
 		 WHERE last_executed + interval_duration <= NOW()
 		 ORDER BY (last_executed + interval_duration) ASC`)
@@ -29,7 +32,7 @@ func (e *Engine) executeDueRoutines() int {
 	var directives []dueRoutine
 	for rows.Next() {
 		var d dueRoutine
-		if err := rows.Scan(&d.ID, &d.Name, &d.Instruction); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.Instruction, &d.Tool, &d.Goal, &d.SilentIfEmpty); err != nil {
 			logger.Log.Warnf("heartbeat: failed to scan routine row: %v", err)
 			continue
 		}
@@ -49,8 +52,10 @@ func (e *Engine) executeDueRoutines() int {
 }
 
 // executeSingleRoutine advances the directive's timer and runs it through
-// the full orchestrator/supervisor loop. Recovers from panics so a single
-// failed directive never crashes the heartbeat goroutine.
+// the orchestrator. If the routine has a `tool` field, the tool is called
+// directly first and the result is passed to the orchestrator with the goal.
+// If silent_if_empty is set and the tool returns no data, the orchestrator
+// is skipped entirely.
 func (e *Engine) executeSingleRoutine(d dueRoutine) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -67,11 +72,44 @@ func (e *Engine) executeSingleRoutine(d dueRoutine) {
 		return
 	}
 
-	prompt := fmt.Sprintf(
-		"ROUTINE: %s\nExecute this routine now. Use your tools to complete it.\n"+
-			"Do not message the user unless the routine explicitly requires it.",
-		d.Instruction,
-	)
+	var prompt string
+
+	if d.Tool != nil && *d.Tool != "" {
+		// Structured routine: call the tool directly, then hand results to the orchestrator.
+		toolResult, err := e.ToolExec(context.Background(), json.RawMessage(
+			fmt.Sprintf(`{"name":%q,"arguments":{}}`, *d.Tool),
+		))
+		if err != nil {
+			logger.Log.Warnf("heartbeat: routine tool call failed, name=%s, tool=%s, err=%v", d.Name, *d.Tool, err)
+			return
+		}
+
+		// If the tool returned nothing useful and silent_if_empty is set, skip.
+		if d.SilentIfEmpty && isEmptyToolResult(toolResult) {
+			logger.Log.Infof("heartbeat: routine %s: tool returned empty, skipping (silent)", d.Name)
+			return
+		}
+
+		goal := d.Instruction
+		if d.Goal != nil && *d.Goal != "" {
+			goal = *d.Goal
+		}
+
+		prompt = fmt.Sprintf(
+			"ROUTINE: %s\nThe tool %q was called and returned the following data:\n\n%s\n\nYour task: %s",
+			d.Name, *d.Tool, toolResult, goal,
+		)
+	} else {
+		// Legacy routine: pass instruction to orchestrator and let it figure things out.
+		prompt = fmt.Sprintf(
+			"ROUTINE: %s\nExecute this routine now. Use your tools to complete it.\n"+
+				"Do not message the user unless the routine explicitly requires it.",
+			d.Instruction,
+		)
+	}
+
+	// Prepend routine mode preamble for focused execution context.
+	prompt = strings.TrimSpace(prompts.RoutineMode) + "\n\n" + prompt
 
 	var err error
 	e.withOrchestratorLock(func() {
@@ -87,4 +125,35 @@ func (e *Engine) executeSingleRoutine(d dueRoutine) {
 	}
 
 	logger.Log.Infof("heartbeat: routine executed, name=%s", d.Name)
+	e.recordAction("routine", fmt.Sprintf("Executed %q", d.Name))
+}
+
+// isEmptyToolResult checks if a tool result indicates no data was returned.
+func isEmptyToolResult(result string) bool {
+	if result == "" {
+		return true
+	}
+	// Skills return "No tweets found.", "No news articles found.", etc.
+	for _, prefix := range []string{"No ", "no ", "error", "Error"} {
+		if len(result) > len(prefix) && result[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	// JSON results with count=0
+	if len(result) > 10 && result[0] == '{' {
+		if idx := indexOf(result, `"count":0`); idx >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// indexOf returns the index of substr in s, or -1 if not found.
+func indexOf(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
 }

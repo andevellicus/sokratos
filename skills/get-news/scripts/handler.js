@@ -1,42 +1,17 @@
-// Parse config.txt: [sources] and [topics] sections, one entry per line.
-function parseConfig(raw) {
-    var sources = [];
-    var topics = [];
-    if (!raw) return {sources: sources, topics: topics};
-    var section = "";
-    var lines = raw.split("\n");
-    for (var i = 0; i < lines.length; i++) {
-        var line = lines[i].trim();
-        if (!line || line.charAt(0) === "#") continue;
-        if (line === "[sources]") { section = "sources"; continue; }
-        if (line === "[topics]") { section = "topics"; continue; }
-        if (section === "sources") sources.push(line);
-        if (section === "topics") topics.push(line);
-    }
-    return {sources: sources, topics: topics};
-}
+// skill_config is a parsed TOML object: {sources: [...], topics: [...]}
+var cfg = skill_config || {};
 
-var cfg = parseConfig(skill_config);
-
-// Config is always the base; args add extra sources/topics on top.
-var sources = cfg.sources.slice();
-if (args.sources) {
-    var extra = args.sources.split(",").map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
-    for (var i = 0; i < extra.length; i++) {
-        if (sources.indexOf(extra[i]) === -1) sources.push(extra[i]);
-    }
-}
-var topics = cfg.topics.slice();
-if (args.topics) {
-    var extra = args.topics.split(",").map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
-    for (var i = 0; i < extra.length; i++) {
-        if (topics.indexOf(extra[i]) === -1) topics.push(extra[i]);
-    }
-}
+// Args override config when provided; config is the fallback.
+var sources = args.sources
+    ? args.sources.split(",").map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; })
+    : (cfg.sources || []).slice();
+var topics = args.topics
+    ? args.topics.split(",").map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; })
+    : (cfg.topics || []).slice();
 var count = args.count || 5;
 
 if (topics.length === 0) {
-    return "No topics configured. Edit skills/get-news/config.txt or pass topics as arguments.";
+    return "No topics configured. Edit skills/get-news/config.toml or pass topics as arguments.";
 }
 
 var seen = {};
@@ -64,7 +39,17 @@ for (var i = 0; i < topics.length; i++) {
         var h = hits[j];
         if (h.url && !seen[h.url]) {
             seen[h.url] = true;
-            results.push({title: h.title || "", url: h.url, snippet: h.content || ""});
+            // Extract source domain from URL.
+            var source = "";
+            var match = h.url.match(/^https?:\/\/(?:www\.)?([^\/]+)/);
+            if (match) source = match[1];
+            results.push({
+                title: h.title || "",
+                url: h.url,
+                snippet: h.content || "",
+                source: source,
+                date: h.publishedDate || ""
+            });
             added++;
         }
     }
@@ -72,12 +57,4 @@ for (var i = 0; i < topics.length; i++) {
 
 if (results.length === 0) return "No news articles found.";
 
-var lines = ["Found " + results.length + " articles (ALWAYS include the URL for each article in your response):\n"];
-for (var k = 0; k < results.length; k++) {
-    var r = results[k];
-    lines.push((k + 1) + ". " + r.title);
-    lines.push("   " + r.snippet);
-    lines.push("   " + r.url);
-    lines.push("");
-}
-return lines.join("\n");
+return {count: results.length, articles: results};

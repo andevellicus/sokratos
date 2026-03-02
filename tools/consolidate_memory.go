@@ -231,7 +231,7 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 		currentProfile = "{}"
 	}
 
-	// Z1 runs with 32K context. With 4096 max output tokens and ~4 chars/token,
+	// DTC runs with 32K context. With 4096 max output tokens and ~4 chars/token,
 	// the input budget is ~28K tokens ≈ 112K chars. 50K is conservative.
 	promptBudget := opts.MaxPromptChars
 	if promptBudget <= 0 {
@@ -285,7 +285,7 @@ func ConsolidateCore(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerCl
 		} else {
 			reqCtx, cancel = context.WithTimeout(ctx, TimeoutConsolidationDefault)
 		}
-		raw, cErr := dtc.Complete(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
+		raw, cErr := dtc.CompleteNoThink(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
 		cancel()
 		if cErr != nil {
 			return totalProcessed, fmt.Errorf("consolidation request (batch %d): %w", batch, cErr)
@@ -631,6 +631,25 @@ func RunInitialConsolidation(pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEn
 	}
 
 	logger.Log.Infof("[consolidate] startup: profile created/updated from %d high-salience memories", n)
+}
+
+// ConsolidateImmediate runs a quick mini-consolidation focused on recent
+// high-salience memories. Used by the paradigm shift fast-path to update
+// the identity profile without waiting for the next cognitive run.
+func ConsolidateImmediate(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc) error {
+	n, err := ConsolidateCore(ctx, pool, dtc, embedEndpoint, embedModel, ConsolidateOpts{
+		SalienceThreshold: 8,
+		MemoryLimit:       10,
+		Timeout:           90 * time.Second,
+	}, grammarFn)
+	if err != nil {
+		logger.Log.Warnf("[consolidate] immediate mini-consolidation failed: %v", err)
+		return err
+	}
+	if n > 0 {
+		logger.Log.Infof("[consolidate] immediate mini-consolidation processed %d memories", n)
+	}
+	return nil
 }
 
 // logMergeFailure records a memory merge failure to the failed_operations table.

@@ -25,9 +25,7 @@ type AppConfig struct {
 	DeepThinkerURL   string
 	DeepThinkerModel string
 
-	Text2SQLURL string
-
-	SubagentURL   string
+	SubagentURL string
 	SubagentModel string
 	SubagentSlots int
 
@@ -51,8 +49,6 @@ type AppConfig struct {
 	DBMaxConnLifetime   time.Duration
 	DBMaxConnIdleTime   time.Duration
 	DBHealthCheckPeriod time.Duration
-	Text2SQLModel       string
-	Text2SQLKeepAlive   string
 	ConfirmationTimeout time.Duration
 	EmailCheckLookback  string
 	EmailDisplayBatch   int
@@ -83,9 +79,7 @@ func Load() *AppConfig {
 		DeepThinkerURL:   os.Getenv("DEEP_THINKER_URL"),
 		DeepThinkerModel: os.Getenv("DEEP_THINKER_MODEL"),
 
-		Text2SQLURL: os.Getenv("TEXT2SQL_URL"),
-
-		SubagentURL:   os.Getenv("SUBAGENT_URL"),
+		SubagentURL: os.Getenv("SUBAGENT_URL"),
 		SubagentModel: os.Getenv("SUBAGENT_MODEL"),
 		SubagentSlots: EnvInt("SUBAGENT_SLOTS", 2),
 
@@ -109,8 +103,6 @@ func Load() *AppConfig {
 		DBMaxConnLifetime:   EnvDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute),
 		DBMaxConnIdleTime:   EnvDuration("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
 		DBHealthCheckPeriod: EnvDuration("DB_HEALTH_CHECK_PERIOD", 30*time.Second),
-		Text2SQLModel:       EnvString("TEXT2SQL_MODEL", "Arctic-Text2SQL-R1-7B.Q8_0"),
-		Text2SQLKeepAlive:   EnvString("TEXT2SQL_KEEP_ALIVE", "30s"),
 		ConfirmationTimeout: EnvDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
 		EmailCheckLookback:  EnvString("EMAIL_CHECK_LOOKBACK", "newer_than:1h"),
 		EmailDisplayBatch:   EnvInt("EMAIL_DISPLAY_BATCH", 5),

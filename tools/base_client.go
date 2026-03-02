@@ -24,27 +24,28 @@ type baseClient struct {
 	logTag   string // "[dtc]" or "[subagent]"
 }
 
-// dtcRequest is the payload sent to /v1/chat/completions.
-type dtcRequest struct {
-	Model           string       `json:"model,omitempty"`
-	Messages        []dtcMessage `json:"messages"`
-	Temperature     float64      `json:"temperature"`
-	MaxTokens       int          `json:"max_tokens"`
-	Think           *bool        `json:"think,omitempty"`            // when false, disables chain-of-thought reasoning (llama-server)
-	Grammar         string       `json:"grammar,omitempty"`          // GBNF grammar constraint (used by SubagentClient)
-	ReasoningFormat string       `json:"reasoning_format,omitempty"` // "deepseek" → split <think> into reasoning_content vs content
+// chatRequest is the payload sent to /v1/chat/completions (shared by DTC and SubagentClient).
+type chatRequest struct {
+	Model              string         `json:"model,omitempty"`
+	Messages           []chatMessage   `json:"messages"`
+	Temperature        float64        `json:"temperature"`
+	MaxTokens          int            `json:"max_tokens"`
+	Think              *bool          `json:"think,omitempty"`                // when false, disables chain-of-thought reasoning (llama-server)
+	Grammar            string         `json:"grammar,omitempty"`              // GBNF grammar constraint (used by SubagentClient)
+	ReasoningFormat    string         `json:"reasoning_format,omitempty"`     // "deepseek" → split <think> into reasoning_content vs content
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"` // Jinja template vars (e.g. enable_thinking for Qwen3.5)
 }
 
-type dtcMessage struct {
+type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type dtcResponse struct {
+type chatResponse struct {
 	Choices []struct {
 		Message struct {
 			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"` // GLM models put output here even with think:false
+			ReasoningContent string `json:"reasoning_content"` // thinking output when reasoning_format=deepseek
 		} `json:"message"`
 	} `json:"choices"`
 }
@@ -68,7 +69,7 @@ func isTransientError(err error) bool {
 	return false
 }
 
-// thinkFalse is a reusable pointer to false for triage requests.
+// thinkFalse is a reusable pointer to false for the ensureLoaded health probe.
 var thinkFalse = func() *bool { b := false; return &b }()
 
 // doRequest sends a single HTTP request and returns the content or an error.
@@ -94,7 +95,7 @@ func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error
 		return "", &serverError{status: resp.StatusCode, detail: detail}
 	}
 
-	var raw dtcResponse
+	var raw chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return "", fmt.Errorf("decode response: %w", err)
 	}
@@ -109,9 +110,10 @@ func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error
 		bc.OnAccess()
 	}
 
-	// GLM models may put all output into reasoning_content even when
-	// think:false is set (template quirk). Fall back to reasoning_content
-	// when content is empty. This is expected behavior, not an error.
+	// When reasoning_format=deepseek is set, thinking goes into
+	// reasoning_content and the answer goes into content. Fall back to
+	// reasoning_content when content is empty (defensive, shouldn't happen
+	// in normal operation with Qwen3.5's chat_template_kwargs).
 	content := strings.TrimSpace(raw.Choices[0].Message.Content)
 	if content == "" {
 		content = strings.TrimSpace(raw.Choices[0].Message.ReasoningContent)
@@ -124,9 +126,9 @@ func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error
 // loaded), it triggers loading and polls /health until ready. For always-on
 // dedicated servers, this serves as a lightweight health check (~10ms).
 func (bc *baseClient) ensureLoaded(ctx context.Context) error {
-	probe, _ := json.Marshal(dtcRequest{
+	probe, _ := json.Marshal(chatRequest{
 		Model:     bc.Model,
-		Messages:  []dtcMessage{{Role: "user", Content: "ping"}},
+		Messages:  []chatMessage{{Role: "user", Content: "ping"}},
 		MaxTokens: 1,
 		Think:     thinkFalse,
 	})

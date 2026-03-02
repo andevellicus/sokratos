@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"sokratos/logger"
 )
@@ -130,7 +131,7 @@ func TestValidateSkillSource(t *testing.T) {
 func TestExecuteSkill_ReturnStatement(t *testing.T) {
 	source := `var result = args.a * args.b; return "product=" + result;`
 	args := json.RawMessage(`{"a": 5, "b": 6}`)
-	result, err := ExecuteSkill(context.Background(), "test_return", source, "", args)
+	result, err := ExecuteSkill(context.Background(), "test_return", source, "", args, nil)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -151,7 +152,7 @@ func TestNeedsIIFEWrap(t *testing.T) {
 func TestExecuteSkill_BasicArithmetic(t *testing.T) {
 	source := `var result = args.a + args.b; "sum=" + result;`
 	args := json.RawMessage(`{"a": 3, "b": 4}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, "", args)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args, nil)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestExecuteSkill_BasicArithmetic(t *testing.T) {
 func TestExecuteSkill_DefaultArgs(t *testing.T) {
 	source := `var c = args.currency || "usd"; c;`
 	args := json.RawMessage(`{}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, "", args)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args, nil)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -175,7 +176,7 @@ func TestExecuteSkill_DefaultArgs(t *testing.T) {
 func TestExecuteSkill_RuntimeError(t *testing.T) {
 	source := `null.foo;`
 	args := json.RawMessage(`{}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, "", args)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args, nil)
 	if err != nil {
 		t.Fatalf("expected soft error, got hard error: %v", err)
 	}
@@ -264,7 +265,7 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 		},
 		Source: `"result=" + (args.a + args.b);`,
 	}
-	RegisterSkill(registry, skill)
+	RegisterSkill(registry, skill, nil)
 
 	if !registry.Has("add_nums") {
 		t.Fatal("expected add_nums to be registered")
@@ -394,7 +395,7 @@ func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	}
 
 	// Execute the loaded skill.
-	result, err := ExecuteSkill(context.Background(), s.Manifest.Name, s.Source, "", json.RawMessage(`{"city":"Tokyo"}`))
+	result, err := ExecuteSkill(context.Background(), s.Manifest.Name, s.Source, "", json.RawMessage(`{"city":"Tokyo"}`), nil)
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -426,7 +427,7 @@ func TestNewCreateSkill_Validation(t *testing.T) {
 	var grammarRebuilt bool
 	rebuildGrammar := func() { grammarRebuilt = true }
 
-	createSkill := NewCreateSkill(registry, skillsDir, rebuildGrammar)
+	createSkill := NewCreateSkill(registry, skillsDir, rebuildGrammar, nil)
 
 	// Test case: failed test execution
 	args := json.RawMessage(`{"name":"bad_skill","description":"fails","code":"throw new Error('fail');","test_args":"{}"}`)
@@ -468,5 +469,140 @@ func TestNewCreateSkill_Validation(t *testing.T) {
 	}
 	if !grammarRebuilt {
 		t.Error("expected grammar to be rebuilt")
+	}
+}
+
+func TestExecuteSkill_ConsoleLog(t *testing.T) {
+	source := `console.log("hello", "world"); console.warn("caution"); console.error("oops"); "done";`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	if !strings.Contains(result, "done") {
+		t.Errorf("expected result to contain 'done', got %q", result)
+	}
+	if !strings.Contains(result, "[LOG] hello world") {
+		t.Errorf("expected log output, got %q", result)
+	}
+	if !strings.Contains(result, "[WARN] caution") {
+		t.Errorf("expected warn output, got %q", result)
+	}
+	if !strings.Contains(result, "[ERROR] oops") {
+		t.Errorf("expected error output, got %q", result)
+	}
+}
+
+func TestExecuteSkill_BtoaAtob(t *testing.T) {
+	source := `var encoded = btoa("hello world"); var decoded = atob(encoded); decoded;`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	if result != "hello world" {
+		t.Errorf("expected 'hello world', got %q", result)
+	}
+}
+
+func TestExecuteSkill_BtoaAtob_Value(t *testing.T) {
+	source := `btoa("hello world");`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	if result != "aGVsbG8gd29ybGQ=" {
+		t.Errorf("expected base64 'aGVsbG8gd29ybGQ=', got %q", result)
+	}
+}
+
+func TestExecuteSkill_Sleep(t *testing.T) {
+	start := time.Now()
+	source := `sleep(100); "done";`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	elapsed := time.Since(start)
+	if result != "done" {
+		t.Errorf("expected 'done', got %q", result)
+	}
+	if elapsed < 80*time.Millisecond {
+		t.Errorf("sleep(100) completed too fast: %v", elapsed)
+	}
+}
+
+func TestExecuteSkill_SleepCapped(t *testing.T) {
+	// sleep(999999) should be capped at 5 seconds, but we use a short
+	// context deadline to make the test fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	source := `sleep(999999); "done";`
+	_, _ = ExecuteSkill(ctx, "test", source, "", nil, nil)
+	elapsed := time.Since(start)
+	if elapsed > 1*time.Second {
+		t.Errorf("sleep should have been capped by context, took %v", elapsed)
+	}
+}
+
+func TestExecuteSkill_Env(t *testing.T) {
+	os.Setenv("SKILL_TEST_KEY", "test_value_123")
+	defer os.Unsetenv("SKILL_TEST_KEY")
+
+	source := `env("TEST_KEY");`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	if result != "test_value_123" {
+		t.Errorf("expected 'test_value_123', got %q", result)
+	}
+}
+
+func TestExecuteSkill_EnvBlocked(t *testing.T) {
+	// Non-SKILL_ prefixed env vars should not be accessible.
+	source := `var v = env("PATH"); typeof v === "undefined" ? "blocked" : "leaked";`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	if result != "blocked" {
+		t.Errorf("expected 'blocked', got %q (env leaked non-SKILL_ var)", result)
+	}
+}
+
+func TestExecuteSkill_HashSha256(t *testing.T) {
+	source := `hash_sha256("hello");`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	// SHA-256 of "hello"
+	expected := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	if result != expected {
+		t.Errorf("expected %s, got %q", expected, result)
+	}
+}
+
+func TestExecuteSkill_HashHmacSha256(t *testing.T) {
+	source := `hash_hmac_sha256("key", "message");`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	// HMAC-SHA256("key", "message")
+	expected := "6e9ef29b75fffc5b7abae527d58fdadb2fe42e7219011976917343065f58ed4a"
+	if result != expected {
+		t.Errorf("expected %s, got %q", expected, result)
+	}
+}
+
+func TestExecuteSkill_KV_NilPool(t *testing.T) {
+	source := `kv_set("k", "v");`
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	if err != nil {
+		t.Fatalf("expected soft error, got hard error: %v", err)
+	}
+	if !strings.Contains(result, "kv store unavailable") {
+		t.Errorf("expected 'kv store unavailable' error, got %q", result)
 	}
 }

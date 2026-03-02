@@ -4,21 +4,16 @@ An autonomous AI assistant with long-term memory, powered by a multi-model archi
 
 ## Architecture
 
-Sokratos uses a **single-model supervisor pattern** where a vision-capable orchestrator produces free-form text with tool intent tags parsed via regex. Five llama-server instances run on a separate Mac (M3 Ultra):
+Sokratos uses a **single-model supervisor pattern** where a vision-capable orchestrator produces free-form text with tool intent tags parsed via regex. Four llama-server instances run on a separate Mac (M3 Ultra):
 
 | Service | Port | Model | Purpose |
 |---------|------|-------|---------|
 | Orchestrator | 11434 | Qwen3.5-VL-35B-A3B (UD-Q4_K_XL) | Vision-capable MoE reasoning, free-form text + `<TOOL_INTENT>` tags |
-| Deep thinker | 11435 | GLM-Z1-32B (UD-Q6_K_XL) | Always-on heavy reasoning, consolidation |
-| Subagent | 11436 | GLM-4.7-Flash-30B-A3B (UD-Q4_K_XL) | Always-on MoE structured tasks: triage, rewriting, re-ranking |
-| On-demand router | 11437 | Arctic-Text2SQL-7B (Q8_0) | SQL generation (loaded/unloaded dynamically) |
+| Deep thinker | 11435 | Qwen3.5-27B (UD-Q6_K_XL) | Always-on heavy reasoning, consolidation, plan decomposition |
+| Subagent | 11436 | Gemma3-4B-IT (UD-Q8_K_XL) | Always-on structured tasks: triage, rewriting, re-ranking, SQL generation |
 | Embedding | 8081 | BGE-large-en-v1.5 (q8_0) | 1024-dim vectors for pgvector |
 
 The orchestrator runs without grammar constraints. When it wants a tool, it emits `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds).
-
-### Model Lineage Diversity
-
-GLM-Z1-32B is deliberately chosen for the deep thinker over a Qwen-family model to avoid compounded inferential mistakes when the Qwen3-VL orchestrator gets a "second opinion" on triage, consolidation, or reasoning tasks.
 
 ## Prerequisites
 
@@ -46,7 +41,7 @@ On your inference machine (e.g., Mac with M3 Ultra):
 cd models && ./start.sh
 ```
 
-This launches all five llama-server instances.
+This launches all four llama-server instances.
 
 ### 3. Configure environment
 
@@ -58,15 +53,14 @@ ALLOWED_TELEGRAM_IDS=your_telegram_id
 DATABASE_URL=postgres://sokratos:sokratos@localhost:5435/sokratos
 
 LLM_URL=http://your-mac:11434
-LLM_MODEL=Qwen3-VL-30B-A3B-Instruct-UD-Q6_K_XL
+LLM_MODEL=Qwen3.5-VL-35B-A3B-Instruct-UD-Q4_K_XL
 
 DEEP_THINKER_URL=http://your-mac:11435
-DEEP_THINKER_MODEL=GLM-Z1-32B-0414-UD-Q6_K_XL
-
-TEXT2SQL_URL=http://your-mac:11437
+DEEP_THINKER_MODEL=Qwen3.5-27B-UD-Q6_K_XL
 
 SUBAGENT_URL=http://your-mac:11436
-SUBAGENT_MODEL=GLM-4.7-9B-Flash-UD-Q4_K_XL
+SUBAGENT_MODEL=gemma-3-4b-it-UD-Q8_K_XL
+SUBAGENT_SLOTS=3
 
 EMBEDDING_URL=http://your-mac:8081
 EMBEDDING_MODEL=bge-large-en-v1.5-q8_0
@@ -92,12 +86,9 @@ go build -o sokratos ./...
 | `LLM_MODEL` | (required) | Orchestrator model name |
 | `DEEP_THINKER_URL` | (empty) | Deep thinker endpoint |
 | `DEEP_THINKER_MODEL` | (empty) | Deep thinker model (no .gguf suffix) |
-| `TEXT2SQL_URL` | (empty) | Text2SQL on-demand router endpoint |
-| `TEXT2SQL_MODEL` | `Arctic-Text2SQL-R1-7B.Q8_0` | Text2SQL model name |
-| `TEXT2SQL_KEEP_ALIVE` | `30s` | Text2SQL auto-unload delay |
 | `SUBAGENT_URL` | (empty) | Subagent endpoint |
 | `SUBAGENT_MODEL` | (empty) | Subagent model name |
-| `SUBAGENT_SLOTS` | `2` | Concurrent slots for Flash subagent |
+| `SUBAGENT_SLOTS` | `3` | Concurrent slots for Gemma3 subagent |
 | `EMBEDDING_URL` | (empty) | Embedding endpoint |
 | `EMBEDDING_MODEL` | (empty) | Embedding model name |
 | `SEARXNG_URL` | (empty) | SearXNG instance URL |
@@ -143,12 +134,11 @@ The orchestrator has access to the following built-in tools:
 | `save_memory` | Persist a fact or preference to long-term memory |
 | `forget_topic` | Delete memories related to a topic by semantic similarity |
 | `consolidate_memory` | Synthesize high-salience memories into the core profile |
-| `bootstrap_profile` | Generate initial identity profile from conversation context |
-| `consult_deep_thinker` | Route complex reasoning to GLM-Z1-32B with full chain-of-thought |
+| `consult_deep_thinker` | Route complex reasoning to Qwen3.5-27B with full chain-of-thought |
 | `delegate_task` | Delegate structured tasks to subagent with scoped tool access |
 | `plan_and_execute` | Decompose a directive into steps via DTC, execute via subagent (supports background mode) |
 | `check_background_task` | List, check status, or cancel background tasks |
-| `ask_database` | Natural language queries against the PostgreSQL database via Text2SQL |
+| `ask_database` | Natural language queries against the PostgreSQL database via subagent |
 | `search_email` | Search Gmail with time bounds and query filters |
 | `send_email` | Send an email (requires Telegram confirmation) |
 | `search_calendar` | Search Google Calendar events with time bounds |
@@ -157,30 +147,101 @@ The orchestrator has access to the following built-in tools:
 | `read_url` | Fetch and extract content from a web page |
 | `run_code` | Execute JavaScript code in a sandboxed goja runtime |
 | `add_task` / `complete_task` | Manage scheduled tasks with recurrence |
-| `manage_routines` | Create persistent background habits (e.g., "check email every 2h") |
+| `manage_routines` | Create persistent background habits — syncs to `routines.toml` |
 | `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
 | `create_skill` / `manage_skills` | Create or manage user-defined JavaScript tools |
 
+## Skill System
+
+Skills are user-created JavaScript tools that persist to disk and auto-load on startup. Each skill lives in `skills/<name>/` with a `SKILL.md` manifest, `scripts/handler.js`, and optional `config.toml`.
+
+### Runtime Globals
+
+Skills execute in a goja ES5 sandbox (30s timeout) with:
+
+| Global | Description |
+|--------|-------------|
+| `args` | Parsed JSON parameters from the tool invocation |
+| `skill_config` | Parsed `config.toml` as a JS object |
+| `http_request(method, url, headers, body)` | Synchronous HTTP bridge (15s timeout, 1MB cap, private IPs blocked) |
+| `console.log/warn/error(...)` | Output appended to result as log lines |
+| `btoa(s)` / `atob(s)` | Base64 encode/decode |
+| `sleep(ms)` | Synchronous sleep (capped at 5s per call) |
+| `env(key)` | Read `SKILL_<key>` environment variable |
+| `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Per-skill PostgreSQL key-value store |
+| `hash_sha256(s)` | SHA-256 hex digest |
+| `hash_hmac_sha256(key, msg)` | HMAC-SHA256 hex digest |
+
+### Built-in Skills
+
+| Skill | Config | Output |
+|-------|--------|--------|
+| `get-weather` | `location` | `{location, current: {condition, temp_f, humidity, ...}, forecast: [{date, high_f, low_f, condition}]}` |
+| `get-news` | `sources`, `topics` | `{count, articles: [{title, url, snippet, source, date}]}` |
+| `twitter-feed` | `accounts`, `topics` | `{count, tweets: [{author, text, snippet, url, date}]}` |
+
+### Creating Skills
+
+The orchestrator can create new skills at runtime via `create_skill`. Skills are validated (JS syntax check + test execution), written to disk, registered in the live tool registry, and the GBNF grammar is rebuilt. Skills can also be managed via `manage_skills` (list/delete).
+
 ## Memory System
 
 See [docs/memory-system.md](docs/memory-system.md) for the full technical reference.
 
-In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (HNSW index). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a ~30-day half-life and are pruned when stale. Higher-order synthesis layers (consolidation, episodic synthesis, reflection) are triggered by event-driven cognitive processing based on memory volume and user activity lulls.
+In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (HNSW index). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a dual-rate system: unretrieved memories (age>14d) use a ~15-day half-life, all others use ~30-day. Episode synthesis clusters related memories and reduces constituent salience by 40% so episodes are preferred in retrieval. Triage includes context-aware coverage checks — if 3+ similar memories already exist, the save bar is raised. Paradigm shifts trigger a fast-path: synchronous transition memory → mini-consolidation → immediate profile refresh. Higher-order synthesis layers (consolidation, episodic synthesis, reflection) are triggered by event-driven cognitive processing based on memory volume and user activity lulls. Reflection insights are routed back into conversation context for the orchestrator.
+
+## Routines
+
+Routines are persistent background habits defined in `routines.toml` and synced to PostgreSQL. They execute on a configurable interval during the heartbeat loop.
+
+### Structured Format (preferred)
+
+```toml
+[news-digest]
+interval = "4 hours"
+tool = "get-news"
+goal = "Select 3-5 articles relevant to my interests. Send a digest."
+silent_if_empty = true
+```
+
+When `tool` is set, the engine calls it directly, then passes the result + `goal` to the orchestrator for interpretation. If `silent_if_empty = true` and the tool returns no data, the orchestrator is skipped entirely (no message sent).
+
+### Legacy Format
+
+```toml
+[check-inbox]
+interval = "2 hours"
+instruction = "Check for new emails and alert about urgent ones."
+```
+
+Without a `tool` field, the full instruction is passed to the orchestrator which handles everything.
+
+### Source of Truth
+
+`routines.toml` is the source of truth. The database is a runtime cache. Three sync paths keep them aligned:
+
+1. **Startup** — `SyncRoutinesFromFile()` does a full sync (upsert all TOML entries, delete DB entries not in the file)
+2. **Heartbeat** — mtime-based incremental check on each tick; re-syncs if the file was modified
+3. **`/reload`** — Telegram command that forces an immediate full sync of both routines and skills
+
+Changes made via the `manage_routines` tool are written back to `routines.toml`.
 
 ## Project Structure
 
 ```
 sokratos/
   main.go              # Telegram bot, message loop, prefetch, wiring
+  register_tools.go    # Domain-grouped tool registration
+  routines.go          # Routine TOML file management, sync, and write-back
   config.go            # Environment variable helpers
   confirm.go           # Telegram confirmation gate for sensitive tools
   prefetch.go          # Subconscious memory prefetch for message loop
   telegram.go          # Telegram helpers (photo download, typing indicator)
   format.go            # Markdown-to-Telegram HTML converter
   db/                  # PostgreSQL connection and schema auto-apply
-    schema.sql         # memories, tasks, routines, personality_traits, etc.
+    schema.sql         # memories, tasks, routines, personality_traits, skill_kv, etc.
   engine/              # Heartbeat loop, context sliding, state
     engine.go          # Heartbeat: phase 1 routines, phase 2 contextual reasoning
     cognitive.go       # Event-driven cognitive processing (consolidation, episodes, reflection)
@@ -230,11 +291,23 @@ sokratos/
   googleauth/          # OAuth2 helpers for Gmail/Calendar via Telegram
   grammar/             # GBNF grammar builder from tool schemas
   prompts/             # Embedded prompt templates (//go:embed)
-  skills/              # User-created JavaScript tools (auto-loaded on startup)
+  skills/              # JavaScript tools (auto-loaded on startup)
+    <name>/SKILL.md    # Frontmatter manifest (name, description, parameters)
+    <name>/scripts/handler.js  # Skill source code
+    <name>/config.toml # Optional TOML config (injected as skill_config)
+  routines.toml        # Routine definitions (synced bidirectionally with DB)
   timeouts/            # Shared timeout constants (DB, embedding, synthesis, save)
+  timefmt/             # Centralized time formatting constants and helpers
   models/              # GGUF model files and start.sh
   docker/              # Docker Compose for PostgreSQL + SearXNG
 ```
+
+## Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/bootstrap` | Generate initial identity profile from conversation context |
+| `/reload` | Force re-sync routines and skills from TOML files to database |
 
 ## Development
 

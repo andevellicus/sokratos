@@ -1,0 +1,2 @@
+sources = ["arstechnica.com", "apnews.com", "reuters.com"]
+topics = ["AI research", "World news"]

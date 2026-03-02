@@ -1,3 +1,0 @@
-interval: 4 hours
----
-Check upcoming calendar events using check_calendar. Alert about any events today or tomorrow.

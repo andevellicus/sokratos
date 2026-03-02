@@ -17,7 +17,6 @@ const (
 	TimeoutSubagent     = 30 * time.Second
 	TimeoutSubagentCall = 10 * time.Second
 	TimeoutGatekeeper   = 30 * time.Second
-	TimeoutText2SQL     = 2 * time.Minute
 	TimeoutDistillation = timeouts.Distillation
 
 	// --- Memory & Triage ---
@@ -33,9 +32,10 @@ const (
 	// --- Tasks & Skills ---
 	TimeoutTaskExtraction = 15 * time.Second
 	TimeoutSkillExec      = 30 * time.Second
+	TimeoutSkillKV        = 5 * time.Second
 
 	// --- Bootstrap ---
-	TimeoutBootstrapProfile = 3 * time.Minute
+	TimeoutBootstrapProfile = 5 * time.Minute
 
 	// --- Consolidation ---
 	TimeoutConsolidationDefault = 10 * time.Minute

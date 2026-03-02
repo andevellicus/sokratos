@@ -10,21 +10,22 @@ import (
 
 // DeepThinkerClient owns the shared HTTP client, URL, and model for all
 // deep-thinker interactions (triage, consolidation, consult). A semaphore
-// limits concurrency to 1, matching Z1's single 32K slot.
+// limits concurrency to 1, matching the DTC server's single 32K slot.
 type DeepThinkerClient struct {
 	baseClient
 	sem chan struct{}
 }
 
-// NewDeepThinkerClient returns a ready-to-use client with a shared 120s HTTP
-// transport and a concurrency semaphore of 1 (Z1 runs --parallel 1 with full
-// 32K context for heavy reasoning; subagent overflow queues behind DTC).
+// NewDeepThinkerClient returns a ready-to-use client with the HTTP safety-net
+// timeout and a concurrency semaphore of 1 (Qwen3.5-27B runs --parallel 1 with
+// full 32K context for heavy reasoning; subagent overflow queues behind DTC).
+// Per-call timeouts are controlled via context deadlines, not the HTTP client.
 func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 	return &DeepThinkerClient{
 		baseClient: baseClient{
 			URL:    url,
 			Model:  model,
-			client: httputil.NewClient(TimeoutDeepThinker),
+			client: httputil.NewClient(TimeoutHTTPSafetyNet),
 			cb:     newCircuitBreaker("dtc"),
 			logTag: "[dtc]",
 		},
@@ -32,37 +33,27 @@ func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 	}
 }
 
-// triageResult is the structured output from a triage call.
-type triageResult struct {
-	SalienceScore float64  `json:"salience_score"`
-	Summary       string   `json:"summary"`
-	Category      string   `json:"category"`
-	Tags          []string `json:"tags"`
-	Save          *bool    `json:"save,omitempty"`
-	ParadigmShift bool     `json:"paradigm_shift,omitempty"`
-}
-
-// Complete sends a system+user message pair to the deep thinker and returns the
-// raw content string. It is the low-level building block for ConsultDeepThinker
-// and episode/reflection synthesis. Thinking is enabled (default).
+// Complete sends a system+user message pair to the deep thinker with thinking
+// enabled. Qwen3.5-27B's Jinja template uses chat_template_kwargs to control
+// thinking; reasoning_format "deepseek" makes llama-server split <think> blocks
+// into reasoning_content, keeping the content field clean.
 func (d *DeepThinkerClient) Complete(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error) {
-	return d.complete(ctx, systemPrompt, userContent, maxTokens, nil)
+	return d.complete(ctx, systemPrompt, userContent, maxTokens, true)
 }
 
-// CompleteNoThink is like Complete but explicitly disables chain-of-thought
-// reasoning. WARNING: GLM-Z1 ignores think:false and still produces reasoning,
-// but llama-server routes everything to reasoning_content (leaving content
-// empty). The doRequest fallback then returns the full reasoning+output mixed
-// together, breaking JSON extraction. Prefer Complete for Z1 — it properly
-// separates reasoning from content.
+// CompleteNoThink is like Complete but disables chain-of-thought reasoning via
+// chat_template_kwargs {"enable_thinking": false}. Qwen3.5-27B produces clean
+// output with zero reasoning tokens, making this the preferred path for
+// structured output tasks (consolidation JSON, plan decomposition, etc.).
 func (d *DeepThinkerClient) CompleteNoThink(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error) {
-	return d.complete(ctx, systemPrompt, userContent, maxTokens, thinkFalse)
+	return d.complete(ctx, systemPrompt, userContent, maxTokens, false)
 }
 
 // complete is the internal implementation shared by Complete and CompleteNoThink.
-// When think is non-nil, it is sent as the "think" parameter to llama-server.
-// Sends a lightweight probe to verify the model is responding before the real request.
-func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userContent string, maxTokens int, think *bool) (string, error) {
+// enableThinking controls Qwen3.5's Jinja template via chat_template_kwargs.
+// reasoning_format "deepseek" is always set so llama-server correctly separates
+// any <think> output from the content field.
+func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userContent string, maxTokens int, enableThinking bool) (string, error) {
 	if err := d.cb.check(); err != nil {
 		return "", err
 	}
@@ -80,15 +71,18 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 		return "", fmt.Errorf("model not available: %w", err)
 	}
 
-	payload := dtcRequest{
+	payload := chatRequest{
 		Model: d.Model,
-		Messages: []dtcMessage{
+		Messages: []chatMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userContent},
 		},
-		Temperature: 0.1,
-		MaxTokens:   maxTokens,
-		Think:       think,
+		Temperature:     0.1,
+		MaxTokens:       maxTokens,
+		ReasoningFormat: "deepseek",
+		ChatTemplateKwargs: map[string]any{
+			"enable_thinking": enableThinking,
+		},
 	}
 
 	body, err := json.Marshal(payload)

@@ -43,9 +43,12 @@ func (e *Engine) heartbeatPrefetch(ctx context.Context) *llm.Message {
 
 // dueRoutine represents a single routine row that's due for execution.
 type dueRoutine struct {
-	ID          int
-	Name        string
-	Instruction string
+	ID            int
+	Name          string
+	Instruction   string
+	Tool          *string // if set, call this tool directly
+	Goal          *string // what to do with tool results
+	SilentIfEmpty bool    // skip orchestrator if tool returns empty
 }
 
 // heartbeatTask represents a pending task for heartbeat context assembly.
@@ -53,12 +56,6 @@ type heartbeatTask struct {
 	ID          int64
 	Description string
 	DueAt       *time.Time
-}
-
-// heartbeatMemory represents a recent salient memory for heartbeat context.
-type heartbeatMemory struct {
-	Summary   string
-	CreatedAt time.Time
 }
 
 // backgroundTask represents a background plan_and_execute task for heartbeat context.
@@ -77,8 +74,8 @@ type heartbeatContext struct {
 	currentObjective string // from e.SM.GetState().CurrentTask
 	userLastActive   string // RFC3339 timestamp of last user message
 	tasks            []heartbeatTask
-	memories         []heartbeatMemory
 	backgroundTasks  []backgroundTask
+	recentActions    []actionRecord
 }
 
 // heartbeatTick handles a single heartbeat using a two-phase approach:
@@ -158,9 +155,10 @@ func (e *Engine) heartbeatTick() {
 	logger.Log.Infof("heartbeat: tick complete, routines_fired=%d", routinesFired)
 }
 
-// gatherHeartbeatContext queries Postgres for pending tasks and recent salient
-// memories. Each query uses a 5-second timeout. On any query failure the
-// affected section is left empty — the orchestrator still runs with partial context.
+// gatherHeartbeatContext queries Postgres for pending tasks and background tasks.
+// Recent salient memories are provided by <temporal_context> in the system prompt.
+// Each query uses a 5-second timeout. On any query failure the affected section
+// is left empty — the orchestrator still runs with partial context.
 func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	hc := heartbeatContext{
 		currentTime:      timefmt.Now(),
@@ -169,6 +167,8 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	if la := e.SM.LastUserActivity(); !la.IsZero() {
 		hc.userLastActive = la.Format(time.RFC3339)
 	}
+
+	hc.recentActions = e.recentActions
 
 	if e.DB == nil {
 		return hc
@@ -198,31 +198,10 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 		taskRows.Close()
 	}
 
-	// Query 2: Recent salient memories (exclude backfill — those are historical
-	// content ingested now, not things that actually happened recently).
-	memRows, err := e.DB.Query(queryCtx,
-		`SELECT summary, created_at
-		 FROM memories
-		 WHERE created_at >= NOW() - INTERVAL '48 hours'
-		   AND salience >= 7
-		   AND COALESCE(source, '') != 'backfill'
-		 ORDER BY created_at DESC
-		 LIMIT 3`)
-	if err != nil {
-		logger.Log.Warnf("heartbeat: failed to query recent memories: %v", err)
-	} else {
-		for memRows.Next() {
-			var m heartbeatMemory
-			if err := memRows.Scan(&m.Summary, &m.CreatedAt); err != nil {
-				logger.Log.Warnf("heartbeat: failed to scan memory row: %v", err)
-				continue
-			}
-			hc.memories = append(hc.memories, m)
-		}
-		memRows.Close()
-	}
-
-	// Query 3: Background tasks (running + recently completed within 1h).
+	// Query 2: Background tasks (running + recently completed within 1h).
+	// Note: recent salient memories are provided by <temporal_context> in the
+	// system prompt (7-day window, salience≥6, up to 8 items) — no need to
+	// duplicate them here.
 	bgRows, err := e.DB.Query(queryCtx,
 		`SELECT id, directive, status, COALESCE(priority, 5), steps_total, steps_completed, error_message
 		 FROM background_tasks
@@ -272,18 +251,6 @@ func (hc heartbeatContext) toXML() string {
 	}
 	fmt.Fprintf(&b, "  <user_last_active>%s</user_last_active>\n", lastActive)
 
-	// Recent salient memories.
-	if len(hc.memories) == 0 {
-		b.WriteString("  <recent_salient_memories>none</recent_salient_memories>\n")
-	} else {
-		b.WriteString("  <recent_salient_memories>\n")
-		for _, m := range hc.memories {
-			fmt.Fprintf(&b, "    <memory recorded=\"%s\">%s</memory>\n",
-				m.CreatedAt.Format(time.RFC3339), m.Summary)
-		}
-		b.WriteString("  </recent_salient_memories>\n")
-	}
-
 	// Pending tasks.
 	if len(hc.tasks) == 0 {
 		b.WriteString("  <pending_tasks>none</pending_tasks>\n")
@@ -318,6 +285,18 @@ func (hc heartbeatContext) toXML() string {
 				bt.ID, bt.Status, bt.Priority, bt.Progress, errAttr, dir)
 		}
 		b.WriteString("  </background_tasks>\n")
+	}
+
+	// Recent actions taken by this engine.
+	if len(hc.recentActions) == 0 {
+		b.WriteString("  <recent_actions>none</recent_actions>\n")
+	} else {
+		b.WriteString("  <recent_actions>\n")
+		for _, a := range hc.recentActions {
+			fmt.Fprintf(&b, "    <action type=%q time=%q>%s</action>\n",
+				a.Type, a.Time.Format(time.RFC3339), a.Summary)
+		}
+		b.WriteString("  </recent_actions>\n")
 	}
 
 	b.WriteString("</heartbeat_context>")

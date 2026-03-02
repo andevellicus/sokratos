@@ -14,10 +14,16 @@ import (
 // actual relevance. Uses a ~30-day half-life: pow(0.977, days_since_last_access).
 // Should be called periodically (e.g. on each consolidation tick).
 func MaterializeDecay(ctx context.Context, db *pgxpool.Pool) (int64, error) {
+	// Unretrieved memories (retrieval_count=0, age>14d) decay at ~15-day half-life
+	// (0.954/day). All others decay at the standard ~30-day half-life (0.977/day).
 	tag, err := db.Exec(ctx,
 		`UPDATE memories
-		 SET salience = GREATEST(salience * pow(0.977,
-		     EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed, created_at))) / 86400), 0),
+		 SET salience = GREATEST(salience *
+		     CASE WHEN COALESCE(retrieval_count, 0) = 0
+		               AND EXTRACT(EPOCH FROM (now() - created_at)) / 86400 > 14
+		          THEN pow(0.954, EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed, created_at))) / 86400)
+		          ELSE pow(0.977, EXTRACT(EPOCH FROM (now() - COALESCE(last_accessed, created_at))) / 86400)
+		     END, 0),
 		     last_accessed = now()
 		 WHERE last_accessed < now() - INTERVAL '1 day'
 		   AND salience > 0`,

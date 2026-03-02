@@ -21,7 +21,7 @@ You are a conversation memory triage assistant. Analyze the following user-assis
 4. Categorize the conversation topic (e.g., "personal", "work", "technical", "social", "health", "finance", "travel", "hobby").
 5. Assign 1-3 relevant tags for memory retrieval.
 6. Decide whether this exchange is worth saving to long-term memory (`save`: true if it contains new information worth retaining, false otherwise).
-7. Detect paradigm shifts: Set `paradigm_shift` to true ONLY for life-altering events that fundamentally change the user's context — new job, marriage, divorce, moving cities, death in family, major health diagnosis, new child, retirement. These are events where older memories need re-interpretation. For everything else, set `paradigm_shift` to false.
+7. Detect paradigm shifts: Set `paradigm_shift` to true ONLY for life-altering events that fundamentally change the user's context — new job, marriage, divorce, moving cities, death in family, major health diagnosis, new child, retirement, engagement. These are events where older memories need re-interpretation. A conversation covering multiple routine work topics is NOT a paradigm shift even if individually notable. paradigm_shift requires ONE pivotal moment, not a collection of updates. For everything else, set `paradigm_shift` to false.
 
 ## Output Format
 

@@ -29,9 +29,21 @@ type searchMemoryArgs struct {
 	MemoryType string   `json:"memory_type,omitempty"`
 }
 
-const rewriteSystemPrompt = "You are a search query optimizer. Output exactly 3 concise, factual reformulations of the input query that are likely to match relevant documents in a semantic vector space. Output ONLY the 3 variations, one per line, no numbering, no preamble."
+const rewriteSystemPrompt = `You are a search query optimizer for a personal memory database. Given the user's query, output exactly 3 alternative search queries that would help retrieve relevant memories.
 
-const rerankSystemPrompt = "You are a search result re-ranker. Given a query and a numbered list of memory summaries, output the numbers of the most relevant results in order of relevance, one per line. Only include results that are genuinely relevant to the query. Output ONLY the numbers, one per line, no explanation."
+Rules:
+- Preserve the specific people, places, topics, and timeframes mentioned in the original query.
+- Vary the phrasing and word choice to maximize semantic coverage (synonyms, related terms).
+- Keep each query concise (under 15 words).
+- Output ONLY the 3 queries, one per line. No numbering, no preamble, no explanation.`
+
+const rerankSystemPrompt = `You are a search result re-ranker. Given a query and a numbered list of memory summaries, output the numbers of the most relevant results in order of relevance.
+
+Rules:
+- Only include results that DIRECTLY relate to the query topic.
+- Be selective: return at most 5-6 results. Most queries should return 3-5.
+- Exclude results about unrelated personal topics unless the query asks about them.
+- Output ONLY the numbers, one per line, no explanation.`
 
 // perEmbeddingLimit is the number of results to retrieve per embedding query.
 const perEmbeddingLimit = 5

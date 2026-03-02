@@ -70,14 +70,31 @@ type Engine struct {
 	GrammarFunc         memory.GrammarSubagentFunc // for grammar-constrained quality scoring (nil = skip enrichment)
 	BgGrammarFunc       memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
 	QueueFunc           memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
-	SyncFunc            func()               // hot-reload skills + routines from disk (called each heartbeat tick)
-	OnFirstTick         func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
+	SyncFunc             func()               // hot-reload skills + routines from disk (called each heartbeat tick)
+	ReflectionNotifyFunc func(summary string) // inject reflection insights into conversation context (nil = skip)
+	OnFirstTick          func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
 
 	// Internal timers (not configured externally).
 	lastCognitiveRun   time.Time
 	lastMaintenanceRun time.Time
 	lastCuriosityRun   time.Time
 	lastHeartbeatHash  [32]byte // SHA-256 of last proactive heartbeat reply (dedup guard)
+	recentActions      []actionRecord // last ≤5 actions taken (routines + heartbeat); no mutex — sequential callers only
+}
+
+// actionRecord captures a single action taken during a heartbeat tick.
+type actionRecord struct {
+	Time    time.Time
+	Type    string // "routine" or "heartbeat"
+	Summary string
+}
+
+// recordAction appends an action to the recent history, capping at 5 entries.
+func (e *Engine) recordAction(typ, summary string) {
+	e.recentActions = append(e.recentActions, actionRecord{Time: time.Now(), Type: typ, Summary: summary})
+	if len(e.recentActions) > 5 {
+		e.recentActions = e.recentActions[len(e.recentActions)-5:]
+	}
 }
 
 // withOrchestratorLock runs fn while holding the orchestrator mutex.
@@ -157,7 +174,7 @@ func (e *Engine) Run() {
 		e.heartbeatTick()
 
 		// Run deferred startup work (e.g. consolidation) after the first
-		// heartbeat completes, so Z1 is available for interactive requests
+		// heartbeat completes, so DTC is available for interactive requests
 		// during startup instead of being blocked by consolidation.
 		if firstTick && e.OnFirstTick != nil {
 			go e.OnFirstTick()

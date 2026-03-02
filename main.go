@@ -164,14 +164,12 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		subagentURL = cfg.DeepThinkerURL
 	}
 	if subagentURL != "" && cfg.SubagentModel != "" {
-		subagent = tools.NewSubagentClientNamed("subagent-flash", subagentURL, cfg.SubagentModel, cfg.SubagentSlots)
+		subagent = tools.NewSubagentClientNamed("subagent-gemma3", subagentURL, cfg.SubagentModel, cfg.SubagentSlots)
 
-		// Flash-only: Z1 is dedicated to DTC (consolidation, synthesis,
-		// consulting). Overflow to Z1 caused contention — its single slot
-		// would get starved by lightweight subagent calls queuing behind
-		// heavy DTC work, triggering cascading timeouts and circuit breaker
-		// trips. Flash handles all subagent work; TryComplete skips
-		// gracefully when slots are full.
+		// Gemma3-only: Qwen3.5-27B is dedicated to DTC (consolidation,
+		// synthesis, consulting). Gemma3-4B handles all subagent
+		// work — triage, rewriting, re-ranking, tool calling. TryComplete
+		// skips gracefully when slots are full.
 		subagentFunc = func(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
 			return subagent.Complete(ctx, systemPrompt, userPrompt, 1024)
 		}
@@ -187,7 +185,7 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		queueFunc = func(req memory.WorkRequest) {
 			subagent.QueueWork(req)
 		}
-		logger.Log.Info("[startup] subagent: flash-only (Z1 dedicated to DTC)")
+		logger.Log.Info("[startup] subagent: gemma3-only (Qwen3.5-27B dedicated to DTC)")
 	}
 
 	// OAuth via Telegram.
@@ -376,7 +374,7 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 	}
 
 	// Defer initial consolidation until after the first heartbeat tick so
-	// Z1 is available for interactive requests during startup.
+	// Qwen3.5-27B is available for interactive requests during startup.
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
 		capturedDTC := svc.DTC
 		eng.OnFirstTick = func() {
@@ -407,11 +405,11 @@ func runStartupTasks(cfg *config.AppConfig) {
 		cancel()
 	}
 
-	// Ensure default routines exist (idempotent, ON CONFLICT DO NOTHING).
-	seedDefaultRoutines()
+	// Sync routines from TOML file → DB (TOML is source of truth).
+	SyncRoutinesFromFile("routines.toml")
 
 	// Cleanup and initial consolidation are now deferred to OnFirstTick in
-	// the engine, so Z1 is free for interactive requests during startup.
+	// the engine, so Qwen3.5-27B is free for interactive requests during startup.
 }
 
 // --- Main ---
@@ -458,6 +456,15 @@ func main() {
 
 	eng := initEngine(cfg, svc, lb, registry, fallbacks)
 
+	// Wire paradigm shift fast-path: after a paradigm shift is detected in
+	// triage, run mini-consolidation then refresh the engine's profile state.
+	if emailTriageCfg != nil {
+		emailTriageCfg.ProfileRefreshFunc = func() {
+			eng.RefreshProfile()
+			eng.RefreshPersonality()
+		}
+	}
+
 	// Background task runner (needs engine.SendFunc).
 	var bgRunner *tools.BackgroundTaskRunner
 	if db.Pool != nil {
@@ -468,22 +475,6 @@ func main() {
 
 	// Register tools that need the engine for refresh callbacks.
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
-		bootstrapSend := func(msg string) {
-			for id := range cfg.AllowedIDs {
-				m := tgbotapi.NewMessage(id, msg)
-				svc.Bot.Send(m)
-			}
-		}
-		registry.Register("bootstrap_profile", tools.NewBootstrapProfile(
-			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
-			cfg.AgentName, bootstrapSend, func() {
-				eng.RefreshProfile()
-				eng.RefreshPersonality()
-			},
-		), tools.ToolSchema{
-			Name:        "bootstrap_profile",
-			Description: "Generate initial identity profile via deep thinker (async)",
-		})
 		registry.Register("consolidate_memory", tools.NewConsolidateMemory(
 			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
 			cfg.ConsolidationMemoryLimit, svc.GrammarFunc, func() {
@@ -545,16 +536,24 @@ func main() {
 	}
 
 	tools.AllowedInternalHosts = collectInternalHosts(cfg)
-	registerSkillTools(registry, "skills", rebuildGrammar)
+	registerSkillTools(registry, "skills", rebuildGrammar, db.Pool)
 	registerPlanTools(registry, svc.DTC, svc.Subagent, delegateConfig, bgRunner)
 	rebuildGrammar() // include disk-loaded skills + plan tools in grammar
 
 	// Wire hot-reload: sync skills + routines from disk on each heartbeat.
 	skillMtimes := map[string]time.Time{}
-	routineMtimes := map[string]time.Time{}
+	var routineMtime time.Time
 	eng.SyncFunc = func() {
-		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes)
-		syncRoutineFiles("routines", routineMtimes)
+		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, db.Pool)
+		syncRoutinesFile("routines.toml", &routineMtime)
+	}
+
+	// Wire reflection routing: inject reflection insights into conversation context.
+	eng.ReflectionNotifyFunc = func(summary string) {
+		svc.StateMgr.AppendMessage(llm.Message{
+			Role:    "user",
+			Content: "[REFLECTION] A pattern was identified from recent memories:\n" + summary + "\nUse this if relevant to future interactions.",
+		})
 	}
 
 	// Wire curiosity function for proactive research during cognitive lulls.
@@ -645,14 +644,52 @@ func main() {
 		chatID := msg.Chat.ID
 
 		// Direct-dispatch slash commands — bypass the orchestrator entirely.
-		if strings.TrimSpace(msgText) == "/bootstrap" {
-			toolJSON := []byte(`{"name":"bootstrap_profile","arguments":{}}`)
-			result, err := registry.Execute(context.Background(), toolJSON)
-			text := result
-			if err != nil {
-				text = "Bootstrap failed — check the logs for details."
+		if strings.TrimSpace(msgText) == "/reload" {
+			// Force re-sync all TOML configs from disk → DB.
+			added, updated, deleted := SyncRoutinesFromFile("routines.toml")
+			skillsChanged := tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, db.Pool)
+			var parts []string
+			if len(added)+len(updated)+len(deleted) > 0 {
+				parts = append(parts, fmt.Sprintf("Routines: +%d ~%d -%d", len(added), len(updated), len(deleted)))
+			}
+			if skillsChanged {
+				parts = append(parts, "Skills: reloaded")
+			}
+			text := "Everything up to date."
+			if len(parts) > 0 {
+				text = "Reloaded: " + strings.Join(parts, ", ")
 			}
 			reply := tgbotapi.NewMessage(chatID, text)
+			reply.ReplyToMessageID = msg.MessageID
+			svc.Bot.Send(reply)
+			continue
+		}
+		if strings.TrimSpace(msgText) == "/bootstrap" {
+			if db.Pool == nil || svc.DTC == nil || cfg.EmbedURL == "" {
+				reply := tgbotapi.NewMessage(chatID, "Bootstrap requires database, deep thinker, and embedding service.")
+				reply.ReplyToMessageID = msg.MessageID
+				svc.Bot.Send(reply)
+				continue
+			}
+			bootstrapSend := func(text string) {
+				for id := range cfg.AllowedIDs {
+					m := tgbotapi.NewMessage(id, text)
+					svc.Bot.Send(m)
+				}
+			}
+			go tools.RunBootstrap(tools.BootstrapConfig{
+				Pool:          db.Pool,
+				DTC:           svc.DTC,
+				EmbedEndpoint: cfg.EmbedURL,
+				EmbedModel:    cfg.EmbedModel,
+				AgentName:     cfg.AgentName,
+				SendFunc:      bootstrapSend,
+				OnProfile: func() {
+					eng.RefreshProfile()
+					eng.RefreshPersonality()
+				},
+			})
+			reply := tgbotapi.NewMessage(chatID, "Profile generation started in the background. I'll notify you when it's ready.")
 			reply.ReplyToMessageID = msg.MessageID
 			svc.Bot.Send(reply)
 			continue

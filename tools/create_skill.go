@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"sokratos/logger"
 )
 
@@ -20,7 +22,7 @@ var skillNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{1,48}$`)
 
 // NewCreateSkill returns a ToolFunc that creates a new JavaScript skill on
 // disk, registers it in the live registry, and rebuilds the grammar.
-func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc) ToolFunc {
+func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, pool *pgxpool.Pool) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
 			Name        string          `json:"name"`
@@ -88,7 +90,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			return "Invalid JSON in test_args", nil
 		}
 
-		testResult, err := ExecuteSkill(ctx, a.Name, a.Code, "", testArgsRaw)
+		testResult, err := ExecuteSkill(ctx, a.Name, a.Code, "", testArgsRaw, pool)
 		if err != nil {
 			return fmt.Sprintf("Skill failed test execution: %v", err), nil
 		}
@@ -123,7 +125,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			Params: params,
 			Source: a.Code,
 		}
-		RegisterSkill(registry, skill)
+		RegisterSkill(registry, skill, pool)
 
 		// Rebuild grammar so the subagent can produce valid JSON for this tool.
 		rebuildGrammar()
