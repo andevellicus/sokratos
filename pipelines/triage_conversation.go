@@ -1,4 +1,4 @@
-package tools
+package pipelines
 
 import (
 	"context"
@@ -10,10 +10,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 
+	"sokratos/clients"
+	"sokratos/gmail"
 	"sokratos/logger"
-	"sokratos/textutil"
 	"sokratos/memory"
 	"sokratos/prompts"
+	"sokratos/textutil"
 )
 
 // triageResult is the structured output from a triage call.
@@ -26,10 +28,10 @@ type triageResult struct {
 	ParadigmShift bool     `json:"paradigm_shift,omitempty"`
 }
 
-// TriageViaDTC sends content to the deep thinker (Qwen3.5-27B, no thinking)
+// triageViaDTC sends content to the deep thinker (Qwen3.5-27B, no thinking)
 // with a GBNF grammar constraint and parses the result into a triageResult.
 // Falls back to safe defaults on parse failure.
-func TriageViaDTC(ctx context.Context, dtc *DeepThinkerClient, triageGrammar, systemPrompt, content string, maxLen int) (*triageResult, error) {
+func triageViaDTC(ctx context.Context, dtc *clients.DeepThinkerClient, triageGrammar, systemPrompt, content string, maxLen int) (*triageResult, error) {
 	if len(content) > maxLen {
 		content = textutil.Truncate(content, maxLen)
 	}
@@ -103,7 +105,7 @@ type TriageConfig struct {
 	Pool               *pgxpool.Pool
 	EmbedEndpoint      string
 	EmbedModel         string
-	DTC                *DeepThinkerClient
+	DTC                *clients.DeepThinkerClient
 	QueueFn            memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
 	BgGrammarFn        memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
 	TriageGrammar      string
@@ -150,7 +152,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 				`SELECT COUNT(*) FROM memories
 				 WHERE superseded_by IS NULL
 				   AND (embedding <=> $1) < 0.3
-				   AND memory_type NOT IN ('identity', 'reflection')`,
+				   AND memory_type NOT IN (`+memory.FormatSQLExclusion(memory.ExcludeInternal)+`)`,
 				pgvector.NewVector(emb),
 			).Scan(&count)
 			if count >= 3 {
@@ -159,7 +161,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		}
 	}
 
-	result, err := TriageViaDTC(ctx, cfg.DTC, cfg.TriageGrammar, req.TriagePrompt, triageInput, req.MaxTriageLen)
+	result, err := triageViaDTC(ctx, cfg.DTC, cfg.TriageGrammar, req.TriagePrompt, triageInput, req.MaxTriageLen)
 	if err != nil {
 		return err
 	}
@@ -169,11 +171,12 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		return nil
 	}
 
-	// Store summary first (dominates the embedding model's 512-token window)
-	// followed by the full source for internal analysis (contradiction detection,
-	// consolidation). A 2000-char safety cap prevents copy-paste bombs.
-	sourceContent := textutil.Truncate(req.SourceContent, 2000)
-	text := fmt.Sprintf("%s\n\n%s:\n%s", result.Summary, req.SourceLabel, sourceContent)
+	// Store only the triage summary as the memory text. The source exchange
+	// is intentionally excluded: the embedding model's 512-token window is
+	// better served by a clean summary, and appending raw exchanges caused
+	// junk chunk-2 fragments and assistant-generated content leaking into
+	// memory. Contradiction detection already strips source exchanges.
+	text := result.Summary
 	tags := append([]string{req.DomainTag}, result.Tags...)
 
 	memReq := memory.MemoryWriteRequest{
@@ -192,7 +195,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 			return nil // save failed but triage succeeded — don't retry
 		}
 	} else {
-		memory.SaveToMemoryWithSalienceAsync(cfg.Pool, memReq, nil)
+		memory.SaveToMemoryWithSalienceAsync(cfg.Pool, memReq, nil, cfg.QueueFn)
 	}
 
 	logger.Log.Infof("[triage:%s] saved (score=%.0f, category=%s, tags=%v): %s",
@@ -268,6 +271,42 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 			logger.Log.Warnf("[conversation_triage] triage failed: %v", err)
 			if cfg.RetryQueue != nil {
 				EnqueueConversationTriage(cfg.RetryQueue, cfg, triageInput, exchange, toolsUsed)
+			}
+		}
+	}()
+}
+
+// TriageAndSaveEmailAsync sends an email for triage scoring, then saves it to
+// memory if it meets the salience threshold. Runs as a fire-and-forget goroutine.
+func TriageAndSaveEmailAsync(cfg TriageConfig, email gmail.Email) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
+		defer cancel()
+
+		formatted := gmail.FormatEmailSummary(email)
+		sourceDate := email.Date
+
+		err := triageAndSave(ctx, cfg, TriageSaveRequest{
+			TriagePrompt:  strings.TrimSpace(prompts.EmailTriage),
+			TriageInput:   formatted,
+			SourceContent: formatted,
+			SourceLabel:   "Source email",
+			DomainTag:     "email",
+			MemoryType:    "email",
+			Source:        "email",
+			SourceDate:    &sourceDate,
+			MaxTriageLen:  8000,
+			ShouldSave: func(r *triageResult) bool {
+				if r.Save != nil && !*r.Save {
+					return false
+				}
+				return r.SalienceScore >= 1
+			},
+		})
+		if err != nil {
+			logger.Log.Warnf("[email_triage] failed: %v", err)
+			if cfg.RetryQueue != nil {
+				EnqueueEmailTriage(cfg.RetryQueue, cfg, formatted, formatted)
 			}
 		}
 	}()

@@ -10,10 +10,6 @@ const (
 	Distillation = 120 * time.Second
 	MemorySave   = 30 * time.Second
 
-	// PersonalityMigration is the timeout for the one-time personality trait
-	// migration from monolithic profile on startup.
-	PersonalityMigration = 30 * time.Second
-
 	// RoutineDB is the timeout for routine-related database operations
 	// (seeding defaults, hot-reload upserts).
 	RoutineDB = 10 * time.Second

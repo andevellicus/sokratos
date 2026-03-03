@@ -1,11 +1,15 @@
-package tools
+package clients
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"sokratos/httputil"
+	"sokratos/logger"
+	"sokratos/memory"
+	"sokratos/timeouts"
 )
 
 // DeepThinkerClient owns the shared HTTP client, URL, and model for all
@@ -13,7 +17,8 @@ import (
 // limits concurrency to 1, matching the DTC server's single 32K slot.
 type DeepThinkerClient struct {
 	baseClient
-	sem chan struct{}
+	sem    chan struct{}
+	workCh chan memory.WorkRequest
 }
 
 // NewDeepThinkerClient returns a ready-to-use client with the HTTP safety-net
@@ -21,15 +26,66 @@ type DeepThinkerClient struct {
 // full 32K context for heavy reasoning; subagent overflow queues behind DTC).
 // Per-call timeouts are controlled via context deadlines, not the HTTP client.
 func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
-	return &DeepThinkerClient{
+	d := &DeepThinkerClient{
 		baseClient: baseClient{
 			URL:    url,
 			Model:  model,
-			client: httputil.NewClient(TimeoutHTTPSafetyNet),
+			client: httputil.NewClient(timeouts.HTTPSafetyNet),
 			cb:     newCircuitBreaker("dtc"),
 			logTag: "[dtc]",
 		},
-		sem: make(chan struct{}, 1),
+		sem:    make(chan struct{}, 1),
+		workCh: make(chan memory.WorkRequest, 16),
+	}
+	go d.processWorkQueue()
+	return d
+}
+
+// QueueWork submits a background task to the DTC work queue. Items are
+// processed sequentially (single slot). Each item gets a fresh context with
+// item.Timeout, so queue wait time doesn't eat into inference time.
+func (d *DeepThinkerClient) QueueWork(item memory.WorkRequest) {
+	select {
+	case d.workCh <- item:
+		logger.Log.Debugf("%s queued: %s (depth=%d/%d)", d.logTag, item.Label, len(d.workCh), cap(d.workCh))
+	default:
+		logger.Log.Warnf("%s %s dropped: queue full (%d/%d)", d.logTag, item.Label, len(d.workCh), cap(d.workCh))
+		if item.OnComplete != nil {
+			item.OnComplete("", fmt.Errorf("DTC work queue full"))
+		}
+	}
+}
+
+// processWorkQueue drains the DTC work channel sequentially (single slot).
+func (d *DeepThinkerClient) processWorkQueue() {
+	for item := range d.workCh {
+		ctx, cancel := context.WithTimeout(context.Background(), item.Timeout)
+		var result string
+		var err error
+		if item.Grammar != "" {
+			result, err = d.CompleteNoThinkWithGrammar(ctx, item.SystemPrompt, item.UserPrompt, item.Grammar, item.MaxTokens)
+		} else {
+			result, err = d.CompleteNoThink(ctx, item.SystemPrompt, item.UserPrompt, item.MaxTokens)
+		}
+		cancel()
+
+		if err != nil && item.Retries > 0 {
+			item.Retries--
+			backoff := 2 * time.Second
+			logger.Log.Warnf("%s %s failed (%v), retrying in %v (%d left)",
+				d.logTag, item.Label, err, backoff, item.Retries)
+			time.Sleep(backoff)
+			select {
+			case d.workCh <- item:
+				continue
+			default:
+				logger.Log.Warnf("%s %s retry failed: queue full, delivering error", d.logTag, item.Label)
+			}
+		}
+
+		if item.OnComplete != nil {
+			item.OnComplete(result, err)
+		}
 	}
 }
 
@@ -107,4 +163,3 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 	d.cb.recordSuccess()
 	return result, nil
 }
-

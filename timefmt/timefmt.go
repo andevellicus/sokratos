@@ -58,3 +58,28 @@ func ParseISO8601(s string) (time.Time, error) {
 	}
 	return time.Time{}, fmt.Errorf("parsing time %q: unrecognized format", s)
 }
+
+// ParseSchedule validates an "HH:MM" string and returns hour, minute.
+// Used by routine sync, routine management, and schedule evaluation.
+func ParseSchedule(s string) (int, int, error) {
+	if len(s) != 5 || s[2] != ':' {
+		return 0, 0, fmt.Errorf("invalid schedule format %q (expected HH:MM)", s)
+	}
+	h := int(s[0]-'0')*10 + int(s[1]-'0')
+	m := int(s[3]-'0')*10 + int(s[4]-'0')
+	if h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, 0, fmt.Errorf("invalid schedule %q: hour must be 0-23, minute 0-59", s)
+	}
+	return h, m, nil
+}
+
+// ReinterpretAsLocal takes a time and, if it's in UTC, reinterprets the wall
+// clock values as local time. This handles the common case where an LLM
+// appends "Z" to timestamps but actually means local time. If the time already
+// has a non-UTC zone (e.g. "-05:00"), it is returned unchanged.
+func ReinterpretAsLocal(t time.Time) time.Time {
+	if t.Location() != time.UTC {
+		return t
+	}
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.Local)
+}

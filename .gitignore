@@ -3,6 +3,7 @@ models/
 .claude/
 
 .env
+*.toml
 settings.yml
 .credentials/
 CLAUDE.md

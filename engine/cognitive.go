@@ -87,6 +87,9 @@ func (e *Engine) runCognitiveIfTriggered() {
 	// 4. Proactive curiosity.
 	e.runCuriosityIfReady()
 
+	// 4.5. Goal inference.
+	e.runGoalInferenceIfReady()
+
 	// 5. Refresh cached profile and personality.
 	e.RefreshProfile()
 	e.RefreshPersonality()

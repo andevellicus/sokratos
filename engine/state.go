@@ -16,13 +16,13 @@ import (
 	"sokratos/timeouts"
 )
 
-// Task represents a row in the PostgreSQL tasks table.
+// Task represents a scheduled work item (type='scheduled') in the work_items table.
 type Task struct {
-	ID          int64
-	Description string
-	DueAt       *time.Time
-	Recurrence  time.Duration // stored as nanoseconds (BIGINT) in DB
-	Status      string        // "pending", "completed"
+	ID         int64
+	Directive  string
+	DueAt      *time.Time
+	Recurrence time.Duration // stored as nanoseconds (BIGINT) in DB
+	Status     string        // "pending", "completed"
 }
 
 // AgentState represents the in-memory state of the autonomous agent.

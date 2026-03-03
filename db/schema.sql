@@ -69,35 +69,35 @@ ADD COLUMN IF NOT EXISTS summary_tsv tsvector GENERATED ALWAYS AS (
 
 CREATE INDEX IF NOT EXISTS memories_summary_tsv_idx ON memories USING gin (summary_tsv);
 
-CREATE TABLE IF NOT EXISTS tasks (
-    id BIGSERIAL PRIMARY KEY,
-    description TEXT NOT NULL,
-    due_at TIMESTAMPTZ,
-    recurrence BIGINT DEFAULT 0, -- nanoseconds (maps directly to Go time.Duration)
-    status VARCHAR(20) DEFAULT 'pending',
-    created_at TIMESTAMPTZ DEFAULT now()
-);
+-- Legacy tasks table: migrated to work_items on startup (see migrateTasksTable).
+-- CREATE TABLE kept for reference only; new installs use work_items directly.
 
-CREATE INDEX IF NOT EXISTS tasks_pending_due_idx ON tasks (due_at ASC)
-WHERE
-    status = 'pending'
-    AND due_at IS NOT NULL;
-
--- Add a migration to rename the table if it already exists
+-- Legacy migration: rename old table name if it exists.
 ALTER TABLE IF EXISTS directives RENAME TO routines;
 
 CREATE TABLE IF NOT EXISTS routines (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) UNIQUE NOT NULL,
-    interval_duration INTERVAL NOT NULL,
+    interval_duration INTERVAL,          -- nullable: schedule-only routines have no interval
     last_executed TIMESTAMPTZ DEFAULT now(),
-    instruction TEXT NOT NULL
+    instruction TEXT,                     -- nullable: structured routines use tool+goal instead
+    tool VARCHAR(255),                    -- single tool to call directly
+    tools TEXT[],                         -- multi-tool list (takes precedence over tool)
+    tool_args JSONB,                      -- per-tool arguments with template expansion
+    goal TEXT,                            -- what to do with tool results
+    silent_if_empty BOOLEAN DEFAULT false,-- skip orchestrator if tool returns empty
+    schedule TEXT                         -- "HH:MM" or comma-separated "HH:MM,HH:MM" daily schedule
 );
 
--- Structured routine fields: tool to call, goal for orchestrator, silent flag.
+-- Migrations for existing databases (safe to re-run).
 ALTER TABLE routines ADD COLUMN IF NOT EXISTS tool VARCHAR(255);
 ALTER TABLE routines ADD COLUMN IF NOT EXISTS goal TEXT;
 ALTER TABLE routines ADD COLUMN IF NOT EXISTS silent_if_empty BOOLEAN DEFAULT false;
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule TEXT;
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS tools TEXT[];
+ALTER TABLE routines ALTER COLUMN interval_duration DROP NOT NULL;
+ALTER TABLE routines ALTER COLUMN instruction DROP NOT NULL;
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS tool_args JSONB;
 
 CREATE TABLE IF NOT EXISTS user_preferences (
     key VARCHAR(255) PRIMARY KEY,
@@ -123,21 +123,19 @@ CREATE TABLE IF NOT EXISTS processed_emails (
     seen_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS processed_emails_meta (
+    key VARCHAR(64) PRIMARY KEY,
+    checked_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS processed_events (
     event_uid VARCHAR(512) PRIMARY KEY,
     seen_at TIMESTAMPTZ DEFAULT now()
 );
 
-INSERT INTO routines (name, interval_duration, instruction)
-VALUES (
-    'monitor_inbox',
-    '5m',
-    'Use search_email with no arguments to check for new emails. Emails are automatically triaged and saved by the background pipeline — do NOT call save_memory for email content. Only evaluate whether any email requires urgent user notification. Do not message the user unless an email is critically urgent.'
-) ON CONFLICT (name) DO NOTHING;
-
--- Migration: update existing monitor_inbox instruction to remove save_memory directive.
-UPDATE routines SET instruction = 'Use search_email with no arguments to check for new emails. Emails are automatically triaged and saved by the background pipeline — do NOT call save_memory for email content. Only evaluate whether any email requires urgent user notification. Do not message the user unless an email is critically urgent.'
-WHERE name = 'monitor_inbox';
+-- Routine seed data removed: routines.toml is the source of truth.
+-- SyncFromFile() on startup upserts all TOML entries and deletes any DB
+-- routines not present in the file.
 
 CREATE TABLE IF NOT EXISTS conversation_snapshot (
     id INTEGER PRIMARY KEY DEFAULT 1,
@@ -145,22 +143,41 @@ CREATE TABLE IF NOT EXISTS conversation_snapshot (
     updated_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS background_tasks (
+-- Unified work tracking: replaces both tasks and background_tasks tables.
+-- Rename existing background_tasks if upgrading (idempotent: skipped if already renamed).
+ALTER TABLE IF EXISTS background_tasks RENAME TO work_items;
+
+CREATE TABLE IF NOT EXISTS work_items (
     id BIGSERIAL PRIMARY KEY,
+    type VARCHAR(20) NOT NULL DEFAULT 'background', -- 'scheduled', 'background', 'routine'
     directive TEXT NOT NULL,
-    status VARCHAR(20) DEFAULT 'running',
+    status VARCHAR(20) DEFAULT 'pending',            -- pending, running, completed, failed, cancelled
     result TEXT,
     steps_total INT DEFAULT 0,
     steps_completed INT DEFAULT 0,
     error_message TEXT,
     created_at TIMESTAMPTZ DEFAULT now(),
-    completed_at TIMESTAMPTZ
+    completed_at TIMESTAMPTZ,
+    priority INT DEFAULT 5,
+    due_at TIMESTAMPTZ,              -- scheduled tasks: when to fire
+    recurrence BIGINT DEFAULT 0,     -- scheduled tasks: nanoseconds between recurrences
+    started_at TIMESTAMPTZ,          -- when execution began (all types)
+    timeout_at TIMESTAMPTZ           -- watchdog: kill if still running past this time
 );
 
-CREATE INDEX IF NOT EXISTS background_tasks_status_idx
-    ON background_tasks (status) WHERE status = 'running';
+-- Migrations for existing databases (safe to re-run).
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS type VARCHAR(20) NOT NULL DEFAULT 'background';
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS priority INT DEFAULT 5;
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS due_at TIMESTAMPTZ;
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS recurrence BIGINT DEFAULT 0;
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS timeout_at TIMESTAMPTZ;
 
-ALTER TABLE background_tasks ADD COLUMN IF NOT EXISTS priority INT DEFAULT 5;
+CREATE INDEX IF NOT EXISTS work_items_running_idx ON work_items (status) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS work_items_scheduled_idx ON work_items (due_at ASC)
+    WHERE type = 'scheduled' AND status = 'pending' AND due_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS work_items_timeout_idx ON work_items (timeout_at)
+    WHERE status = 'running' AND timeout_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS failed_operations (
     id BIGSERIAL PRIMARY KEY,

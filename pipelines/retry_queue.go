@@ -1,4 +1,4 @@
-package tools
+package pipelines
 
 import (
 	"sync"
@@ -22,10 +22,10 @@ type RetryQueue struct {
 }
 
 type retryItem struct {
-	fn       func() error
-	label    string
-	retries  int
-	addedAt  time.Time
+	fn      func() error
+	label   string
+	retries int
+	addedAt time.Time
 }
 
 // RetryQueueConfig holds configuration for a RetryQueue.

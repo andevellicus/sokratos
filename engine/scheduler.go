@@ -43,7 +43,7 @@ func (e *Engine) runTaskScheduler() {
 			continue
 		}
 
-		logger.Log.Infof("[scheduler] next task %q (#%d) due in %s", task.Description, task.ID, delay)
+		logger.Log.Infof("[scheduler] next task %q (#%d) due in %s", task.Directive, task.ID, delay)
 		timer := time.NewTimer(delay)
 
 		select {
@@ -56,19 +56,19 @@ func (e *Engine) runTaskScheduler() {
 	}
 }
 
-// fetchNextPendingTask returns the earliest pending task with a due_at, or nil
-// if no scheduled tasks are pending.
+// fetchNextPendingTask returns the earliest pending scheduled task with a
+// due_at, or nil if no scheduled tasks are pending.
 func (e *Engine) fetchNextPendingTask() (*Task, error) {
 	row := e.DB.QueryRow(context.Background(),
-		`SELECT id, description, due_at, recurrence, status
-		 FROM tasks
-		 WHERE status = 'pending' AND due_at IS NOT NULL
+		`SELECT id, directive, due_at, recurrence, status
+		 FROM work_items
+		 WHERE type = 'scheduled' AND status = 'pending' AND due_at IS NOT NULL
 		 ORDER BY due_at ASC
 		 LIMIT 1`)
 
 	var t Task
 	var recurrenceNs int64
-	err := row.Scan(&t.ID, &t.Description, &t.DueAt, &recurrenceNs, &t.Status)
+	err := row.Scan(&t.ID, &t.Directive, &t.DueAt, &recurrenceNs, &t.Status)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -86,20 +86,30 @@ func (e *Engine) executeTask(task Task) {
 	// Verify the task is still pending (it may have been completed externally).
 	var status string
 	err := e.DB.QueryRow(context.Background(),
-		`SELECT status FROM tasks WHERE id = $1`, task.ID).Scan(&status)
+		`SELECT status FROM work_items WHERE id = $1`, task.ID).Scan(&status)
 	if err != nil || status != "pending" {
 		logger.Log.Infof("[scheduler] task #%d no longer pending, skipping", task.ID)
 		return
 	}
 
-	logger.Log.Infof("[scheduler] executing task #%d: %s", task.ID, task.Description)
+	logger.Log.Infof("[scheduler] executing task #%d: %s", task.ID, task.Directive)
+
+	// Track via WorkMonitor if available.
+	timeout := e.RoutineTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	var workID int64
+	if e.WorkMonitor != nil {
+		workID = e.WorkMonitor.TrackStart("scheduled", task.Directive, timeout)
+	}
 
 	prompt := fmt.Sprintf(
 		"[SCHEDULED TASK DUE] The following task is now due: %q. "+
 			"Respond directly to the user with a short message fulfilling this task. "+
 			"Do NOT call complete_task, update_state, add_task, or save_memory — the system handles task lifecycle automatically. "+
 			"Current time: %s",
-		task.Description, timefmt.Now(),
+		task.Directive, timefmt.Now(),
 	)
 
 	var reply string
@@ -116,7 +126,7 @@ func (e *Engine) executeTask(task Task) {
 
 	if err != nil {
 		logger.Log.Errorf("[scheduler] task #%d LLM error: %v", task.ID, err)
-		reply = fmt.Sprintf("(Scheduled task %q fired but LLM error occurred: %v)", task.Description, err)
+		reply = fmt.Sprintf("(Scheduled task %q fired but LLM error occurred: %v)", task.Directive, err)
 	}
 
 	if e.SendFunc != nil && reply != "" {
@@ -130,13 +140,19 @@ func (e *Engine) executeTask(task Task) {
 	tx, txErr := e.DB.Begin(txCtx)
 	if txErr != nil {
 		logger.Log.Errorf("[scheduler] failed to begin task completion tx: %v", txErr)
+		if e.WorkMonitor != nil && workID > 0 {
+			e.WorkMonitor.TrackEnd(workID, "failed", txErr.Error())
+		}
 		return
 	}
 	defer tx.Rollback(txCtx)
 
 	if _, txErr = tx.Exec(txCtx,
-		`UPDATE tasks SET status = 'completed' WHERE id = $1`, task.ID); txErr != nil {
+		`UPDATE work_items SET status = 'completed', completed_at = now() WHERE id = $1`, task.ID); txErr != nil {
 		logger.Log.Errorf("[scheduler] failed to mark task #%d completed: %v", task.ID, txErr)
+		if e.WorkMonitor != nil && workID > 0 {
+			e.WorkMonitor.TrackEnd(workID, "failed", txErr.Error())
+		}
 		return
 	}
 
@@ -144,24 +160,36 @@ func (e *Engine) executeTask(task Task) {
 	if task.Recurrence > 0 && task.DueAt != nil {
 		nextDue := task.DueAt.Add(task.Recurrence)
 		if _, txErr = tx.Exec(txCtx,
-			`INSERT INTO tasks (description, due_at, recurrence, status) VALUES ($1, $2, $3, 'pending')`,
-			task.Description, nextDue, int64(task.Recurrence)); txErr != nil {
+			`INSERT INTO work_items (type, directive, due_at, recurrence, status)
+			 VALUES ('scheduled', $1, $2, $3, 'pending')`,
+			task.Directive, nextDue, int64(task.Recurrence)); txErr != nil {
 			logger.Log.Errorf("[scheduler] failed to insert recurring task: %v", txErr)
+			if e.WorkMonitor != nil && workID > 0 {
+				e.WorkMonitor.TrackEnd(workID, "failed", txErr.Error())
+			}
 			return
 		}
-		logger.Log.Infof("[scheduler] recurring task %q rescheduled for %s", task.Description, nextDue.Format(time.RFC3339))
+		logger.Log.Infof("[scheduler] recurring task %q rescheduled for %s", task.Directive, nextDue.Format(time.RFC3339))
 	}
 
 	if txErr = tx.Commit(txCtx); txErr != nil {
 		logger.Log.Errorf("[scheduler] task completion commit failed: %v", txErr)
 	}
+
+	if e.WorkMonitor != nil && workID > 0 {
+		e.WorkMonitor.TrackEnd(workID, "completed", "")
+	}
 }
 
-// FetchPendingTasksMarkdown queries the database for all pending tasks and
-// returns a Markdown-formatted summary suitable for inclusion in prompts.
+// FetchPendingTasksMarkdown queries the database for all pending scheduled
+// tasks and returns a Markdown-formatted summary suitable for inclusion in
+// prompts.
 func FetchPendingTasksMarkdown(ctx context.Context, pool *pgxpool.Pool) string {
 	rows, err := pool.Query(ctx,
-		`SELECT id, description, due_at, recurrence FROM tasks WHERE status = 'pending' ORDER BY due_at ASC NULLS LAST`)
+		`SELECT id, directive, due_at, recurrence
+		 FROM work_items
+		 WHERE type = 'scheduled' AND status = 'pending'
+		 ORDER BY due_at ASC NULLS LAST`)
 	if err != nil {
 		return "**Task Queue:** (error fetching tasks)\n"
 	}
@@ -172,23 +200,23 @@ func FetchPendingTasksMarkdown(ctx context.Context, pool *pgxpool.Pool) string {
 	count := 0
 	for rows.Next() {
 		var id int64
-		var desc string
+		var directive string
 		var dueAt *time.Time
 		var recurrenceNs int64
-		if err := rows.Scan(&id, &desc, &dueAt, &recurrenceNs); err != nil {
+		if err := rows.Scan(&id, &directive, &dueAt, &recurrenceNs); err != nil {
 			continue
 		}
 		recurrence := time.Duration(recurrenceNs)
 		count++
 		switch {
 		case dueAt != nil && recurrence > 0:
-			fmt.Fprintf(&b, "- [%d] %s (due: %s, every %s)\n", id, desc, dueAt.Format(time.RFC3339), recurrence)
+			fmt.Fprintf(&b, "- [%d] %s (due: %s, every %s)\n", id, directive, dueAt.Format(time.RFC3339), recurrence)
 		case dueAt != nil:
-			fmt.Fprintf(&b, "- [%d] %s (due: %s)\n", id, desc, dueAt.Format(time.RFC3339))
+			fmt.Fprintf(&b, "- [%d] %s (due: %s)\n", id, directive, dueAt.Format(time.RFC3339))
 		case recurrence > 0:
-			fmt.Fprintf(&b, "- [%d] %s (every %s)\n", id, desc, recurrence)
+			fmt.Fprintf(&b, "- [%d] %s (every %s)\n", id, directive, recurrence)
 		default:
-			fmt.Fprintf(&b, "- [%d] %s\n", id, desc)
+			fmt.Fprintf(&b, "- [%d] %s\n", id, directive)
 		}
 	}
 	if count == 0 {

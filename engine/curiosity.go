@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"sokratos/logger"
+	"sokratos/memory"
 	"sokratos/textutil"
 	"sokratos/timeouts"
 )
@@ -45,30 +46,17 @@ func (e *Engine) runCuriosityIfReady() {
 	defer cancel()
 	var running int
 	if err := e.DB.QueryRow(ctx,
-		`SELECT COUNT(*) FROM background_tasks
+		`SELECT COUNT(*) FROM work_items
 		 WHERE status = 'running' AND directive LIKE '[curiosity]%'`).Scan(&running); err == nil && running > 0 {
 		logger.Log.Debug("[curiosity] task already running, skipping")
 		return
 	}
 
 	// Query recent memories for signal.
-	rows, err := e.DB.Query(ctx,
-		`SELECT summary FROM memories
-		 WHERE created_at >= NOW() - INTERVAL '48 hours'
-		   AND salience >= 5
-		   AND COALESCE(source, '') != 'backfill'
-		 ORDER BY created_at DESC LIMIT 20`)
+	summaries, err := memory.QueryRecentSummaries(ctx, e.DB, 48, memory.SalienceLow, 20)
 	if err != nil {
 		return
 	}
-	var summaries []string
-	for rows.Next() {
-		var s string
-		if rows.Scan(&s) == nil {
-			summaries = append(summaries, s)
-		}
-	}
-	rows.Close()
 
 	if len(summaries) < curiosityMinMemories {
 		return

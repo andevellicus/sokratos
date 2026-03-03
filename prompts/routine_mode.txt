@@ -4,4 +4,4 @@ Rules:
 - Filter noise: only surface results that are genuinely relevant or actionable.
 - Keep output concise — the user receives this via Telegram.
 - Do not add commentary, offers of help, or follow-up suggestions.
-- If the routine produces nothing noteworthy, do not message the user.
+- If the routine produces nothing noteworthy, respond with exactly: <NO_ACTION_REQUIRED>

@@ -61,8 +61,10 @@ func buildEnrichmentPrompt(summary string, existingSummaries []string) string {
 // ScoreAndWrite embeds and inserts a memory with default quality values, then
 // fires async quality enrichment via the subagent (if available). The memory is
 // immediately available for retrieval; enrichment updates entities, confidence,
-// and salience in the background without blocking the caller.
-func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, grammarFn GrammarSubagentFunc) (int64, error) {
+// and salience in the background without blocking the caller. When queueFn is
+// non-nil, enrichment is submitted to the work queue (with retries) instead of
+// a fire-and-forget goroutine that silently drops on busy.
+func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest, grammarFn GrammarSubagentFunc, queueFn WorkQueueFunc) (int64, error) {
 	memType := req.MemoryType
 	if memType == "" {
 		memType = "general"
@@ -100,8 +102,12 @@ func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest
 		}
 	}
 
-	if grammarFn != nil && len(allIDs) > 0 {
-		go EnrichViaGrammarFn(db, grammarFn, allIDs, req.Summary, req.Salience, nil)
+	if len(allIDs) > 0 {
+		if queueFn != nil {
+			submitEnrichment(queueFn, db, allIDs, req.Summary, req.Salience, nil)
+		} else if grammarFn != nil {
+			go EnrichViaGrammarFn(db, grammarFn, allIDs, req.Summary, req.Salience, nil)
+		}
 	}
 
 	return firstID, nil

@@ -1,17 +1,26 @@
+[morning-briefing]
+schedule = "06:00"
+tools = ["search_email", "get-weather", "search_calendar"]
+goal = "Generate a morning briefing. Synthesize the tool results (emails, weather, today's full schedule) into a concise, scannable daily orientation (under 15 lines). Structure: schedule first, then weather, then any emails needing attention. Always send the briefing — even if the day is clear."
+
+[morning-briefing.tool_args.search_calendar]
+time_min = "{{today}}"
+time_max = "{{tomorrow}}"
+
 [check-calendar]
 interval = "6 hours"
 tool = "search_calendar"
 goal = "Alert about any events today or tomorrow."
 silent_if_empty = true
 
-[news-digest]
-interval = "6 hours"
-tool = "get-news"
-goal = "Select 3-5 articles relevant to my interests. Send a digest with title, one-line summary, and URL. Skip clickbait and fluff."
+[check-email]
+interval = "5 minutes"
+tool = "search_email"
+goal = "Alert about important or time-sensitive new emails. Summarize each with sender, subject, and key action needed."
 silent_if_empty = true
 
-[twitter-digest]
+[feed-digest]
 interval = "4 hours"
-tool = "twitter-feed"
-goal = "Select 5-7 tweets relevant to my interests. Send a digest with title, summary, and URL. Skip memes and rage-bait."
+tool = "get-feeds"
+goal = "Select 3-5 most interesting items across all feeds. Send a digest grouped by feed with title, one-line summary, and link. Skip low-quality content."
 silent_if_empty = true

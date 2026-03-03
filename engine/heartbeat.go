@@ -6,36 +6,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"sokratos/logger"
 	"sokratos/textutil"
 	"sokratos/timefmt"
 	"sokratos/timeouts"
 )
 
-// dueRoutine represents a single routine row that's due for execution.
-type dueRoutine struct {
-	ID            int
-	Name          string
-	Instruction   string
-	Tool          *string // if set, call this tool directly
-	Goal          *string // what to do with tool results
-	SilentIfEmpty bool    // skip orchestrator if tool returns empty
+// activeGoal represents an inferred user goal from memory.
+type activeGoal struct {
+	ID      int64
+	Summary string
 }
 
-// heartbeatTask represents a pending task for heartbeat context assembly.
-type heartbeatTask struct {
-	ID          int64
-	Description string
-	DueAt       *time.Time
-}
-
-// backgroundTask represents a background plan_and_execute task for heartbeat context.
-type backgroundTask struct {
+// workItem represents a row from the unified work_items table for heartbeat
+// context assembly.
+type workItem struct {
 	ID        int64
+	Type      string // "scheduled", "background", "routine"
 	Directive string
 	Status    string
 	Priority  int
-	Progress  string // "2/5"
+	Progress  string // "2/5" for background tasks
+	DueAt     *time.Time
+	StartedAt *time.Time
 	ErrMsg    *string
 }
 
@@ -44,14 +39,14 @@ type heartbeatContext struct {
 	currentTime      string
 	currentObjective string // from e.SM.GetState().CurrentTask
 	userLastActive   string // RFC3339 timestamp of last user message
-	tasks            []heartbeatTask
-	backgroundTasks  []backgroundTask
+	workItems        []workItem
 	recentActions    []actionRecord
+	goals            []activeGoal
 }
 
-// heartbeatTick handles a single heartbeat using a two-phase approach:
-// Phase 1 executes due routines deterministically, then Phase 2 runs
-// contextual orchestrator reasoning over working memory.
+// heartbeatTick handles a single heartbeat. Routines run on their own
+// independent scheduler (see runRoutineScheduler). The heartbeat focuses on
+// contextual orchestrator reasoning, maintenance, and cognitive processing.
 func (e *Engine) heartbeatTick() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -64,19 +59,20 @@ func (e *Engine) heartbeatTick() {
 		return
 	}
 
-	// Hot-reload skills + routines from disk.
+	// Kill hung work items before proceeding.
+	if e.WorkMonitor != nil {
+		if killed := e.WorkMonitor.KillHungWork(); killed > 0 {
+			logger.Log.Warnf("heartbeat: watchdog killed %d hung work item(s)", killed)
+		}
+	}
+
+	// Hot-reload skills from disk.
 	if e.SyncFunc != nil {
 		e.SyncFunc()
 	}
 
 	// Refresh user preferences from DB (picks up externally added prefs).
 	e.SM.RefreshPrefs()
-
-	// === PHASE 1: Deterministic Routine Execution ===
-	routinesFired := 0
-	if e.DB != nil {
-		routinesFired = e.executeDueRoutines()
-	}
 
 	// Build temporal context for system prompt injection.
 	if e.DB != nil {
@@ -123,13 +119,14 @@ func (e *Engine) heartbeatTick() {
 	// Phase 4: Event-driven cognitive processing.
 	e.runCognitiveIfTriggered()
 
-	logger.Log.Infof("heartbeat: tick complete, routines_fired=%d", routinesFired)
+	logger.Log.Info("heartbeat: tick complete")
 }
 
-// gatherHeartbeatContext queries Postgres for pending tasks and background tasks.
-// Recent salient memories are provided by <temporal_context> in the system prompt.
-// Each query uses a 5-second timeout. On any query failure the affected section
-// is left empty — the orchestrator still runs with partial context.
+// gatherHeartbeatContext queries Postgres for work items (scheduled, background,
+// routine) and active goals. Recent salient memories are provided by
+// <temporal_context> in the system prompt. Each query uses a 5-second timeout.
+// On any query failure the affected section is left empty — the orchestrator
+// still runs with partial context.
 func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	hc := heartbeatContext{
 		currentTime:      timefmt.Now(),
@@ -148,58 +145,100 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	queryCtx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 	defer cancel()
 
-	// Query 1: Pending tasks.
-	taskRows, err := e.DB.Query(queryCtx,
-		`SELECT id, description, due_at
-		 FROM tasks
-		 WHERE status = 'pending'
-		 ORDER BY due_at ASC NULLS LAST
-		 LIMIT 5`)
-	if err != nil {
-		logger.Log.Warnf("heartbeat: failed to query pending tasks: %v", err)
-	} else {
-		for taskRows.Next() {
-			var t heartbeatTask
-			if err := taskRows.Scan(&t.ID, &t.Description, &t.DueAt); err != nil {
-				logger.Log.Warnf("heartbeat: failed to scan task row: %v", err)
-				continue
-			}
-			hc.tasks = append(hc.tasks, t)
-		}
-		taskRows.Close()
-	}
-
-	// Query 2: Background tasks (running + recently completed within 1h).
-	// Note: recent salient memories are provided by <temporal_context> in the
-	// system prompt (7-day window, salience≥6, up to 8 items) — no need to
-	// duplicate them here.
-	bgRows, err := e.DB.Query(queryCtx,
-		`SELECT id, directive, status, COALESCE(priority, 5), steps_total, steps_completed, error_message
-		 FROM background_tasks
+	// Unified work items query: running + pending scheduled + recently completed.
+	rows, err := e.DB.Query(queryCtx,
+		`SELECT id, type, directive, status, COALESCE(priority, 5),
+		        steps_total, steps_completed, error_message, due_at, started_at
+		 FROM work_items
 		 WHERE status = 'running'
+		    OR (type = 'scheduled' AND status = 'pending')
 		    OR (status IN ('completed', 'failed') AND completed_at >= NOW() - INTERVAL '1 hour')
 		 ORDER BY
-		    CASE WHEN status = 'running' THEN 0 ELSE 1 END,
-		    priority DESC,
-		    created_at DESC
-		 LIMIT 5`)
+		    CASE WHEN status = 'running' THEN 0
+		         WHEN status = 'pending' THEN 1
+		         ELSE 2 END,
+		    priority DESC, created_at DESC
+		 LIMIT 10`)
 	if err != nil {
-		logger.Log.Warnf("heartbeat: failed to query background tasks: %v", err)
+		logger.Log.Warnf("heartbeat: failed to query work items: %v", err)
 	} else {
-		for bgRows.Next() {
-			var bt backgroundTask
+		for rows.Next() {
+			var wi workItem
 			var stepsTotal, stepsCompleted int
-			if err := bgRows.Scan(&bt.ID, &bt.Directive, &bt.Status, &bt.Priority, &stepsTotal, &stepsCompleted, &bt.ErrMsg); err != nil {
-				logger.Log.Warnf("heartbeat: failed to scan background task row: %v", err)
+			if err := rows.Scan(&wi.ID, &wi.Type, &wi.Directive, &wi.Status, &wi.Priority,
+				&stepsTotal, &stepsCompleted, &wi.ErrMsg, &wi.DueAt, &wi.StartedAt); err != nil {
+				logger.Log.Warnf("heartbeat: failed to scan work item row: %v", err)
 				continue
 			}
-			bt.Progress = fmt.Sprintf("%d/%d", stepsCompleted, stepsTotal)
-			hc.backgroundTasks = append(hc.backgroundTasks, bt)
+			if stepsTotal > 0 {
+				wi.Progress = fmt.Sprintf("%d/%d", stepsCompleted, stepsTotal)
+			}
+			hc.workItems = append(hc.workItems, wi)
 		}
-		bgRows.Close()
+		rows.Close()
+	}
+
+	// Active inferred goals (recent, high-salience, non-superseded).
+	goalRows, err := e.DB.Query(queryCtx,
+		`SELECT id, summary FROM memories
+		 WHERE memory_type = 'goal'
+		   AND superseded_by IS NULL
+		   AND salience >= 6
+		   AND created_at >= NOW() - INTERVAL '14 days'
+		 ORDER BY salience DESC, created_at DESC
+		 LIMIT 3`)
+	if err != nil {
+		logger.Log.Warnf("heartbeat: failed to query goals: %v", err)
+	} else {
+		for goalRows.Next() {
+			var g activeGoal
+			if err := goalRows.Scan(&g.ID, &g.Summary); err != nil {
+				logger.Log.Warnf("heartbeat: failed to scan goal row: %v", err)
+				continue
+			}
+			// Skip goals that have recent background task attempts.
+			if isGoalAlreadyAttempted(queryCtx, e.DB, g.Summary) {
+				continue
+			}
+			hc.goals = append(hc.goals, g)
+		}
+		goalRows.Close()
 	}
 
 	return hc
+}
+
+// cleanGoalSummary strips the "[Inferred Goal] " prefix and "\nEvidence:" suffix
+// from a goal memory summary, returning just the goal text.
+func cleanGoalSummary(summary string) string {
+	clean := summary
+	if idx := strings.Index(clean, "[Inferred Goal] "); idx >= 0 {
+		clean = clean[idx+len("[Inferred Goal] "):]
+	}
+	if idx := strings.Index(clean, "\nEvidence:"); idx >= 0 {
+		clean = clean[:idx]
+	}
+	return strings.TrimSpace(clean)
+}
+
+// isGoalAlreadyAttempted checks if a work item was recently (24h) started
+// for a goal. It strips the "[Inferred Goal]" prefix and evidence, then checks
+// for ILIKE match against recent work item directives.
+func isGoalAlreadyAttempted(ctx context.Context, db *pgxpool.Pool, goalSummary string) bool {
+	clean := cleanGoalSummary(goalSummary)
+	if clean == "" {
+		return false
+	}
+
+	var count int
+	err := db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM work_items
+		 WHERE created_at >= NOW() - INTERVAL '24 hours'
+		   AND directive ILIKE '%' || $1 || '%'`, clean).Scan(&count)
+	if err != nil {
+		return false // fail open
+	}
+	return count > 0
 }
 
 // toXML formats the heartbeat context as a dense XML block. Empty sections
@@ -222,37 +261,32 @@ func (hc heartbeatContext) toXML() string {
 	}
 	fmt.Fprintf(&b, "  <user_last_active>%s</user_last_active>\n", lastActive)
 
-	// Pending tasks.
-	if len(hc.tasks) == 0 {
-		b.WriteString("  <pending_tasks>none</pending_tasks>\n")
+	// Unified work items.
+	if len(hc.workItems) == 0 {
+		b.WriteString("  <work_items>none</work_items>\n")
 	} else {
-		b.WriteString("  <pending_tasks>\n")
-		for _, t := range hc.tasks {
-			due := "none"
-			if t.DueAt != nil {
-				due = t.DueAt.Format(time.RFC3339)
+		b.WriteString("  <work_items>\n")
+		for _, wi := range hc.workItems {
+			attrs := fmt.Sprintf("id=\"%d\" type=\"%s\" status=\"%s\"", wi.ID, wi.Type, wi.Status)
+			if wi.Priority > 0 {
+				attrs += fmt.Sprintf(" priority=\"%d\"", wi.Priority)
 			}
-			fmt.Fprintf(&b, "    <task id=\"%d\" due=\"%s\">%s</task>\n",
-				t.ID, due, t.Description)
-		}
-		b.WriteString("  </pending_tasks>\n")
-	}
-
-	// Background tasks.
-	if len(hc.backgroundTasks) == 0 {
-		b.WriteString("  <background_tasks>none</background_tasks>\n")
-	} else {
-		b.WriteString("  <background_tasks>\n")
-		for _, bt := range hc.backgroundTasks {
-			errAttr := ""
-			if bt.ErrMsg != nil && *bt.ErrMsg != "" {
-				errAttr = fmt.Sprintf(" error=%q", *bt.ErrMsg)
+			if wi.Progress != "" {
+				attrs += fmt.Sprintf(" progress=\"%s\"", wi.Progress)
 			}
-			dir := textutil.Truncate(bt.Directive, 77)
-			fmt.Fprintf(&b, "    <bg_task id=\"%d\" status=\"%s\" priority=\"%d\" progress=\"%s\"%s>%s</bg_task>\n",
-				bt.ID, bt.Status, bt.Priority, bt.Progress, errAttr, dir)
+			if wi.DueAt != nil {
+				attrs += fmt.Sprintf(" due=\"%s\"", wi.DueAt.Format(time.RFC3339))
+			}
+			if wi.StartedAt != nil && wi.Status == "running" {
+				attrs += fmt.Sprintf(" since=\"%s\"", wi.StartedAt.Format(time.RFC3339))
+			}
+			if wi.ErrMsg != nil && *wi.ErrMsg != "" {
+				attrs += fmt.Sprintf(" error=%q", *wi.ErrMsg)
+			}
+			dir := textutil.Truncate(wi.Directive, 77)
+			fmt.Fprintf(&b, "    <item %s>%s</item>\n", attrs, dir)
 		}
-		b.WriteString("  </background_tasks>\n")
+		b.WriteString("  </work_items>\n")
 	}
 
 	// Recent actions taken by this engine.
@@ -265,6 +299,17 @@ func (hc heartbeatContext) toXML() string {
 				a.Type, a.Time.Format(time.RFC3339), a.Summary)
 		}
 		b.WriteString("  </recent_actions>\n")
+	}
+
+	// Active inferred goals.
+	if len(hc.goals) == 0 {
+		b.WriteString("  <active_goals>none</active_goals>\n")
+	} else {
+		b.WriteString("  <active_goals>\n")
+		for _, g := range hc.goals {
+			fmt.Fprintf(&b, "    <goal id=\"%d\">%s</goal>\n", g.ID, cleanGoalSummary(g.Summary))
+		}
+		b.WriteString("  </active_goals>\n")
 	}
 
 	b.WriteString("</heartbeat_context>")

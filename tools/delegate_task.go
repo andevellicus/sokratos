@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"sokratos/clients"
 )
 
 const maxDelegateContextLen = 12000
@@ -73,7 +75,7 @@ func (dc *DelegateConfig) IsAllowed(name string) bool {
 // access to a configurable set of tools via a lightweight multi-turn supervisor
 // loop. The grammar and allowed-tools list are read from dc on each invocation
 // so that newly created skills are immediately available.
-func NewDelegateTask(sc *SubagentClient, registry *Registry, dc *DelegateConfig) ToolFunc {
+func NewDelegateTask(sc *clients.SubagentClient, registry *Registry, dc *DelegateConfig) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a delegateTaskArgs
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -94,7 +96,7 @@ func NewDelegateTask(sc *SubagentClient, registry *Registry, dc *DelegateConfig)
 
 		toolExec := NewScopedToolExec(registry, dc)
 
-		result, err := SubagentSupervisor(ctx, sc, dc.Grammar(), delegateSystemPrompt, directive, toolExec, 10)
+		result, err := clients.SubagentSupervisor(ctx, sc, dc.Grammar(), delegateSystemPrompt, directive, toolExec, 10)
 		if err != nil {
 			return fmt.Sprintf("delegate_task failed: %v", err), nil
 		}

@@ -20,10 +20,49 @@ var (
 	linkRe       = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 )
 
+// convertTablesToCodeBlocks detects Markdown tables (consecutive lines starting
+// with |) and wraps them in ``` fences so the code block handler renders them
+// as monospace <pre> blocks in Telegram. Separator rows (|---|...) are stripped.
+func convertTablesToCodeBlocks(md string) string {
+	lines := strings.Split(md, "\n")
+	var result []string
+	inTable := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		isTableLine := len(trimmed) > 0 && trimmed[0] == '|' && trimmed[len(trimmed)-1] == '|'
+		if isTableLine {
+			// Skip separator rows (|---|---|)
+			stripped := strings.ReplaceAll(trimmed, "-", "")
+			stripped = strings.ReplaceAll(stripped, "|", "")
+			stripped = strings.ReplaceAll(stripped, ":", "")
+			stripped = strings.TrimSpace(stripped)
+			if stripped == "" {
+				continue
+			}
+			if !inTable {
+				result = append(result, "```")
+				inTable = true
+			}
+			result = append(result, trimmed)
+		} else {
+			if inTable {
+				result = append(result, "```")
+				inTable = false
+			}
+			result = append(result, line)
+		}
+	}
+	if inTable {
+		result = append(result, "```")
+	}
+	return strings.Join(result, "\n")
+}
+
 // mdToTelegramHTML converts common Markdown formatting to Telegram-compatible HTML.
 // Code blocks and inline code are extracted first so their contents are protected
 // from further transformation.
 func mdToTelegramHTML(md string) string {
+	md = convertTablesToCodeBlocks(md)
 	// 1. Extract code blocks → placeholders.
 	var codeBlocks []string
 	s := codeBlockRe.ReplaceAllStringFunc(md, func(match string) string {
@@ -104,8 +143,9 @@ func utf16Len(s string) int {
 }
 
 // mdToEntities converts Markdown text to plain text + Telegram entity array.
-// Handles bold, italic, strikethrough, inline code, code blocks, and links.
+// Handles bold, italic, strikethrough, inline code, code blocks, links, and tables.
 func mdToEntities(md string) (string, []telegramEntity) {
+	md = convertTablesToCodeBlocks(md)
 	var entities []telegramEntity
 
 	// 1. Extract code blocks → placeholders, recording entities.

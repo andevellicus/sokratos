@@ -64,6 +64,12 @@ type MemoryWriteRequest struct {
 // worst case).
 const MaxChunkBytes = 1200
 
+// MaxSupersededProfiles is the maximum number of identity profile rows
+// to retain in the memories table. When a new profile is written and the
+// total exceeds this limit, the oldest superseded profiles are purged.
+// Set via MAX_SUPERSEDED_PROFILES env var (default 20).
+var MaxSupersededProfiles = 20
+
 // SaveToMemoryAsync embeds content and inserts it into the memories table
 // on a background goroutine so it doesn't block the caller. Content that
 // exceeds the embedding model's context window is split into chunks.
@@ -75,18 +81,19 @@ func SaveToMemoryAsync(db *pgxpool.Pool, embedEndpoint, embedModel, tag, content
 		Source:        "conversation_archive",
 		EmbedEndpoint: embedEndpoint,
 		EmbedModel:    embedModel,
-	}, nil)
+	}, nil, nil)
 }
 
 // SaveToMemoryWithSalienceAsync is like SaveToMemoryAsync but accepts a
-// MemoryWriteRequest with custom salience, tags, and source. When grammarFn
-// is non-nil, quality scoring (entities, confidence) is performed via ScoreAndWrite.
-func SaveToMemoryWithSalienceAsync(db *pgxpool.Pool, req MemoryWriteRequest, grammarFn GrammarSubagentFunc) {
+// MemoryWriteRequest with custom salience, tags, and source. When queueFn is
+// non-nil, enrichment is submitted to the work queue (preferred). Otherwise,
+// when grammarFn is non-nil, enrichment runs as a fire-and-forget goroutine.
+func SaveToMemoryWithSalienceAsync(db *pgxpool.Pool, req MemoryWriteRequest, grammarFn GrammarSubagentFunc, queueFn WorkQueueFunc) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutSaveOp)
 		defer cancel()
 
-		id, err := ScoreAndWrite(ctx, db, req, grammarFn)
+		id, err := ScoreAndWrite(ctx, db, req, grammarFn, queueFn)
 		if err != nil {
 			logger.Log.Errorf("[memory] async save failed: %v", err)
 			return
@@ -119,11 +126,18 @@ func RecordMemoryUsefulness(ctx context.Context, db *pgxpool.Pool, memoryIDs []i
 
 // ChunkText splits text into pieces of at most maxBytes, breaking at the
 // last newline before the limit to avoid cutting mid-sentence.
+// minChunkBytes is the minimum useful chunk size. Fragments below this
+// threshold are discarded — they're typically truncated tail-end remnants
+// ("Stat...", "I've added Mary's dinne...") that waste an embedding slot
+// and pollute search results.
+const minChunkBytes = 50
+
 func ChunkText(text string, maxBytes int) []string {
 	if len(text) <= maxBytes {
 		return []string{text}
 	}
 
+	original := text
 	var chunks []string
 	for len(text) > 0 {
 		end := maxBytes
@@ -138,8 +152,15 @@ func ChunkText(text string, maxBytes int) []string {
 			}
 		}
 
-		chunks = append(chunks, strings.TrimSpace(text[:end]))
+		chunk := strings.TrimSpace(text[:end])
+		if len(chunk) >= minChunkBytes {
+			chunks = append(chunks, chunk)
+		}
 		text = text[end:]
+	}
+	// If everything was discarded (shouldn't happen), keep the original.
+	if len(chunks) == 0 {
+		return []string{strings.TrimSpace(original)}
 	}
 	return chunks
 }
@@ -207,5 +228,37 @@ func WriteIdentityProfile(ctx context.Context, db *pgxpool.Pool, embedEndpoint, 
 	}
 
 	logger.Log.Infof("[memory] identity profile written (id=%d, %d bytes)", newID, len(profileJSON))
+
+	// Purge oldest superseded profiles if we exceed the retention limit.
+	if MaxSupersededProfiles > 0 {
+		go purgeSupersededProfiles(db, MaxSupersededProfiles)
+	}
 	return nil
+}
+
+// purgeSupersededProfiles deletes identity profile rows beyond the retention
+// limit, keeping the most recent `keep` rows (the active profile is always
+// the newest and is therefore always retained).
+func purgeSupersededProfiles(db *pgxpool.Pool, keep int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := db.Exec(ctx,
+		`DELETE FROM memories
+		 WHERE memory_type = 'identity'
+		   AND id NOT IN (
+		       SELECT id FROM memories
+		       WHERE memory_type = 'identity'
+		       ORDER BY created_at DESC
+		       LIMIT $1
+		   )`,
+		keep,
+	)
+	if err != nil {
+		logger.Log.Warnf("[memory] failed to purge superseded profiles: %v", err)
+		return
+	}
+	if n := res.RowsAffected(); n > 0 {
+		logger.Log.Infof("[memory] purged %d superseded identity profiles (kept %d)", n, keep)
+	}
 }

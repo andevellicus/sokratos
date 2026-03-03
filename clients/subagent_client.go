@@ -1,4 +1,4 @@
-package tools
+package clients
 
 import (
 	"context"
@@ -9,10 +9,11 @@ import (
 	"sokratos/httputil"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/timeouts"
 )
 
-// SubagentClient manages a lightweight subagent (e.g. Gemma3-4B-IT) running on
-// a dedicated server. It owns a concurrency semaphore matching the server's
+// SubagentClient manages a lightweight subagent running on a dedicated server.
+// It owns a concurrency semaphore matching the server's
 // --parallel setting so we never dispatch more concurrent requests than the
 // server can handle. Background work is submitted via QueueWork and processed
 // sequentially — each item gets a fresh context so queue wait time doesn't eat
@@ -23,15 +24,10 @@ type SubagentClient struct {
 	workCh chan memory.WorkRequest
 }
 
-// NewSubagentClient returns a ready-to-use client. slots controls the max
-// concurrent requests (should match the router's --n-parallel).
-func NewSubagentClient(url, model string, slots int) *SubagentClient {
-	return NewSubagentClientNamed("subagent", url, model, slots)
-}
-
-// NewSubagentClientNamed is like NewSubagentClient but uses a custom name for
+// NewSubagentClientNamed returns a ready-to-use client with a custom name for
 // the circuit breaker and log tag, allowing multiple backends to be
-// distinguished (e.g. "subagent-flash" vs "subagent-z1").
+// distinguished (e.g. "subagent-flash" vs "subagent-z1"). slots controls the
+// max concurrent requests (should match the router's --n-parallel).
 func NewSubagentClientNamed(name, url, model string, slots int) *SubagentClient {
 	if slots <= 0 {
 		slots = 2
@@ -40,7 +36,7 @@ func NewSubagentClientNamed(name, url, model string, slots int) *SubagentClient 
 		baseClient: baseClient{
 			URL:   url,
 			Model: model,
-			client: httputil.NewClient(TimeoutHTTPSafetyNet),
+			client: httputil.NewClient(timeouts.HTTPSafetyNet),
 			cb:     newCircuitBreaker(name),
 			logTag: "[" + name + "]",
 		},
@@ -129,6 +125,9 @@ func (sc *SubagentClient) exec(ctx context.Context, opts requestOpts) (string, e
 		Temperature: 0.1,
 		MaxTokens:   opts.maxTokens,
 		Grammar:     opts.grammar,
+		ChatTemplateKwargs: map[string]any{
+			"enable_thinking": false,
+		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal request: %w", err)
@@ -229,5 +228,3 @@ func (sc *SubagentClient) processWorkQueue() {
 		}
 	}
 }
-
-

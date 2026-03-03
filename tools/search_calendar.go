@@ -12,6 +12,8 @@ import (
 
 	"sokratos/calendar"
 	"sokratos/logger"
+	"sokratos/pipelines"
+	"sokratos/timefmt"
 )
 
 type searchCalendarArgs struct {
@@ -79,7 +81,7 @@ func eventUID(e calendar.Event) string {
 
 // filterNewEvents removes events whose UID is already in processed_events.
 func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []calendar.Event) []calendar.Event {
-	tracker := &ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
+	tracker := &pipelines.ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
 	uids := make([]string, len(events))
 	for i, e := range events {
 		uids[i] = eventUID(e)
@@ -100,7 +102,7 @@ func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []calendar.
 
 // markEventsProcessed inserts event UIDs into processed_events.
 func markEventsProcessed(ctx context.Context, pool *pgxpool.Pool, events []calendar.Event) {
-	tracker := &ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
+	tracker := &pipelines.ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
 	uids := make([]string, len(events))
 	for i, e := range events {
 		uids[i] = eventUID(e)
@@ -132,6 +134,7 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 			if err != nil {
 				return fmt.Sprintf("invalid time_min %q: %v", a.TimeMin, err), nil
 			}
+			t = timefmt.ReinterpretAsLocal(t)
 			timeMin = &t
 		} else {
 			// Default to now — calendar searches without explicit time bounds
@@ -145,6 +148,7 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 			if err != nil {
 				return fmt.Sprintf("invalid time_max %q: %v", a.TimeMax, err), nil
 			}
+			t = timefmt.ReinterpretAsLocal(t)
 			timeMax = &t
 		}
 

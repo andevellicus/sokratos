@@ -15,9 +15,10 @@ type addTaskArgs struct {
 	Recur string `json:"recur,omitempty"`  // Go duration, e.g. "24h", "1h", "168h"
 }
 
-// NewAddTask returns a ToolFunc that inserts a task into the PostgreSQL tasks
-// table. After inserting, it sends a signal on interruptChan to wake the
-// scheduler goroutine in case the new task is due sooner than the current wait.
+// NewAddTask returns a ToolFunc that inserts a scheduled task into the
+// work_items table. After inserting, it sends a signal on interruptChan to
+// wake the scheduler goroutine in case the new task is due sooner than the
+// current wait.
 func NewAddTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a addTaskArgs
@@ -54,7 +55,8 @@ func NewAddTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 
 		var id int64
 		err := pool.QueryRow(ctx,
-			`INSERT INTO tasks (description, due_at, recurrence, status) VALUES ($1, $2, $3, 'pending') RETURNING id`,
+			`INSERT INTO work_items (type, directive, due_at, recurrence, status)
+			 VALUES ('scheduled', $1, $2, $3, 'pending') RETURNING id`,
 			a.Task, dueAt, recurrenceNs).Scan(&id)
 		if err != nil {
 			return fmt.Sprintf("failed to insert task: %v", err), nil
@@ -81,8 +83,9 @@ type completeTaskArgs struct {
 	TaskID int64 `json:"task_id,omitempty"`
 }
 
-// NewCompleteTask returns a ToolFunc that marks a task as completed in
-// PostgreSQL. If no task_id is provided, it completes the oldest pending task.
+// NewCompleteTask returns a ToolFunc that marks a scheduled task as completed
+// in the work_items table. If no task_id is provided, it completes the oldest
+// pending scheduled task.
 func NewCompleteTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a completeTaskArgs
@@ -91,20 +94,26 @@ func NewCompleteTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 		}
 
 		var id int64
-		var desc string
+		var directive string
 
 		if a.TaskID > 0 {
 			err := pool.QueryRow(ctx,
-				`UPDATE tasks SET status = 'completed' WHERE id = $1 AND status = 'pending' RETURNING id, description`,
-				a.TaskID).Scan(&id, &desc)
+				`UPDATE work_items SET status = 'completed', completed_at = now()
+				 WHERE id = $1 AND type = 'scheduled' AND status = 'pending'
+				 RETURNING id, directive`,
+				a.TaskID).Scan(&id, &directive)
 			if err != nil {
-				return fmt.Sprintf("No pending task with id %d found.", a.TaskID), nil
+				return fmt.Sprintf("No pending scheduled task with id %d found.", a.TaskID), nil
 			}
 		} else {
 			err := pool.QueryRow(ctx,
-				`UPDATE tasks SET status = 'completed'
-				 WHERE id = (SELECT id FROM tasks WHERE status = 'pending' ORDER BY due_at ASC NULLS LAST LIMIT 1)
-				 RETURNING id, description`).Scan(&id, &desc)
+				`UPDATE work_items SET status = 'completed', completed_at = now()
+				 WHERE id = (
+				     SELECT id FROM work_items
+				     WHERE type = 'scheduled' AND status = 'pending'
+				     ORDER BY due_at ASC NULLS LAST LIMIT 1
+				 )
+				 RETURNING id, directive`).Scan(&id, &directive)
 			if err != nil {
 				return "No pending tasks to complete.", nil
 			}
@@ -116,6 +125,6 @@ func NewCompleteTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 		default:
 		}
 
-		return fmt.Sprintf("Completed task #%d: %s", id, desc), nil
+		return fmt.Sprintf("Completed task #%d: %s", id, directive), nil
 	}
 }

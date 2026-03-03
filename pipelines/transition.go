@@ -1,4 +1,4 @@
-package tools
+package pipelines
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 
+	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
@@ -21,7 +22,7 @@ func generateTransitionMemory(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	embedEndpoint, embedModel string,
-	dtc *DeepThinkerClient,
+	dtc *clients.DeepThinkerClient,
 	newEventSummary string,
 	tags []string,
 ) (int64, error) {
@@ -103,7 +104,7 @@ func generateTransitionMemory(
 		EmbedEndpoint: embedEndpoint,
 		EmbedModel:    embedModel,
 	}
-	id, err := memory.ScoreAndWrite(ctx, pool, req, nil) // nil grammarFn = skip quality scoring
+	id, err := memory.ScoreAndWrite(ctx, pool, req, nil, nil) // nil grammarFn/queueFn = skip enrichment
 	if err != nil {
 		return 0, fmt.Errorf("save failed: %w", err)
 	}
@@ -112,21 +113,3 @@ func generateTransitionMemory(
 	return id, nil
 }
 
-// GenerateTransitionMemoryAsync is a fire-and-forget wrapper around
-// generateTransitionMemory for callers that don't need the paradigm shift
-// fast-path (mini-consolidation + profile refresh).
-func GenerateTransitionMemoryAsync(
-	pool *pgxpool.Pool,
-	embedEndpoint, embedModel string,
-	dtc *DeepThinkerClient,
-	newEventSummary string,
-	tags []string,
-) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), TimeoutTransition)
-		defer cancel()
-		if _, err := generateTransitionMemory(ctx, pool, embedEndpoint, embedModel, dtc, newEventSummary, tags); err != nil {
-			logger.Log.Warnf("[transition] %v", err)
-		}
-	}()
-}

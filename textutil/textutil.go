@@ -81,13 +81,22 @@ func StripCodeFences(s string) string {
 	return s
 }
 
-// toolIntentTagRe matches <TOOL_INTENT>...</TOOL_INTENT> blocks, including
-// nested <CODE>...</CODE> blocks used by create_skill.
-var toolIntentTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>.*?</TOOL_INTENT>`)
+// toolIntentCodeTagRe matches <TOOL_INTENT>...<CODE>...</CODE> with an
+// optional (possibly malformed) closing TOOL_INTENT tag.
+var toolIntentCodeTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?</CODE>)\s*(?:<[/\\]?TOOL_INT[A-Z]*>)?`)
 
-// StripToolIntentTags removes <TOOL_INTENT>...</TOOL_INTENT> blocks from text.
+// toolIntentTagRe matches <TOOL_INTENT>...</TOOL_INTENT> blocks, including
+// common model mistakes: backslash closer (<\TOOL_INTENT>), truncated tags,
+// and other <TOOL_INT...> variants.
+var toolIntentTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)<[/\\]?TOOL_INT[A-Z]*>`)
+
+// StripToolIntentTags removes all <TOOL_INTENT>...</TOOL_INTENT> blocks from
+// text, returning only surrounding prose. Handles CODE blocks and common model
+// mistakes (backslash closers, truncated tags).
 func StripToolIntentTags(s string) string {
-	return strings.TrimSpace(toolIntentTagRe.ReplaceAllString(s, ""))
+	s = toolIntentCodeTagRe.ReplaceAllString(s, "")
+	s = toolIntentTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
 }
 
 // trailingDotRe matches trailing decimal points (e.g., "salience": 7. }) which are

@@ -5,88 +5,138 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/prompts"
-	"sokratos/timeouts"
+	"sokratos/routines"
+	"sokratos/textutil"
 )
 
-// executeDueRoutines queries all directives whose interval has elapsed and
-// executes each one independently through the orchestrator. Returns the count
-// of directives fired.
-func (e *Engine) executeDueRoutines() int {
-	queryCtx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
-	defer cancel()
-
-	rows, err := e.DB.Query(queryCtx,
-		`SELECT id, name, instruction, tool, goal, COALESCE(silent_if_empty, false)
-		 FROM routines
-		 WHERE last_executed + interval_duration <= NOW()
-		 ORDER BY (last_executed + interval_duration) ASC`)
-	if err != nil {
-		logger.Log.Warnf("heartbeat: failed to query due routines: %v", err)
-		return 0
+// runRoutineScheduler polls for due routines on its own ticker, independent
+// of the heartbeat loop. This gives routines better time precision (default
+// 30s polling) and decouples them from heartbeat processing.
+func (e *Engine) runRoutineScheduler() {
+	interval := e.RoutineInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
 	}
 
-	var directives []dueRoutine
-	for rows.Next() {
-		var d dueRoutine
-		if err := rows.Scan(&d.ID, &d.Name, &d.Instruction, &d.Tool, &d.Goal, &d.SilentIfEmpty); err != nil {
-			logger.Log.Warnf("heartbeat: failed to scan routine row: %v", err)
-			continue
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	logger.Log.Infof("[routine-scheduler] started (interval: %s)", interval)
+
+	for range ticker.C {
+		// Hot-reload routines from disk before checking for due routines.
+		if e.RoutineSyncFunc != nil {
+			e.RoutineSyncFunc()
 		}
-		directives = append(directives, d)
+		e.executeDueRoutines()
 	}
-	rows.Close()
+}
 
-	if rows.Err() != nil {
-		logger.Log.Warnf("heartbeat: routine iteration error: %v", rows.Err())
+// executeDueRoutines queries all routines whose interval has elapsed or
+// schedule time has been reached, and executes each one independently
+// through the orchestrator.
+func (e *Engine) executeDueRoutines() {
+	directives, err := routines.QueryDue(e.DB)
+	if err != nil {
+		logger.Log.Warnf("routine-scheduler: %v", err)
+		return
 	}
 
 	for _, d := range directives {
 		e.executeSingleRoutine(d)
 	}
 
-	return len(directives)
+	if len(directives) > 0 {
+		logger.Log.Infof("routine-scheduler: executed %d routine(s)", len(directives))
+	}
 }
 
-// executeSingleRoutine advances the directive's timer and runs it through
+// executeSingleRoutine advances the routine's timer and runs it through
 // the orchestrator. If the routine has a `tool` field, the tool is called
 // directly first and the result is passed to the orchestrator with the goal.
 // If silent_if_empty is set and the tool returns no data, the orchestrator
-// is skipped entirely.
-func (e *Engine) executeSingleRoutine(d dueRoutine) {
+// is skipped entirely. Execution is tracked via WorkMonitor and bounded by
+// RoutineTimeout.
+func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Log.Errorf("heartbeat: routine panic, name=%s, err=%v", d.Name, r)
+			logger.Log.Errorf("routine-scheduler: panic, name=%s, err=%v", d.Name, r)
 		}
 	}()
 
 	// Advance timer BEFORE execution to prevent double-fire on crash.
-	advCtx, advCancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
-	defer advCancel()
-	if _, err := e.DB.Exec(advCtx,
-		`UPDATE routines SET last_executed = NOW() WHERE id = $1`, d.ID); err != nil {
-		logger.Log.Warnf("heartbeat: failed to advance routine timer, name=%s, err=%v", d.Name, err)
+	if err := routines.AdvanceTimer(e.DB, d.ID); err != nil {
+		logger.Log.Warnf("routine-scheduler: failed to advance timer, name=%s, err=%v", d.Name, err)
 		return
+	}
+
+	// Compute timeout and create a cancellable context.
+	timeout := e.RoutineTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Track via WorkMonitor if available.
+	var workID int64
+	if e.WorkMonitor != nil {
+		workID = e.WorkMonitor.TrackStart("routine", d.Name, timeout)
+		e.WorkMonitor.SetCancel(workID, cancel)
+		defer func() {
+			status := "completed"
+			var errMsg string
+			if ctx.Err() != nil {
+				status = "failed"
+				errMsg = ctx.Err().Error()
+			}
+			e.WorkMonitor.TrackEnd(workID, status, errMsg)
+		}()
 	}
 
 	var prompt string
 
-	if d.Tool != nil && *d.Tool != "" {
-		// Structured routine: call the tool directly, then hand results to the orchestrator.
-		toolResult, err := e.ToolExec(context.Background(), json.RawMessage(
-			fmt.Sprintf(`{"name":%q,"arguments":{}}`, *d.Tool),
-		))
-		if err != nil {
-			logger.Log.Warnf("heartbeat: routine tool call failed, name=%s, tool=%s, err=%v", d.Name, *d.Tool, err)
-			return
+	// Resolve tool list with precedence: Tools (multi) > Tool (single) > legacy instruction.
+	var toolList []string
+	if len(d.Tools) > 0 {
+		toolList = d.Tools
+	} else if d.Tool != nil && *d.Tool != "" {
+		toolList = []string{*d.Tool}
+	}
+
+	if len(toolList) > 0 {
+		// Structured routine: call tool(s) directly, then hand results to the orchestrator.
+		var results strings.Builder
+		anyNonEmpty := false
+
+		for _, toolName := range toolList {
+			argsJSON := json.RawMessage("{}")
+			if d.ToolArgs != nil {
+				if ta, ok := d.ToolArgs[toolName]; ok {
+					argsJSON = routines.ExpandAndMarshal(ta)
+				}
+			}
+			toolResult, err := e.ToolExec(ctx, json.RawMessage(
+				fmt.Sprintf(`{"name":%q,"arguments":%s}`, toolName, argsJSON),
+			))
+			if err != nil {
+				logger.Log.Warnf("routine-scheduler: tool call failed, name=%s, tool=%s, err=%v", d.Name, toolName, err)
+				continue
+			}
+			if !routines.IsEmptyResult(toolResult) {
+				anyNonEmpty = true
+			}
+			fmt.Fprintf(&results, "## %s\n%s\n\n", toolName, toolResult)
 		}
 
-		// If the tool returned nothing useful and silent_if_empty is set, skip.
-		if d.SilentIfEmpty && isEmptyToolResult(toolResult) {
-			logger.Log.Infof("heartbeat: routine %s: tool returned empty, skipping (silent)", d.Name)
+		// If silent_if_empty and ALL tools returned empty, skip orchestrator.
+		if d.SilentIfEmpty && !anyNonEmpty {
+			logger.Log.Infof("routine-scheduler: %s: all tools returned empty, skipping (silent)", d.Name)
 			return
 		}
 
@@ -95,9 +145,10 @@ func (e *Engine) executeSingleRoutine(d dueRoutine) {
 			goal = *d.Goal
 		}
 
+		toolLabel := strings.Join(toolList, ", ")
 		prompt = fmt.Sprintf(
-			"ROUTINE: %s\nThe tool %q was called and returned the following data:\n\n%s\n\nYour task: %s",
-			d.Name, *d.Tool, toolResult, goal,
+			"ROUTINE: %s\nThe following tools were called: %s\n\nResults:\n%s\nYour task: %s",
+			d.Name, toolLabel, results.String(), goal,
 		)
 	} else {
 		// Legacy routine: pass instruction to orchestrator and let it figure things out.
@@ -111,49 +162,28 @@ func (e *Engine) executeSingleRoutine(d dueRoutine) {
 	// Prepend routine mode preamble for focused execution context.
 	prompt = strings.TrimSpace(prompts.RoutineMode) + "\n\n" + prompt
 
+	var reply string
 	var err error
 	e.withOrchestratorLock(func() {
-		_, _, err = llm.QueryOrchestrator(
-			context.Background(), e.LLM.Client, e.LLM.Model, prompt,
+		reply, _, err = llm.QueryOrchestrator(
+			ctx, e.LLM.Client, e.LLM.Model, prompt,
 			e.ToolExec, DefaultTrimFn, e.baseOrchestratorOpts(),
 		)
 	})
 
 	if err != nil {
-		logger.Log.Warnf("heartbeat: routine failed, name=%s, err=%v", d.Name, err)
+		logger.Log.Warnf("routine-scheduler: routine failed, name=%s, err=%v", d.Name, err)
 		return
 	}
 
-	logger.Log.Infof("heartbeat: routine executed, name=%s", d.Name)
-	e.recordAction("routine", fmt.Sprintf("Executed %q", d.Name))
-}
-
-// isEmptyToolResult checks if a tool result indicates no data was returned.
-func isEmptyToolResult(result string) bool {
-	if result == "" {
-		return true
-	}
-	// Skills return "No tweets found.", "No news articles found.", etc.
-	for _, prefix := range []string{"No ", "no ", "error", "Error"} {
-		if len(result) > len(prefix) && result[:len(prefix)] == prefix {
-			return true
+	reply = strings.TrimSpace(reply)
+	if reply != "" && !strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
+		if e.sendDeduped(reply, fmt.Sprintf("routine %q", d.Name)) {
+			e.recordAction("routine", fmt.Sprintf("Sent %q output: %s", d.Name, textutil.Truncate(reply, 80)))
+			logger.Log.Infof("routine-scheduler: %q delivered", d.Name)
 		}
+	} else {
+		logger.Log.Infof("routine-scheduler: %q executed (no user-facing output)", d.Name)
+		e.recordAction("routine", fmt.Sprintf("Executed %q (silent)", d.Name))
 	}
-	// JSON results with count=0
-	if len(result) > 10 && result[0] == '{' {
-		if idx := indexOf(result, `"count":0`); idx >= 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// indexOf returns the index of substr in s, or -1 if not found.
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }

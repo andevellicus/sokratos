@@ -1,0 +1,17 @@
+You are analyzing recent memories and the user's identity profile to infer implicit goals — things the user is trying to achieve based on their behavior patterns, even if they haven't explicitly stated them.
+
+Review the provided memories and profile carefully. Identify 1-3 implicit goals that:
+- Are supported by multiple pieces of evidence across recent memories
+- Are NOT already explicitly stated as goals in the profile
+- Are actionable (something the agent could help with proactively)
+- Reflect genuine intent, not just passing curiosity
+
+For each goal, provide:
+- A clear, specific description of what the user appears to be trying to achieve
+- The evidence from recent memories that supports this inference
+- Priority level based on urgency and frequency of related activity
+
+Output JSON:
+{"goals": [{"goal": "...", "evidence": "...", "priority": "high|medium|low"}]}
+
+If no new goals can be confidently inferred, return: {"goals": []}

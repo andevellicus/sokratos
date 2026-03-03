@@ -6,12 +6,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/calendar"
+	"sokratos/clients"
 	"sokratos/config"
 	"sokratos/db"
 	"sokratos/engine"
 	"sokratos/gmail"
 	"sokratos/grammar"
 	"sokratos/logger"
+	"sokratos/pipelines"
+	"sokratos/routines"
 	"sokratos/tools"
 )
 
@@ -36,7 +39,7 @@ func registerCoreTools(registry *tools.Registry, stateMgr *engine.StateManager) 
 	})
 }
 
-func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan chan struct{}, subagent *tools.SubagentClient) {
+func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan chan struct{}, subagent *clients.SubagentClient) {
 	if pool == nil {
 		return
 	}
@@ -54,14 +57,17 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 		Description: "Mark current task done, advance queue",
 		Params:      []tools.ParamSchema{{Name: "task_id", Type: "number", Required: false}},
 	})
-	registry.Register("manage_routines", tools.NewManageRoutines(pool, &routineFileAdapter{path: "routines.toml"}), tools.ToolSchema{
+	registry.Register("manage_routines", tools.NewManageRoutines(pool, &routines.FileAdapter{Path: "routines.toml"}), tools.ToolSchema{
 		Name:        "manage_routines",
 		Description: "Create, update, or delete autonomous routines",
 		Params: []tools.ParamSchema{
 			{Name: "action", Type: "string", Required: true},
 			{Name: "name", Type: "string", Required: true},
 			{Name: "interval", Type: "string", Required: false},
+			{Name: "schedule", Type: "string", Required: false},
 			{Name: "tool", Type: "string", Required: false},
+			{Name: "tools", Type: "array", Required: false},
+			{Name: "tool_args", Type: "object", Required: false},
 			{Name: "goal", Type: "string", Required: false},
 			{Name: "silent_if_empty", Type: "boolean", Required: false},
 			{Name: "instruction", Type: "string", Required: false},
@@ -76,30 +82,29 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 	}
 }
 
-func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *tools.TriageConfig, emailLookback string, emailDisplayBatch int) {
-	if gmail.Service != nil {
-		registry.Register("search_email", tools.NewSearchEmail(gmail.Service, pool, triageCfg, emailLookback, emailDisplayBatch), tools.ToolSchema{
-			Name:        "search_email",
-			Description: "Search Gmail inbox with optional time bounds",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: false},
-				{Name: "time_min", Type: "string", Required: false},
-				{Name: "time_max", Type: "string", Required: false},
-				{Name: "max_results", Type: "number", Required: false},
-			},
-		})
+func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, emailDisplayBatch int) {
+	if gmail.Service == nil {
+		return
 	}
-	if gmail.Service != nil {
-		registry.Register("send_email", tools.NewSendEmail(gmail.Service), tools.ToolSchema{
-			Name:        "send_email",
-			Description: "Send a plain-text email",
-			Params: []tools.ParamSchema{
-				{Name: "to", Type: "string", Required: true},
-				{Name: "subject", Type: "string", Required: true},
-				{Name: "body", Type: "string", Required: true},
-			},
-		})
-	}
+	registry.Register("search_email", tools.NewSearchEmail(gmail.Service, pool, triageCfg, emailDisplayBatch), tools.ToolSchema{
+		Name:        "search_email",
+		Description: "Search Gmail inbox with optional time bounds",
+		Params: []tools.ParamSchema{
+			{Name: "query", Type: "string", Required: false},
+			{Name: "time_min", Type: "string", Required: false},
+			{Name: "time_max", Type: "string", Required: false},
+			{Name: "max_results", Type: "number", Required: false},
+		},
+	})
+	registry.Register("send_email", tools.NewSendEmail(gmail.Service), tools.ToolSchema{
+		Name:        "send_email",
+		Description: "Send a plain-text email",
+		Params: []tools.ParamSchema{
+			{Name: "to", Type: "string", Required: true},
+			{Name: "subject", Type: "string", Required: true},
+			{Name: "body", Type: "string", Required: true},
+		},
+	})
 }
 
 func registerWebTools(registry *tools.Registry, searxngURL string) {
@@ -124,35 +129,34 @@ func registerWebTools(registry *tools.Registry, searxngURL string) {
 }
 
 func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
-	if calendar.Service != nil {
-		registry.Register("search_calendar", tools.NewSearchCalendar(calendar.Service, pool), tools.ToolSchema{
-			Name:        "search_calendar",
-			Description: "Search Google Calendar for events with optional time bounds",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: false},
-				{Name: "time_min", Type: "string", Required: false},
-				{Name: "time_max", Type: "string", Required: false},
-				{Name: "max_results", Type: "number", Required: false},
-			},
-		})
+	if calendar.Service == nil {
+		return
 	}
-	if calendar.Service != nil {
-		registry.Register("create_event", tools.NewCreateEvent(calendar.Service), tools.ToolSchema{
-			Name:        "create_event",
-			Description: "Create a Google Calendar event",
-			Params: []tools.ParamSchema{
-				{Name: "title", Type: "string", Required: true},
-				{Name: "start", Type: "string", Required: true},
-				{Name: "end", Type: "string", Required: false},
-				{Name: "description", Type: "string", Required: false},
-				{Name: "location", Type: "string", Required: false},
-				{Name: "attendees", Type: "array", Required: false},
-			},
-		})
-	}
+	registry.Register("search_calendar", tools.NewSearchCalendar(calendar.Service, pool), tools.ToolSchema{
+		Name:        "search_calendar",
+		Description: "Search Google Calendar for events with optional time bounds",
+		Params: []tools.ParamSchema{
+			{Name: "query", Type: "string", Required: false},
+			{Name: "time_min", Type: "string", Required: false},
+			{Name: "time_max", Type: "string", Required: false},
+			{Name: "max_results", Type: "number", Required: false},
+		},
+	})
+	registry.Register("create_event", tools.NewCreateEvent(calendar.Service), tools.ToolSchema{
+		Name:        "create_event",
+		Description: "Create a Google Calendar event. Use the user's local timezone offset in start/end times (e.g. 2026-03-07T19:00:00-05:00), NOT Z/UTC.",
+		Params: []tools.ParamSchema{
+			{Name: "title", Type: "string", Required: true},
+			{Name: "start", Type: "string", Required: true},
+			{Name: "end", Type: "string", Required: false},
+			{Name: "description", Type: "string", Required: false},
+			{Name: "location", Type: "string", Required: false},
+			{Name: "attendees", Type: "array", Required: false},
+		},
+	})
 }
 
-func registerAITools(registry *tools.Registry, dtc *tools.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) {
+func registerAITools(registry *tools.Registry, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) {
 	if dtc != nil {
 		registry.Register("consult_deep_thinker", tools.NewConsultDeepThinker(dtc, pool, embedURL, embedModel), tools.ToolSchema{
 			Name:        "consult_deep_thinker",
@@ -170,7 +174,7 @@ func registerAITools(registry *tools.Registry, dtc *tools.DeepThinkerClient, poo
 // tools (search_email, search_calendar, search_memory, save_memory) are
 // always available; user-created skills are added dynamically via
 // rebuildGrammar. Returns the DelegateConfig for live updates.
-func registerDelegateTask(registry *tools.Registry, subagent *tools.SubagentClient) *tools.DelegateConfig {
+func registerDelegateTask(registry *tools.Registry, subagent *clients.SubagentClient) *tools.DelegateConfig {
 	if subagent == nil {
 		return nil
 	}
@@ -218,16 +222,16 @@ func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGramm
 	})
 }
 
-func registerPlanTools(registry *tools.Registry, dtc *tools.DeepThinkerClient,
-	subagent *tools.SubagentClient, dc *tools.DelegateConfig,
-	btr *tools.BackgroundTaskRunner) {
+func registerPlanTools(registry *tools.Registry, dtc *clients.DeepThinkerClient,
+	subagent *clients.SubagentClient, dc *tools.DelegateConfig,
+	wt *tools.WorkTracker) {
 
 	if dtc == nil || subagent == nil || dc == nil {
 		logger.Log.Warn("[startup] plan_and_execute disabled: missing dtc, subagent, or delegate config")
 		return
 	}
 
-	registry.Register("plan_and_execute", tools.NewPlanAndExecute(dtc, subagent, dc, registry, btr), tools.ToolSchema{
+	registry.Register("plan_and_execute", tools.NewPlanAndExecute(dtc, subagent, dc, registry, wt), tools.ToolSchema{
 		Name:        "plan_and_execute",
 		Description: "Decompose and execute complex multi-step tasks (background=true for async)",
 		Params: []tools.ParamSchema{
@@ -238,10 +242,10 @@ func registerPlanTools(registry *tools.Registry, dtc *tools.DeepThinkerClient,
 		},
 	})
 
-	if btr != nil {
-		registry.Register("check_background_task", tools.NewCheckBackgroundTask(btr), tools.ToolSchema{
+	if wt != nil {
+		registry.Register("check_background_task", tools.NewCheckBackgroundTask(wt), tools.ToolSchema{
 			Name:        "check_background_task",
-			Description: "Check status, list, or cancel background tasks",
+			Description: "Check status, list, or cancel work items (background, routine, scheduled)",
 			Params: []tools.ParamSchema{
 				{Name: "task_id", Type: "number", Required: false},
 				{Name: "action", Type: "string", Required: false},
@@ -254,7 +258,7 @@ func registerPlanTools(registry *tools.Registry, dtc *tools.DeepThinkerClient,
 // for the skill HTTP bridge allowlist.
 func collectInternalHosts(cfg *config.AppConfig) []string {
 	var hosts []string
-	for _, raw := range []string{cfg.SearxngURL, cfg.EmbedURL} {
+	for _, raw := range []string{cfg.SearxngURL, cfg.EmbedURL, cfg.RsshubURL} {
 		if raw == "" {
 			continue
 		}
@@ -269,7 +273,7 @@ func collectInternalHosts(cfg *config.AppConfig) []string {
 	return hosts
 }
 
-func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, *tools.TriageConfig, *tools.DelegateConfig) {
+func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, *pipelines.TriageConfig, *tools.DelegateConfig) {
 	registry := tools.NewRegistry()
 
 	registerCoreTools(registry, svc.StateMgr)
@@ -299,8 +303,6 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 				{Name: "memory_type", Type: "string", Required: false},
 			},
 		})
-	}
-	if db.Pool != nil && cfg.EmbedURL != "" {
 		registry.Register("forget_topic", tools.NewForgetTopic(db.Pool, cfg.EmbedURL, cfg.EmbedModel), tools.ToolSchema{
 			Name:        "forget_topic",
 			Description: "Archive all memories related to a topic",
@@ -312,9 +314,9 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 	}
 	// Build email triage config if dependencies are available.
 	// TriageGrammar is left empty here and set after initLLM builds the grammar.
-	var emailTriageCfg *tools.TriageConfig
+	var emailTriageCfg *pipelines.TriageConfig
 	if db.Pool != nil && cfg.EmbedURL != "" && svc.DTC != nil {
-		emailTriageCfg = &tools.TriageConfig{
+		emailTriageCfg = &pipelines.TriageConfig{
 			Pool:          db.Pool,
 			EmbedEndpoint: cfg.EmbedURL,
 			EmbedModel:    cfg.EmbedModel,
@@ -325,7 +327,7 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 		}
 	}
 
-	registerGmailTools(registry, db.Pool, emailTriageCfg, cfg.EmailCheckLookback, cfg.EmailDisplayBatch)
+	registerGmailTools(registry, db.Pool, emailTriageCfg, cfg.EmailDisplayBatch)
 	registerCalendarTools(registry, db.Pool)
 	registerWebTools(registry, cfg.SearxngURL)
 

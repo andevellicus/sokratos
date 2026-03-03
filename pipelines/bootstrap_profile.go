@@ -1,4 +1,4 @@
-package tools
+package pipelines
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
@@ -32,12 +33,13 @@ type bootstrapTrait struct {
 // BootstrapConfig holds dependencies for the /bootstrap command.
 type BootstrapConfig struct {
 	Pool          *pgxpool.Pool
-	DTC           *DeepThinkerClient
+	DTC           *clients.DeepThinkerClient
 	EmbedEndpoint string
 	EmbedModel    string
 	AgentName     string
-	SendFunc      func(string) // Telegram notification on completion/failure
-	OnProfile     func()       // refresh engine profile/personality
+	SendFunc      func(string)               // Telegram notification on completion/failure
+	OnProfile     func()                      // refresh engine profile/personality
+	BgGrammarFn   memory.GrammarSubagentFunc  // entity enrichment for saved memories
 }
 
 // bootstrapResult classifies the outcome of a single bootstrap attempt.
@@ -80,7 +82,7 @@ func RunBootstrap(cfg BootstrapConfig) {
 	backoff := 5 * time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		result, state := bootstrapAttempt(ctx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, prompt, userContent, cfg.OnProfile, attempt)
+		result, state := bootstrapAttempt(ctx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, prompt, userContent, cfg.OnProfile, cfg.BgGrammarFn, attempt)
 
 		switch state {
 		case bsSuccess:
@@ -173,7 +175,7 @@ func isTransientDTCError(err error) bool {
 }
 
 // bootstrapAttempt runs one DTC call + parse cycle. Returns (result, state).
-func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), attempt int) (string, bootstrapResult) {
+func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), bgGrammarFn memory.GrammarSubagentFunc, attempt int) (string, bootstrapResult) {
 	raw, err := dtc.CompleteNoThink(ctx, prompt, userContent, 8192)
 	if err != nil {
 		logger.Log.Errorf("[bootstrap] deep thinker call failed: %v", err)
@@ -193,7 +195,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerC
 	// Try dual structure first; fall back to legacy single-object format.
 	var dual bootstrapOutput
 	if err := json.Unmarshal([]byte(cleaned), &dual); err == nil && len(dual.Personality) > 0 {
-		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, dual)
+		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, bgGrammarFn, dual)
 		if bErr != nil {
 			logger.Log.Errorf("[bootstrap] failed: %v", bErr)
 			return "Bootstrap failed — could not save profile. Check the logs for details.", bsFatal
@@ -231,7 +233,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *DeepThinkerC
 // bootstrapDual processes the dual-structure bootstrap output: writes personality
 // traits, extracts user preferences and recurring topics to their native stores,
 // and writes a compact identity card (name + important_people only).
-func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, dual bootstrapOutput) (string, error) {
+func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, bgGrammarFn memory.GrammarSubagentFunc, dual bootstrapOutput) (string, error) {
 	// Write personality traits.
 	traitCount := 0
 	for _, t := range dual.Personality {
@@ -298,7 +300,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 			Source:        "bootstrap",
 			EmbedEndpoint: embedEndpoint,
 			EmbedModel:    embedModel,
-		}, nil)
+		}, bgGrammarFn, nil)
 		topicCount++
 	}
 	if topicCount > 0 {
@@ -327,20 +329,22 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 		return "", fmt.Errorf("write identity profile: %w", err)
 	}
 
-	// Seed default routines.
+	// Seed default routines (structured format matching routines.toml schema).
 	defaultRoutines := []struct {
-		Name        string
-		Interval    string
-		Instruction string
+		Name          string
+		Interval      string
+		Tool          *string
+		Goal          *string
+		SilentIfEmpty bool
 	}{
-		{"check-calendar", "4 hours", "Check upcoming calendar events using check_calendar. Alert about any events today or tomorrow."},
+		{"check-calendar", "6 hours", strPtr("search_calendar"), strPtr("Alert about any events today or tomorrow."), true},
 	}
 	for _, r := range defaultRoutines {
 		_, err := pool.Exec(ctx,
-			`INSERT INTO routines (name, interval_duration, instruction)
-			 VALUES ($1, $2::interval, $3)
+			`INSERT INTO routines (name, interval_duration, tool, goal, silent_if_empty)
+			 VALUES ($1, $2::interval, $3, $4, $5)
 			 ON CONFLICT (name) DO NOTHING`,
-			r.Name, r.Interval, r.Instruction)
+			r.Name, r.Interval, r.Tool, r.Goal, r.SilentIfEmpty)
 		if err != nil {
 			logger.Log.Warnf("[bootstrap] failed to seed routine %s: %v", r.Name, err)
 		} else {
@@ -351,3 +355,5 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 	logger.Log.Infof("[bootstrap] bootstrapped %d personality traits + user profile (%d bytes)", traitCount, len(profileJSON))
 	return fmt.Sprintf("Bootstrap complete: %d personality traits written, user profile initialized.", traitCount), nil
 }
+
+func strPtr(s string) *string { return &s }

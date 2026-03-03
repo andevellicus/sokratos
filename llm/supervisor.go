@@ -24,8 +24,24 @@ var softErrorPatterns = []string{
 
 // isToolSoftError returns true when a tool result string indicates a
 // user-facing failure (soft error convention: return "error message", nil).
+// Structured data (JSON objects/arrays, count-prefixed results) is never
+// treated as a soft error, even if the content happens to contain words
+// like "error" or "failed" in news headlines or article summaries.
 func isToolSoftError(result string) bool {
-	lower := strings.ToLower(result)
+	trimmed := strings.TrimSpace(result)
+	if len(trimmed) == 0 {
+		return false
+	}
+	// Structured data is never a soft error.
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return false
+	}
+	// Only check the first 200 characters — error messages are short,
+	// but long tool results may contain trigger words in body content.
+	lower := strings.ToLower(trimmed)
+	if len(lower) > 200 {
+		lower = lower[:200]
+	}
 	for _, pat := range softErrorPatterns {
 		if strings.Contains(lower, pat) {
 			return true
@@ -103,15 +119,6 @@ var closingToolIntentRe = regexp.MustCompile(`<[/\\]TOOL_INT[A-Z]*>`)
 // a <CODE> block, including common model mistakes (backslash closer,
 // truncated tags, etc.).
 var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)<[/\\]?TOOL_INT[A-Z]*>`)
-
-// stripToolIntentTags removes all <TOOL_INTENT>...</TOOL_INTENT> blocks from
-// a string, returning only the surrounding prose. Used to preserve substantive
-// text from intermediate supervisor rounds that also contain a tool call.
-func stripToolIntentTags(s string) string {
-	s = toolIntentCodeRe.ReplaceAllString(s, "")
-	s = toolIntentRe.ReplaceAllString(s, "")
-	return strings.TrimSpace(s)
-}
 
 // extractToolIntent extracts the content of the first <TOOL_INTENT> tag.
 // It tries the CODE-block pattern first, then falls back to the simple one.
@@ -338,7 +345,7 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		// Check for tool intent.
 		if intent, ok := extractToolIntent(content); ok {
 			// Preserve any substantive prose that accompanies the tool intent.
-			if prose := stripToolIntentTags(content); prose != "" {
+			if prose := textutil.StripToolIntentTags(content); prose != "" {
 				intermediateText = append(intermediateText, prose)
 			}
 

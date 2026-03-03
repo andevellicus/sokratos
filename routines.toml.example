@@ -1,0 +1,59 @@
+# Single-tool routine with interval trigger.
+[check-calendar]
+interval = "6 hours"
+tool = "search_calendar"
+goal = "Alert about any events today or tomorrow."
+silent_if_empty = true
+
+# Tool arguments with template expansion.
+# Base templates: {{today}}, {{tomorrow}}, {{yesterday}}, {{now}}
+# Relative offsets: {{now-2h}}, {{today+3d}}, {{yesterday-1w}}, {{now+30m}}
+# Offset units: m (minutes), h (hours), d (days), w (weeks).
+# All times expanded at execution time in local timezone.
+[check-calendar-today]
+interval = "4 hours"
+tool = "search_calendar"
+goal = "Summarize today's remaining events."
+silent_if_empty = true
+
+[check-calendar-today.tool_args.search_calendar]
+time_min = "{{today}}"
+time_max = "{{tomorrow}}"
+
+# Passing arbitrary (non-template) arguments to a skill.
+# Any key/value pairs are passed as JSON args to the tool.
+# Non-string values (numbers, booleans) pass through as-is.
+[feed-check]
+interval = "4 hours"
+tool = "get-feeds"
+goal = "Send a digest of the top articles."
+silent_if_empty = true
+
+[feed-check.tool_args.get-feeds]
+count = 5
+feed = "ars-technica"
+
+# Multi-tool routine with schedule trigger and tool_args.
+# Tools are called in order; results are concatenated and passed to the orchestrator.
+[morning-briefing]
+schedule = "06:00"
+tools = ["search_email", "get-weather", "search_calendar"]
+goal = "Synthesize the tool results into a concise daily orientation (under 15 lines)."
+
+[morning-briefing.tool_args.search_calendar]
+time_min = "{{today}}"
+time_max = "{{tomorrow}}"
+
+# Multi-time schedule: fires at each listed time independently.
+[standup-reminder]
+schedule = ["09:00", "14:00"]
+instruction = "Check calendar for meetings in the next hour and remind the user."
+
+# Combined interval + schedule: fires on whichever trigger comes first.
+# The schedule fires at 06:00 daily; the interval fires every 8 hours after that.
+[feed-digest]
+interval = "8 hours"
+schedule = "06:00"
+tool = "get-feeds"
+goal = "Select 3-5 most interesting items. Send a digest with title, summary, and link."
+silent_if_empty = true

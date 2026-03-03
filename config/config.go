@@ -18,6 +18,7 @@ type AppConfig struct {
 	LLMModel string
 
 	SearxngURL string
+	RsshubURL  string
 
 	EmbedURL   string
 	EmbedModel string
@@ -35,6 +36,8 @@ type AppConfig struct {
 
 	ConsolidationMemoryLimit int
 	HeartbeatInterval        time.Duration
+	RoutineInterval          time.Duration
+	RoutineTimeout           time.Duration
 
 	CognitiveBufferThreshold int
 	LullDuration             time.Duration
@@ -50,8 +53,8 @@ type AppConfig struct {
 	DBMaxConnIdleTime   time.Duration
 	DBHealthCheckPeriod time.Duration
 	ConfirmationTimeout time.Duration
-	EmailCheckLookback  string
-	EmailDisplayBatch   int
+	MaxSupersededProfiles int
+	EmailDisplayBatch    int
 
 	DatabaseURL string
 
@@ -72,6 +75,7 @@ func Load() *AppConfig {
 		LLMModel: os.Getenv("LLM_MODEL"),
 
 		SearxngURL: os.Getenv("SEARXNG_URL"),
+		RsshubURL:  os.Getenv("RSSHUB_URL"),
 
 		EmbedURL:   os.Getenv("EMBEDDING_URL"),
 		EmbedModel: os.Getenv("EMBEDDING_MODEL"),
@@ -89,6 +93,8 @@ func Load() *AppConfig {
 
 		ConsolidationMemoryLimit: EnvInt("CONSOLIDATION_MEMORY_LIMIT", 50),
 		HeartbeatInterval:        EnvDuration("HEARTBEAT_INTERVAL", 5*time.Minute),
+		RoutineInterval:          EnvDuration("ROUTINE_INTERVAL", 30*time.Second),
+		RoutineTimeout:           EnvDuration("ROUTINE_TIMEOUT", 5*time.Minute),
 
 		CognitiveBufferThreshold: EnvInt("COGNITIVE_BUFFER_THRESHOLD", 20),
 		LullDuration:             EnvDuration("LULL_DURATION", 20*time.Minute),
@@ -103,9 +109,9 @@ func Load() *AppConfig {
 		DBMaxConnLifetime:   EnvDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute),
 		DBMaxConnIdleTime:   EnvDuration("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
 		DBHealthCheckPeriod: EnvDuration("DB_HEALTH_CHECK_PERIOD", 30*time.Second),
-		ConfirmationTimeout: EnvDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
-		EmailCheckLookback:  EnvString("EMAIL_CHECK_LOOKBACK", "newer_than:1h"),
-		EmailDisplayBatch:   EnvInt("EMAIL_DISPLAY_BATCH", 5),
+		ConfirmationTimeout:  EnvDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
+		MaxSupersededProfiles: EnvInt("MAX_SUPERSEDED_PROFILES", 20),
+		EmailDisplayBatch:    EnvInt("EMAIL_DISPLAY_BATCH", 5),
 
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 

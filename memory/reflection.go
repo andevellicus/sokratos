@@ -27,7 +27,7 @@ func CountMemoriesSince(ctx context.Context, db *pgxpool.Pool, since time.Time) 
 	err := db.QueryRow(ctx,
 		`SELECT COUNT(*) FROM memories
 		 WHERE superseded_by IS NULL
-		   AND memory_type NOT IN ('reflection', 'episode', 'identity')
+		   AND memory_type NOT IN (` + FormatSQLExclusion(ExcludeSynthetic) + `)
 		   AND created_at > $1`,
 		cutoff,
 	).Scan(&count)
@@ -44,7 +44,7 @@ func CountMemoriesSinceLastReflection(ctx context.Context, db *pgxpool.Pool) (in
 	err := db.QueryRow(ctx,
 		`SELECT COUNT(*) FROM memories
 		 WHERE superseded_by IS NULL
-		   AND memory_type NOT IN ('reflection', 'episode', 'identity')
+		   AND memory_type NOT IN (` + FormatSQLExclusion(ExcludeSynthetic) + `)
 		   AND created_at > COALESCE(
 		       (SELECT MAX(created_at) FROM memories WHERE memory_type = 'reflection'),
 		       '1970-01-01'::timestamptz

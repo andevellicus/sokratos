@@ -171,7 +171,7 @@ func TestFormatResults_Empty(t *testing.T) {
 }
 
 func TestCheckBackgroundTask_ArgParsing(t *testing.T) {
-	// We can't test with a real BackgroundTaskRunner (needs DB), but we
+	// We can't test with a real WorkTracker (needs DB), but we
 	// can verify the arg parsing and routing logic by inspecting the
 	// JSON unmarshalling and action defaults.
 

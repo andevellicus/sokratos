@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sokratos/clients"
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
@@ -53,6 +54,9 @@ func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, emb
 	if pf == nil {
 		return nil
 	}
+	if len(pf.IDs) > 0 {
+		go memory.TrackRetrieval(context.Background(), pool, pf.IDs)
+	}
 	return &prefetchResult{
 		IDs:       pf.IDs,
 		Summaries: pf.Content,
@@ -61,7 +65,7 @@ func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, emb
 
 // evaluateMemoryUsefulnessViaSubagent calls the subagent to determine whether
 // prefetched memories contributed to the assistant's response.
-func evaluateMemoryUsefulnessViaSubagent(pool *pgxpool.Pool, sc *tools.SubagentClient, memoryIDs []int64, userMsg, assistantReply, memorySummaries string) {
+func evaluateMemoryUsefulnessViaSubagent(pool *pgxpool.Pool, sc *clients.SubagentClient, memoryIDs []int64, userMsg, assistantReply, memorySummaries string) {
 	ctx, cancel := context.WithTimeout(context.Background(), tools.TimeoutUsefulnessEval)
 	defer cancel()
 

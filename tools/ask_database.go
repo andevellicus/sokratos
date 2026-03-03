@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/textutil"
 )
@@ -20,7 +21,7 @@ type askDBArgs struct {
 // into PostgreSQL via the subagent, executes it, and returns the results.
 // The database schema is fetched dynamically from information_schema so the
 // model always sees the current table definitions.
-func NewAskDatabase(pool *pgxpool.Pool, sc *SubagentClient) ToolFunc {
+func NewAskDatabase(pool *pgxpool.Pool, sc *clients.SubagentClient) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a askDBArgs
 		if err := json.Unmarshal(args, &a); err != nil {

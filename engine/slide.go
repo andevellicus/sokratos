@@ -24,10 +24,11 @@ type ArchiveDeps struct {
 	DB            *pgxpool.Pool
 	EmbedEndpoint string
 	EmbedModel    string
+	DTCQueueFn    memory.WorkQueueFunc       // DTC work queue — preferred for distillation (less hallucination)
 	SubagentFn    memory.SubagentFunc        // blocking, for distillation fallback
 	GrammarFn     memory.GrammarSubagentFunc // blocking, for distillation with grammar
 	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
-	QueueFn       memory.WorkQueueFunc       // background work queue for distillation (preferred over GrammarFn)
+	QueueFn       memory.WorkQueueFunc       // subagent work queue for distillation fallback
 }
 
 // SlideAndArchiveContext trims old messages from the StateManager's
@@ -189,21 +190,49 @@ string ::= "\"" [^"\\]* "\""
 number ::= [0-9] ("." [0-9]+)?
 ws ::= [ \t\n\r]*`
 
-// distillAndSaveArchive runs the cleaned archive text through a subagent to
-// extract lasting facts, then saves each fact individually. Prefers the work
-// queue (QueueFn) which gives each item its own fresh context, preventing
-// queue wait time from eating into inference time. Falls back to direct
-// GrammarFn/SubagentFn calls, then to raw archive save.
+// distillAndSaveArchive runs the archive text through an LLM to extract
+// lasting facts, then saves each fact individually. Prefers DTC (Qwen3.5-27B
+// NoThink) for accuracy; falls back to the subagent work queue, then direct
+// GrammarFn/SubagentFn calls, then raw archive save.
 func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
-	if deps.QueueFn == nil && deps.GrammarFn == nil && deps.SubagentFn == nil {
+	if deps.DTCQueueFn == nil && deps.QueueFn == nil && deps.GrammarFn == nil && deps.SubagentFn == nil {
 		memory.SaveToMemoryAsync(deps.DB, deps.EmbedEndpoint, deps.EmbedModel, "conversation_archive", archiveText)
 		return
 	}
 
 	prompt := strings.TrimSpace(prompts.DistillConversation)
 
-	// Prefer the work queue — each item gets its own fresh context, so queue
-	// wait time doesn't eat into the inference timeout.
+	// Prefer DTC work queue — larger model, much less prone to hallucination
+	// than the small subagent. On failure, fall through to
+	// the subagent queue rather than discarding the archive.
+	if deps.DTCQueueFn != nil {
+		deps.DTCQueueFn(memory.WorkRequest{
+			Label:        "distillation",
+			SystemPrompt: prompt,
+			UserPrompt:   archiveText,
+			Grammar:      distillationGrammar,
+			MaxTokens:    2048,
+			Timeout:      timeouts.Distillation,
+			Retries:      2,
+			OnComplete: func(raw string, err error) {
+				if err != nil {
+					logger.Log.Warnf("[slide] DTC distillation failed: %v; falling back to subagent", err)
+					distillViaSubagent(deps, prompt, archiveText)
+					return
+				}
+				saveDistilledFacts(deps, raw)
+			},
+		})
+		return
+	}
+
+	distillViaSubagent(deps, prompt, archiveText)
+}
+
+// distillViaSubagent runs distillation through the subagent work queue
+// (preferred) or a direct GrammarFn/SubagentFn call. Used as the primary
+// fallback when DTC is unavailable or fails.
+func distillViaSubagent(deps ArchiveDeps, prompt, archiveText string) {
 	if deps.QueueFn != nil {
 		deps.QueueFn(memory.WorkRequest{
 			Label:        "distillation",
@@ -224,7 +253,11 @@ func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
 		return
 	}
 
-	// Fallback: direct call (no queue available).
+	// Direct call (no queue available).
+	if deps.GrammarFn == nil && deps.SubagentFn == nil {
+		logger.Log.Warn("[slide] no distillation backend available; discarding archive")
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeouts.Distillation)
 	defer cancel()
 
@@ -310,7 +343,7 @@ func saveDistilledFacts(deps ArchiveDeps, raw string) {
 			}
 			logger.Log.Infof("[slide] contradiction-checked+saved id=%d (salience=%.0f): %.60s", id, req.Salience, req.Summary)
 		} else {
-			memory.SaveToMemoryWithSalienceAsync(deps.DB, req, deps.GrammarFn)
+			memory.SaveToMemoryWithSalienceAsync(deps.DB, req, deps.GrammarFn, deps.QueueFn)
 		}
 		saved++
 	}
@@ -341,41 +374,28 @@ func isNearDuplicate(deps ArchiveDeps, text string) bool {
 }
 
 // recoverPartialFacts attempts to salvage complete fact objects from truncated
-// JSON output. Finds complete {"text":...,"salience":...,"tags":...} objects
-// and parses them individually.
+// JSON output. Uses encoding/json's decoder to locate each object's exact byte
+// extent, correctly handling } characters inside string values (which a naive
+// brace-depth counter would misparse).
 func recoverPartialFacts(s string) []distilledFact {
 	var facts []distilledFact
 	for {
-		// Find the start of the next fact object.
 		idx := strings.Index(s, `{"text":`)
 		if idx < 0 {
 			break
 		}
-		s = s[idx:]
-
-		// Walk to find the matching closing brace.
-		depth := 0
-		end := -1
-		for i, ch := range s {
-			if ch == '{' {
-				depth++
-			} else if ch == '}' {
-				depth--
-				if depth == 0 {
-					end = i + 1
-					break
-				}
-			}
-		}
-		if end <= 0 {
+		// Decode one JSON value starting at the {"text": marker. The decoder
+		// handles string escaping, nested structures, and unicode correctly.
+		dec := json.NewDecoder(strings.NewReader(s[idx:]))
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
 			break // truncated mid-object, stop
 		}
-
 		var fact distilledFact
-		if err := json.Unmarshal([]byte(s[:end]), &fact); err == nil && fact.Text != "" {
+		if err := json.Unmarshal(raw, &fact); err == nil && fact.Text != "" {
 			facts = append(facts, fact)
 		}
-		s = s[end:]
+		s = s[idx+int(dec.InputOffset()):]
 	}
 	return facts
 }

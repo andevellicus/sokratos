@@ -21,8 +21,11 @@
   Time filters MUST be ISO8601 format: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", or full RFC3339. Never pass natural language like "today" or "this week" — compute the actual date. "query" is full-text search on event titles/descriptions/attendees; do NOT put temporal words in query when using time bounds. Omitted time_min defaults to now (future events only).
 - create_event: Create a Google Calendar event. Arguments: {"title": "<event title>", "start": "<RFC3339 timestamp>", "end": "<RFC3339 timestamp>", "description": "<description>", "location": "<location>", "attendees": ["email1", "email2"]}
   "title" and "start" are required. "end" defaults to start + 1 hour.
-- manage_routines: Create, update, or delete autonomous routines (routines). Arguments: {"action": "<upsert|delete>", "name": "<unique name>", "interval": "<Go duration e.g. '24h', '1h', '168h'>", "instruction": "<what to do when the routine fires>"}
-  "action" and "name" are required. "interval" and "instruction" are required for upsert. Routines fire automatically during heartbeats when their interval elapses.
+- manage_routines: Create, update, or delete autonomous routines. Arguments: {"action": "<upsert|delete>", "name": "<unique name>", "interval": "<Go duration e.g. '4h', '24h', '168h'>", "schedule": "<'HH:MM' or ['HH:MM', 'HH:MM']>", "tool": "<single tool name>", "tools": ["tool1", "tool2"], "tool_args": {"tool_name": {"key": "value"}}, "goal": "<what to do with tool results>", "silent_if_empty": false, "instruction": "<legacy: raw instruction text>"}
+  "action" and "name" are required. For upsert, at least one trigger (interval or schedule) and one action (tool/tools or instruction) are required. Prefer structured format (tool + goal) over legacy instruction.
+  TRIGGERS: "interval" fires every N duration. "schedule" fires at specific daily times (string or array for multiple times, e.g. ["06:00", "18:00"]). Both can be set — routine fires on whichever comes first.
+  TOOL ARGS: "tool_args" passes per-tool arguments. Keys are tool names, values are argument objects. String values support template expansion: {{today}}, {{tomorrow}}, {{yesterday}}, {{now}} (expanded at execution time). Relative offsets: {{now-2h}}, {{today+3d}}, {{now+30m}}, {{yesterday-1w}}. Units: m (minutes), h (hours), d (days), w (weeks). Non-string values (numbers, booleans) pass through as-is.
+  SILENT MODE: "silent_if_empty" skips the orchestrator if the tool returns no data — use for feeds/email checks that often have nothing new.
 - ask_database: Query or modify your database using natural language. Arguments: {"natural_language_query": "<your question about the data>"}
   The query is translated to PostgreSQL by a specialized SQL model and executed. Results are returned as formatted text. Use for introspecting memories, tasks, routines, or performing bulk operations. Schema-level changes (DROP, ALTER, CREATE) are blocked.
 - create_skill: Create a new JavaScript skill that gets registered as a live tool. Arguments: {"name": "<lowercase_underscore_name>", "description": "<what the skill does>", "params": "<JSON string of param array>", "test_args": {"key": "value"}}
@@ -32,9 +35,10 @@
   - "test_args" must be a JSON OBJECT (not a string), e.g.: "test_args": {"location": "New York, NY"}
   - DO NOT put code in the JSON args. Write code in a <CODE>...</CODE> block AFTER the JSON inside the TOOL_INTENT tags. The system extracts and injects it as the "code" field automatically.
   JAVASCRIPT RUNTIME (goja/ES5 sandbox — 30s timeout):
-  - Available: args (global object with parsed params), http_request(method, url, headersObj, body) for HTTP calls
-  - NOT available: fetch, XMLHttpRequest, DOMParser, Buffer, process, console, require, setTimeout, setInterval, Node.js APIs, browser APIs
+  - Available: args (parsed params), skill_config (parsed config.toml), http_request(method, url, headers, body), console.log/warn/error, btoa/atob, sleep(ms) (max 5s), env(key) (reads SKILL_<key> env var), kv_get/kv_set/kv_delete (per-skill key-value store), hash_sha256(s), hash_hmac_sha256(key, msg)
+  - NOT available: fetch, XMLHttpRequest, DOMParser, Buffer, process, require, setTimeout, setInterval, Node.js APIs, browser APIs
   - http_request returns {status: number, body: string, headers: object}. It is synchronous — do NOT use await/async with it.
+  - kv_get/kv_set/kv_delete persist strings to a PostgreSQL key-value store namespaced per skill. Use JSON.stringify/parse for structured data. Good for dedup tracking, caching, rate-limit state.
   RETURN FORMAT CONTRACT — skills are the data layer; YOU are the presentation layer:
   - Return raw structured JSON — do NOT summarize or format inside the skill. You interpret the data and write the user-facing response.
   - For list results, always include a top-level "count" field: return {count: results.length, items: results};

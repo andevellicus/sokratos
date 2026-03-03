@@ -251,3 +251,56 @@ func TestCleanLLMJSON(t *testing.T) {
 		})
 	}
 }
+
+func TestStripToolIntentTags(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "no tags",
+			input: "Hello world",
+			want:  "Hello world",
+		},
+		{
+			name:  "clean TOOL_INTENT",
+			input: "Prose before <TOOL_INTENT>search_web: {\"query\": \"test\"}</TOOL_INTENT> and after",
+			want:  "Prose before  and after",
+		},
+		{
+			name:  "backslash closer",
+			input: `text <TOOL_INTENT>tool: {}<\TOOL_INTENT> more`,
+			want:  "text  more",
+		},
+		{
+			name:  "truncated closing tag",
+			input: "text <TOOL_INTENT>tool: {}</TOOL_INTEN> more",
+			want:  "text  more",
+		},
+		{
+			name:  "CODE block inside intent",
+			input: "before <TOOL_INTENT>create_skill: {\"name\":\"test\"}<CODE>console.log('hi')</CODE></TOOL_INTENT> after",
+			want:  "before  after",
+		},
+		{
+			name:  "CODE block with no closing TOOL_INTENT",
+			input: "before <TOOL_INTENT>create_skill: {}<CODE>code here</CODE> after",
+			want:  "before after",
+		},
+		{
+			name:  "only tags",
+			input: "<TOOL_INTENT>tool: {}</TOOL_INTENT>",
+			want:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := StripToolIntentTags(tt.input)
+			if got != tt.want {
+				t.Errorf("StripToolIntentTags(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}

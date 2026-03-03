@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
+	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/prompts"
 	"sokratos/textutil"
@@ -113,28 +111,8 @@ type stepResult struct {
 	Success     bool
 }
 
-// BackgroundTaskRunner manages async task execution with DB-backed state.
-type BackgroundTaskRunner struct {
-	db       *pgxpool.Pool
-	sendFunc func(string)
-	mu       sync.Mutex
-	running  map[int64]context.CancelFunc
-	sem      chan struct{} // concurrency limiter (cap 3)
-}
-
-// NewBackgroundTaskRunner creates a runner with the given DB pool and
-// Telegram send function.
-func NewBackgroundTaskRunner(db *pgxpool.Pool, sendFunc func(string)) *BackgroundTaskRunner {
-	return &BackgroundTaskRunner{
-		db:       db,
-		sendFunc: sendFunc,
-		running:  make(map[int64]context.CancelFunc),
-		sem:      make(chan struct{}, 3),
-	}
-}
-
 // decomposePlan calls DTC to break a directive into concrete steps.
-func decomposePlan(ctx context.Context, dtc *DeepThinkerClient, directive, extraContext string) (*taskPlan, error) {
+func decomposePlan(ctx context.Context, dtc *clients.DeepThinkerClient, directive, extraContext string) (*taskPlan, error) {
 	userContent := directive
 	if extraContext != "" {
 		userContent = fmt.Sprintf("%s\n\nContext:\n%s", directive, extraContext)
@@ -171,7 +149,7 @@ func decomposePlan(ctx context.Context, dtc *DeepThinkerClient, directive, extra
 // SubagentSupervisor (Flash); complex synthesis/analysis steps route to DTC
 // directly. A scratchpad carries concise context between steps. When dtc is
 // non-nil, mid-flight replanning is enabled on step failures.
-func executeSteps(ctx context.Context, sc *SubagentClient, dtc *DeepThinkerClient,
+func executeSteps(ctx context.Context, sc *clients.SubagentClient, dtc *clients.DeepThinkerClient,
 	dc *DelegateConfig, registry *Registry, directive string, steps []planStep,
 	progressFn func(completed, total int)) []stepResult {
 
@@ -209,7 +187,7 @@ func executeSteps(ctx context.Context, sc *SubagentClient, dtc *DeepThinkerClien
 			// Simple retrieval steps go through Flash via SubagentSupervisor.
 			logger.Log.Infof("[plan] executing step %d/%d: %s", i+1, len(steps), step.Description)
 			toolExec := NewScopedToolExec(registry, dc)
-			result, err = SubagentSupervisor(stepCtx, sc, dc.Grammar(), systemPrompt,
+			result, err = clients.SubagentSupervisor(stepCtx, sc, dc.Grammar(), systemPrompt,
 				step.Description, toolExec, 10)
 		}
 		stepCancel()
@@ -249,7 +227,7 @@ func executeSteps(ctx context.Context, sc *SubagentClient, dtc *DeepThinkerClien
 		// Check replan triggers: step failed + more than 1 step remaining + not already replanned.
 		remaining := len(steps) - (i + 1)
 		shouldReplan := !replanned && dtc != nil && remaining > 0 && !sr.Success &&
-			(consecutiveFailures >= 2 || !sr.Success)
+			(consecutiveFailures >= 2 || remaining <= 2)
 		if shouldReplan {
 			newSteps, replanErr := replanRemaining(ctx, dtc, directive, pad, steps[i+1:])
 			if replanErr != nil {
@@ -318,7 +296,7 @@ func isComplexStep(step planStep) bool {
 
 // replanRemaining asks DTC to produce a revised plan for the remaining steps
 // given the current scratchpad state and failures.
-func replanRemaining(ctx context.Context, dtc *DeepThinkerClient, directive string,
+func replanRemaining(ctx context.Context, dtc *clients.DeepThinkerClient, directive string,
 	pad *Scratchpad, remainingSteps []planStep) ([]planStep, error) {
 
 	var b strings.Builder
@@ -377,251 +355,11 @@ func formatResults(results []stepResult) string {
 	return b.String()
 }
 
-// --- BackgroundTaskRunner methods ---
-
-// Start creates a DB row, launches a goroutine, and returns the task ID.
-// Planning must complete before calling this (pass pre-decomposed steps).
-// When dtc is non-nil, mid-flight replanning and complex step routing are enabled.
-func (btr *BackgroundTaskRunner) Start(directive string, priority int, steps []planStep,
-	sc *SubagentClient, dtc *DeepThinkerClient, dc *DelegateConfig, registry *Registry) (int64, error) {
-
-	ctx := context.Background()
-	var taskID int64
-	err := btr.db.QueryRow(ctx,
-		`INSERT INTO background_tasks (directive, status, steps_total, priority) VALUES ($1, 'running', $2, $3) RETURNING id`,
-		directive, len(steps), priority,
-	).Scan(&taskID)
-	if err != nil {
-		return 0, fmt.Errorf("create background task: %w", err)
-	}
-
-	bgCtx, cancel := context.WithTimeout(ctx, TimeoutPlanBackground)
-
-	btr.mu.Lock()
-	btr.running[taskID] = cancel
-	btr.mu.Unlock()
-
-	go func() {
-		defer func() {
-			cancel()
-			btr.mu.Lock()
-			delete(btr.running, taskID)
-			btr.mu.Unlock()
-		}()
-
-		// Acquire concurrency slot.
-		select {
-		case btr.sem <- struct{}{}:
-		case <-bgCtx.Done():
-			btr.updateTask(taskID, "failed", "", "timed out waiting for execution slot")
-			return
-		}
-		defer func() { <-btr.sem }()
-
-		progressFn := func(completed, total int) {
-			if _, err := btr.db.Exec(context.Background(),
-				`UPDATE background_tasks SET steps_completed = $1 WHERE id = $2`,
-				completed, taskID,
-			); err != nil {
-				logger.Log.Warnf("[background] failed to update progress for task %d: %v", taskID, err)
-			}
-		}
-
-		results := executeSteps(bgCtx, sc, dtc, dc, registry, directive, steps, progressFn)
-		formatted := formatResults(results)
-
-		succeeded := 0
-		for _, r := range results {
-			if r.Success {
-				succeeded++
-			}
-		}
-
-		status := "completed"
-		var errMsg string
-		if succeeded == 0 {
-			status = "failed"
-			errMsg = "all steps failed"
-		} else if succeeded < len(results) {
-			errMsg = fmt.Sprintf("%d/%d steps failed", len(results)-succeeded, len(results))
-		}
-
-		btr.updateTask(taskID, status, formatted, errMsg)
-
-		if btr.sendFunc != nil {
-			label := "completed"
-			if status == "failed" {
-				label = "failed"
-			}
-			notification := fmt.Sprintf("Background task #%d %s: %s\n\n%d/%d steps succeeded.",
-				taskID, label, directive, succeeded, len(results))
-			btr.sendFunc(textutil.Truncate(notification, 500))
-		}
-	}()
-
-	return taskID, nil
-}
-
-func (btr *BackgroundTaskRunner) updateTask(id int64, status, result, errMsg string) {
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanProgressDB)
-	defer cancel()
-	_, err := btr.db.Exec(ctx,
-		`UPDATE background_tasks SET status = $1, result = $2, error_message = $3, completed_at = now() WHERE id = $4`,
-		status, result, errMsg, id,
-	)
-	if err != nil {
-		logger.Log.Errorf("[background] failed to update task %d: %v", id, err)
-	}
-}
-
-// Status returns the current state of a background task.
-func (btr *BackgroundTaskRunner) Status(ctx context.Context, taskID int64) (string, error) {
-	var status, directive string
-	var result, errMsg *string
-	var stepsTotal, stepsCompleted, priority int
-	var createdAt time.Time
-	var completedAt *time.Time
-
-	err := btr.db.QueryRow(ctx,
-		`SELECT directive, status, result, error_message, steps_total, steps_completed, created_at, completed_at, COALESCE(priority, 5)
-		 FROM background_tasks WHERE id = $1`, taskID,
-	).Scan(&directive, &status, &result, &errMsg, &stepsTotal, &stepsCompleted, &createdAt, &completedAt, &priority)
-	if err != nil {
-		return "", fmt.Errorf("task not found: %w", err)
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "Task #%d: %s\n", taskID, directive)
-	fmt.Fprintf(&b, "Status: %s | Priority: %d\n", status, priority)
-	fmt.Fprintf(&b, "Progress: %d/%d steps\n", stepsCompleted, stepsTotal)
-	fmt.Fprintf(&b, "Started: %s\n", createdAt.Format(time.RFC3339))
-	if completedAt != nil {
-		fmt.Fprintf(&b, "Completed: %s\n", completedAt.Format(time.RFC3339))
-	}
-	if errMsg != nil && *errMsg != "" {
-		fmt.Fprintf(&b, "Error: %s\n", *errMsg)
-	}
-	if result != nil && *result != "" {
-		fmt.Fprintf(&b, "\nResults:\n%s", *result)
-	}
-	return b.String(), nil
-}
-
-// Cancel cancels a running background task.
-func (btr *BackgroundTaskRunner) Cancel(taskID int64) (string, error) {
-	btr.mu.Lock()
-	cancelFn, exists := btr.running[taskID]
-	btr.mu.Unlock()
-
-	if !exists {
-		return fmt.Sprintf("Task #%d is not currently running.", taskID), nil
-	}
-
-	cancelFn()
-	btr.updateTask(taskID, "cancelled", "", "cancelled by user")
-
-	btr.mu.Lock()
-	delete(btr.running, taskID)
-	btr.mu.Unlock()
-
-	return fmt.Sprintf("Task #%d cancelled.", taskID), nil
-}
-
-// CleanupOrphans marks any 'running' tasks in the DB as 'failed' on startup.
-func (btr *BackgroundTaskRunner) CleanupOrphans() {
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanProgressDB)
-	defer cancel()
-	result, err := btr.db.Exec(ctx,
-		`UPDATE background_tasks SET status = 'failed', error_message = 'orphaned: process restarted', completed_at = now()
-		 WHERE status = 'running'`)
-	if err != nil {
-		logger.Log.Errorf("[background] orphan cleanup failed: %v", err)
-		return
-	}
-	if result.RowsAffected() > 0 {
-		logger.Log.Infof("[background] cleaned up %d orphaned tasks", result.RowsAffected())
-	}
-}
-
-// CleanupOldTasks deletes completed/failed/cancelled tasks older than 7 days.
-func (btr *BackgroundTaskRunner) CleanupOldTasks() {
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanProgressDB)
-	defer cancel()
-	result, err := btr.db.Exec(ctx,
-		`DELETE FROM background_tasks
-		 WHERE status IN ('completed', 'failed', 'cancelled')
-		   AND completed_at < NOW() - INTERVAL '7 days'`)
-	if err != nil {
-		logger.Log.Errorf("[background] old task cleanup failed: %v", err)
-		return
-	}
-	if result.RowsAffected() > 0 {
-		logger.Log.Infof("[background] cleaned up %d old tasks", result.RowsAffected())
-	}
-}
-
-// List returns a summary of running and recently completed background tasks.
-func (btr *BackgroundTaskRunner) List(ctx context.Context) (string, error) {
-	rows, err := btr.db.Query(ctx,
-		`SELECT id, directive, status, COALESCE(priority, 5), steps_total, steps_completed
-		 FROM background_tasks
-		 WHERE status = 'running'
-		    OR (status IN ('completed', 'failed', 'cancelled') AND completed_at >= NOW() - INTERVAL '24 hours')
-		 ORDER BY
-		    CASE WHEN status = 'running' THEN 0 ELSE 1 END,
-		    priority DESC,
-		    created_at DESC
-		 LIMIT 10`)
-	if err != nil {
-		return "", fmt.Errorf("list background tasks: %w", err)
-	}
-	defer rows.Close()
-
-	var b strings.Builder
-	b.WriteString("Background Tasks:\n")
-	b.WriteString("ID  | Status     | Pri | Progress | Directive\n")
-	b.WriteString("----|------------|-----|----------|----------\n")
-	count := 0
-	for rows.Next() {
-		var id int64
-		var directive, status string
-		var priority, stepsTotal, stepsCompleted int
-		if err := rows.Scan(&id, &directive, &status, &priority, &stepsTotal, &stepsCompleted); err != nil {
-			continue
-		}
-		count++
-		dir := textutil.Truncate(directive, 37)
-		fmt.Fprintf(&b, "%-4d| %-10s | %-3d | %d/%-6d | %s\n", id, status, priority, stepsCompleted, stepsTotal, dir)
-	}
-	if count == 0 {
-		b.WriteString("(no tasks)\n")
-	}
-	return b.String(), nil
-}
-
-// LaunchBackgroundPlan decomposes a directive via DTC and launches it as a
-// background task. Returns the task ID. Used by the curiosity engine.
-func LaunchBackgroundPlan(btr *BackgroundTaskRunner, dtc *DeepThinkerClient,
-	sc *SubagentClient, dc *DelegateConfig, registry *Registry,
-	directive string, priority int) (int64, error) {
-
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanDecomposition)
-	defer cancel()
-
-	plan, err := decomposePlan(ctx, dtc, directive, "")
-	if err != nil {
-		return 0, fmt.Errorf("curiosity plan decomposition: %w", err)
-	}
-	return btr.Start(directive, priority, plan.Steps, sc, dtc, dc, registry)
-}
-
-// --- Tool constructors ---
-
 // NewPlanAndExecute returns a ToolFunc that decomposes a directive into steps
 // via DTC, then executes them via SubagentSupervisor with accumulated context.
 // When background=true, planning runs synchronously but execution is async.
-func NewPlanAndExecute(dtc *DeepThinkerClient, sc *SubagentClient,
-	dc *DelegateConfig, registry *Registry, btr *BackgroundTaskRunner) ToolFunc {
+func NewPlanAndExecute(dtc *clients.DeepThinkerClient, sc *clients.SubagentClient,
+	dc *DelegateConfig, registry *Registry, wt *WorkTracker) ToolFunc {
 
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a planAndExecuteArgs
@@ -652,8 +390,8 @@ func NewPlanAndExecute(dtc *DeepThinkerClient, sc *SubagentClient,
 		}
 
 		// Phase 2: Execute.
-		if a.Background && btr != nil {
-			taskID, err := btr.Start(a.Directive, a.Priority, plan.Steps, sc, dtc, dc, registry)
+		if a.Background && wt != nil {
+			taskID, err := wt.Start(a.Directive, a.Priority, plan.Steps, sc, dtc, dc, registry)
 			if err != nil {
 				return fmt.Sprintf("Failed to start background task: %v", err), nil
 			}
@@ -666,41 +404,5 @@ func NewPlanAndExecute(dtc *DeepThinkerClient, sc *SubagentClient,
 
 		results := executeSteps(fgCtx, sc, dtc, dc, registry, a.Directive, plan.Steps, nil)
 		return formatResults(results), nil
-	}
-}
-
-// NewCheckBackgroundTask returns a ToolFunc for listing, checking status, or
-// cancelling background tasks.
-func NewCheckBackgroundTask(btr *BackgroundTaskRunner) ToolFunc {
-	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a struct {
-			TaskID int64  `json:"task_id"`
-			Action string `json:"action"`
-		}
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
-		}
-
-		action := a.Action
-		if action == "" {
-			action = "status"
-		}
-
-		switch action {
-		case "list":
-			return btr.List(ctx)
-		case "status":
-			if a.TaskID <= 0 {
-				return "task_id is required for status action", nil
-			}
-			return btr.Status(ctx, a.TaskID)
-		case "cancel":
-			if a.TaskID <= 0 {
-				return "task_id is required for cancel action", nil
-			}
-			return btr.Cancel(a.TaskID)
-		default:
-			return fmt.Sprintf("unknown action %q (use 'list', 'status', or 'cancel')", action), nil
-		}
 	}
 }

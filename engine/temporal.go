@@ -55,10 +55,10 @@ func BuildTemporalContext(ctx context.Context, db *pgxpool.Pool) string {
 		}
 	}
 
-	// Upcoming tasks (next 48 hours).
+	// Upcoming scheduled tasks (next 48 hours).
 	taskRows, err := db.Query(qCtx,
-		`SELECT description, due_at FROM tasks
-		 WHERE status = 'pending' AND due_at IS NOT NULL
+		`SELECT directive, due_at FROM work_items
+		 WHERE type = 'scheduled' AND status = 'pending' AND due_at IS NOT NULL
 		   AND due_at BETWEEN NOW() AND NOW() + INTERVAL '48 hours'
 		 ORDER BY due_at ASC LIMIT 5`)
 	if err == nil {

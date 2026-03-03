@@ -79,23 +79,6 @@ func GetEmbedding(ctx context.Context, endpoint string, model string, text strin
 	return raw.Data[0].Embedding, nil
 }
 
-// GetEmbeddings calls an OpenAI-compatible /v1/embeddings endpoint with an
-// array of texts and returns all embedding vectors in one request.
-func GetEmbeddings(ctx context.Context, endpoint string, model string, texts []string) ([][]float32, error) {
-	raw, err := doEmbeddingRequest(ctx, endpoint, model, texts)
-	if err != nil {
-		return nil, err
-	}
-	if len(raw.Data) != len(texts) {
-		return nil, fmt.Errorf("embedding server returned %d vectors for %d inputs", len(raw.Data), len(texts))
-	}
-	result := make([][]float32, len(raw.Data))
-	for i, d := range raw.Data {
-		result[i] = d.Embedding
-	}
-	return result, nil
-}
-
 // embedWithFallback embeds text, recursively splitting in half on "too large"
 // errors from the embedding server. Returns one or more (text, embedding)
 // pairs. The minimum split size is 100 bytes to prevent infinite recursion.

@@ -47,7 +47,11 @@ Rules:
 - Do NOT repeat information the user already knows.
 - Do NOT offer unsolicited help.
 - Prefer "none" unless there is a clear, actionable, time-sensitive reason to act.
-- A pending task is only actionable if it is overdue or due within the next hour AND you can make progress without user input.`
+- If a background task recently completed (check <recent_actions>), consider whether follow-up is needed.
+- A pending task is only actionable if it is overdue or due within the next hour AND you can make progress without user input.
+- If <active_goals> lists goals you can make progress on, consider initiating a plan_and_execute background task via "tool" action.
+- Only pursue goals when you can make meaningful progress without user input.
+- Check <work_items> to avoid re-pursuing goals already being worked on.`
 
 // gatekeeperDecision represents the parsed gatekeeper JSON output.
 type gatekeeperDecision struct {

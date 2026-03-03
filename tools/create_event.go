@@ -40,11 +40,15 @@ func NewCreateEvent(svc *cal.Service) ToolFunc {
 		if err != nil {
 			return fmt.Sprintf("error: invalid start time: %v (expected ISO8601/RFC3339 format)", err), nil
 		}
+		// LLMs commonly append "Z" (UTC) to timestamps when they mean local
+		// time. Reinterpret UTC wall-clock values as local to prevent events
+		// from being created hours off from the user's intent.
+		startTime = timefmt.ReinterpretAsLocal(startTime)
 
 		endTime := startTime.Add(1 * time.Hour) // default: 1 hour
 		if a.End != "" {
 			if t, err := timefmt.ParseISO8601(a.End); err == nil {
-				endTime = t
+				endTime = timefmt.ReinterpretAsLocal(t)
 			} else {
 				return fmt.Sprintf("error: invalid end time: %v (expected ISO8601/RFC3339 format)", err), nil
 			}

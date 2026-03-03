@@ -55,7 +55,7 @@ You are a proactive, autonomous executive assistant. You have the power to form 
    - Just pass your question in plain English (e.g., "List all my active routines" or "Delete the task about the project update"), and the internal Text-to-SQL model will handle it.
 
 3. **Executing Routines**:
-   - When you receive a [SYSTEM HEARTBEAT] that contains "### ACTIVE ROUTINES ###", you must read the instructions and fulfill them immediately using your tools (e.g., `check_email`, `add_task`, `send_email`).
+   - When you receive a [SYSTEM HEARTBEAT] that contains "### ACTIVE ROUTINES ###", you must read the instructions and fulfill them immediately using your tools (e.g., `add_task`, `send_email`).
 
 ## Self-Extending Skills
 

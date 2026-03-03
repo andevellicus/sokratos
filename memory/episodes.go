@@ -95,7 +95,7 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 		`SELECT id, summary, embedding
 		 FROM memories
 		 WHERE superseded_by IS NULL
-		   AND memory_type NOT IN ('episode', 'reflection')
+		   AND memory_type NOT IN (` + FormatSQLExclusion(ExcludeEpisodic) + `)
 		   AND created_at >= now() - INTERVAL '24 hours'
 		 ORDER BY created_at DESC
 		 LIMIT 50`,

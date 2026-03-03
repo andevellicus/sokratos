@@ -1,0 +1,48 @@
+# --- Reddit (native RSS feed, no auth required) ---
+[[feeds]]
+name = "reddit-ml"
+type = "reddit"
+subreddit = "MachineLearning"
+sort = "hot"                        # hot, new, top, rising
+count = 5
+
+# --- Twitter (via RSSHub, requires TWITTER_AUTH_TOKEN) ---
+[[feeds]]
+name = "twitter"
+type = "twitter"
+lists = ["1234567890"]              # Twitter list IDs from x.com/i/lists/<id>
+# accounts = ["karpathy", "ylecun"] # Per-account routes (lists preferred)
+count = 5
+
+# --- Generic RSSHub route ---
+# See https://docs.rsshub.app for all available routes.
+[[feeds]]
+name = "hackernews"
+type = "rsshub"
+route = "/hackernews/best"
+count = 5
+
+# --- News sources (via RSSHub) ---
+[[feeds]]
+name = "ars-technica"
+type = "rsshub"
+route = "/arstechnica/index"
+count = 5
+
+[[feeds]]
+name = "reuters"
+type = "rsshub"
+route = "/reuters/world"
+count = 5
+
+[[feeds]]
+name = "bbc-news"
+type = "rsshub"
+route = "/bbc/world"
+count = 5
+
+[[feeds]]
+name = "ap-news"
+type = "rsshub"
+route = "/apnews/topics/apf-topnews"
+count = 5

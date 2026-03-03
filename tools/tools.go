@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/textutil"
 )
@@ -164,6 +165,21 @@ func (r *Registry) DynamicToolDescriptions() string {
 	return b.String()
 }
 
+// Call is a convenience method that marshals args into JSON and invokes the
+// named tool. Use this when calling a tool programmatically without constructing
+// a raw ToolCall JSON payload.
+func (r *Registry) Call(ctx context.Context, name string, args any) (string, error) {
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return "", fmt.Errorf("marshal args for %s: %w", name, err)
+	}
+	raw, err := json.Marshal(ToolCall{Name: name, Arguments: argsJSON})
+	if err != nil {
+		return "", fmt.Errorf("marshal tool call for %s: %w", name, err)
+	}
+	return r.Execute(ctx, raw)
+}
+
 // Execute parses raw JSON into a ToolCall, looks up the tool, and invokes it.
 func (r *Registry) Execute(ctx context.Context, raw json.RawMessage) (string, error) {
 	var tc ToolCall
@@ -188,7 +204,7 @@ func (r *Registry) Execute(ctx context.Context, raw json.RawMessage) (string, er
 // NewScopedToolExec returns a SubagentToolExec that validates tool availability
 // against dc before delegating to the registry. Use this wherever a subagent
 // supervisor loop needs restricted tool access.
-func NewScopedToolExec(registry *Registry, dc *DelegateConfig) SubagentToolExec {
+func NewScopedToolExec(registry *Registry, dc *DelegateConfig) clients.SubagentToolExec {
 	return func(ctx context.Context, raw json.RawMessage) (string, error) {
 		var tc ToolCall
 		if err := json.Unmarshal(raw, &tc); err != nil {

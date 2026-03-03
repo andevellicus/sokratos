@@ -36,7 +36,7 @@ func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, que
 		`SELECT id, summary, created_at
 		 FROM memories
 		 WHERE superseded_by IS NULL
-		   AND memory_type NOT IN ('identity', 'reflection')
+		   AND memory_type NOT IN (` + FormatSQLExclusion(ExcludeInternal) + `)
 		 ORDER BY `+RankingOrderBy(1, 2)+`
 		 LIMIT `+fmt.Sprintf("%d", limit),
 		pgvector.NewVector(emb), fulltext,

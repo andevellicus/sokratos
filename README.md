@@ -147,7 +147,7 @@ The orchestrator has access to the following built-in tools:
 | `read_url` | Fetch and extract content from a web page |
 | `run_code` | Execute JavaScript code in a sandboxed goja runtime |
 | `add_task` / `complete_task` | Manage scheduled tasks with recurrence |
-| `manage_routines` | Create persistent background habits — syncs to `routines.toml` |
+| `manage_routines` | Create persistent background habits with tool args and templates — syncs to `routines.toml` |
 | `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
@@ -179,8 +179,7 @@ Skills execute in a goja ES5 sandbox (30s timeout) with:
 | Skill | Config | Output |
 |-------|--------|--------|
 | `get-weather` | `location` | `{location, current: {condition, temp_f, humidity, ...}, forecast: [{date, high_f, low_f, condition}]}` |
-| `get-news` | `sources`, `topics` | `{count, articles: [{title, url, snippet, source, date}]}` |
-| `twitter-feed` | `accounts`, `topics` | `{count, tweets: [{author, text, snippet, url, date}]}` |
+| `get-feeds` | `feeds` | RSS/Atom aggregator supporting Twitter (via RSSHub), Reddit (native RSS), and any RSSHub route (news sites, HN, YouTube, etc.) |
 
 ### Creating Skills
 
@@ -194,19 +193,52 @@ In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (H
 
 ## Routines
 
-Routines are persistent background habits defined in `routines.toml` and synced to PostgreSQL. They execute on a configurable interval during the heartbeat loop.
+Routines are persistent background habits defined in `routines.toml` and synced to PostgreSQL. They execute during the heartbeat loop when their trigger fires. All routine logic lives in the `routines/` package.
 
 ### Structured Format (preferred)
 
 ```toml
-[news-digest]
+[feed-digest]
 interval = "4 hours"
-tool = "get-news"
-goal = "Select 3-5 articles relevant to my interests. Send a digest."
+tool = "get-feeds"
+goal = "Select 3-5 most interesting items. Send a digest with title, summary, and link."
 silent_if_empty = true
 ```
 
 When `tool` is set, the engine calls it directly, then passes the result + `goal` to the orchestrator for interpretation. If `silent_if_empty = true` and the tool returns no data, the orchestrator is skipped entirely (no message sent).
+
+### Multi-Tool with Tool Args
+
+```toml
+[morning-briefing]
+schedule = "06:00"
+tools = ["search_email", "get-weather", "search_calendar"]
+goal = "Synthesize everything into a concise daily orientation."
+
+[morning-briefing.tool_args.search_calendar]
+time_min = "{{today}}"
+time_max = "{{tomorrow}}"
+```
+
+`tool_args` provides per-tool arguments with template expansion at execution time. Non-string values (numbers, booleans) pass through as-is — you can pass any argument a tool or skill accepts.
+
+| Template | Expands to | Example |
+|----------|-----------|---------|
+| `{{today}}` | Today 00:00 | `2026-03-02T00:00:00` |
+| `{{tomorrow}}` | Tomorrow 00:00 | `2026-03-03T00:00:00` |
+| `{{yesterday}}` | Yesterday 00:00 | `2026-03-01T00:00:00` |
+| `{{now}}` | Current time | `2026-03-02T14:30:00` |
+| `{{base+offset}}` | Base time + offset | `{{now-2h}}`, `{{today+3d}}` |
+
+Offset units: `m` (minutes), `h` (hours), `d` (days), `w` (weeks). All times in local timezone.
+
+### Triggers
+
+Routines support three trigger modes:
+
+- **Interval**: `interval = "4 hours"` — fires when the duration elapses since last execution
+- **Schedule**: `schedule = "06:00"` or `schedule = ["06:00", "18:00"]` — fires at specific daily times (multi-time supported)
+- **Combined**: Both `interval` and `schedule` on the same routine — fires on whichever trigger comes first
 
 ### Legacy Format
 
@@ -222,11 +254,13 @@ Without a `tool` field, the full instruction is passed to the orchestrator which
 
 `routines.toml` is the source of truth. The database is a runtime cache. Three sync paths keep them aligned:
 
-1. **Startup** — `SyncRoutinesFromFile()` does a full sync (upsert all TOML entries, delete DB entries not in the file)
+1. **Startup** — `routines.SyncFromFile()` does a full sync (upsert all TOML entries, delete DB entries not in the file)
 2. **Heartbeat** — mtime-based incremental check on each tick; re-syncs if the file was modified
 3. **`/reload`** — Telegram command that forces an immediate full sync of both routines and skills
 
 Changes made via the `manage_routines` tool are written back to `routines.toml`.
+
+See `routines.toml.example` for more examples.
 
 ## Project Structure
 
@@ -234,7 +268,6 @@ Changes made via the `manage_routines` tool are written back to `routines.toml`.
 sokratos/
   main.go              # Telegram bot, message loop, prefetch, wiring
   register_tools.go    # Domain-grouped tool registration
-  routines.go          # Routine TOML file management, sync, and write-back
   config.go            # Environment variable helpers
   confirm.go           # Telegram confirmation gate for sensitive tools
   prefetch.go          # Subconscious memory prefetch for message loop
@@ -245,10 +278,16 @@ sokratos/
   engine/              # Heartbeat loop, context sliding, state
     engine.go          # Heartbeat: phase 1 routines, phase 2 contextual reasoning
     cognitive.go       # Event-driven cognitive processing (consolidation, episodes, reflection)
-    routines.go        # Persistent background routine execution
+    routines.go        # Routine execution within heartbeat (uses routines/ package)
     scheduler.go       # PostgreSQL-backed task scheduler
     slide.go           # Context window management and archival (ArchiveDeps)
     state.go           # Thread-safe in-memory agent state with DB-backed prefs
+  routines/            # Routine definitions, scheduling, file I/O, DB sync
+    routines.go        # Entry, DueRoutine, NilIfEmpty, IsEmptyResult
+    schedule.go        # NormalizeSchedule, ParseSchedules, IsScheduleDue (multi-time)
+    args.go            # ExpandArgs, ExpandAndMarshal (template expansion)
+    file.go            # FileWriter interface, FileAdapter, LoadFile
+    sync.go            # SyncFromFile, SyncIfChanged, Upsert, Delete, QueryDue, AdvanceTimer
   llm/                 # LLM client, supervisor pattern, tool intent extraction
     client.go          # Chat API, thinking mode, grammar constraints
     supervisor.go      # Supervisor loop with regex-based tool parsing
@@ -267,25 +306,15 @@ sokratos/
   tools/               # Tool implementations and registry
     tools.go           # Registry, Execute, NewScopedToolExec factory
     memory.go          # search_memory, save_memory, retrieval tracking
-    triage_conversation.go  # TriageConfig, TriageSaveRequest, triageAndSave core pipeline
-    triage_queue.go    # Retry queue wrappers for conversation/email triage
-    consolidate_memory.go   # Profile synthesis pipeline
-    deep_thinker_client.go  # Shared HTTP client with think/no-think modes
-    subagent_client.go # Concurrency-limited subagent client
-    subagent_supervisor.go  # Multi-turn subagent supervisor loop
-    base_client.go     # Shared HTTP base for DTC and subagent
-    processed_tracker.go    # Dedup abstraction for processed_emails/processed_events
     skills.go          # Skill loader, executor, and registry integration
     create_skill.go    # create_skill tool (JS validation, test, persist)
     personality.go     # manage_personality tool
-    transition.go      # Paradigm shift transition memory generation
-    routines.go        # manage_routines tool
+    routines.go        # manage_routines tool (uses routines/ package)
     delegate_task.go   # delegate_task tool (scoped tool access)
     plan_execute.go    # plan_and_execute + check_background_task tools
     search_web.go      # search_web tool (SearXNG)
     read_url.go        # read_url tool (web page fetching)
     run_code.go        # run_code tool (sandboxed JS execution)
-    retry_queue.go     # Background retry queue for triage failures
   httputil/            # HTTP client factory (shared transport config)
   textutil/            # Shared text processing (strip tags, extract JSON, truncate)
   googleauth/          # OAuth2 helpers for Gmail/Calendar via Telegram

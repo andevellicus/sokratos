@@ -503,7 +503,7 @@ func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMe
 			return fmt.Sprintf("Skill %q execution error (Promise rejected): %v", name, promise.Result()), nil
 		case goja.PromiseStatePending:
 			// Await pending promise
-			fmt.Printf("[skills] waiting for pending promise in %s\n", name)
+			logger.Log.Debugf("[skills] waiting for pending promise in %s", name)
 			// goja doesn't support event loops without an extension, but our http_request
 			// bridge is fully synchronous, so the promise should already be fulfilled
 			// or rejected by the time RunString completes.

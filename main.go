@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"sokratos/calendar"
+	"sokratos/clients"
 	"sokratos/config"
 	"sokratos/db"
 	"sokratos/engine"
@@ -23,72 +22,12 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/pipelines"
 	"sokratos/prompts"
-	"sokratos/timeouts"
+	"sokratos/routines"
+	"sokratos/textutil"
 	"sokratos/tools"
 )
-
-// --- Fallback Map ---
-
-// buildFallbackMap returns the deterministic fallback chains for tools that
-// have known-good alternatives. This prevents the orchestrator from wasting
-// rounds retrying tools that are likely to keep failing.
-func buildFallbackMap() llm.FallbackMap {
-	return llm.FallbackMap{
-		"get-weather": {
-			FallbackTool: "search_web",
-			ArgsTransform: func(_ string, originalArgs json.RawMessage, _ string) json.RawMessage {
-				var args struct {
-					Location string `json:"location"`
-				}
-				if err := json.Unmarshal(originalArgs, &args); err != nil || args.Location == "" {
-					args.Location = "current location"
-				}
-				b, _ := json.Marshal(map[string]string{"query": "weather " + args.Location})
-				return b
-			},
-		},
-		"get-news": {
-			FallbackTool: "search_web",
-			ArgsTransform: func(_ string, originalArgs json.RawMessage, _ string) json.RawMessage {
-				var args struct {
-					Topics string `json:"topics"`
-					Query  string `json:"query"`
-				}
-				json.Unmarshal(originalArgs, &args)
-				q := args.Topics
-				if q == "" {
-					q = args.Query
-				}
-				if q == "" {
-					q = "latest news"
-				}
-				b, _ := json.Marshal(map[string]string{"query": q + " news"})
-				return b
-			},
-		},
-		"twitter-feed": {
-			FallbackTool:   "search_web",
-			TriggerPattern: regexp.MustCompile(`(?i)timeout|no results|error|failed|deadline`),
-			ArgsTransform: func(_ string, originalArgs json.RawMessage, _ string) json.RawMessage {
-				var args struct {
-					Accounts string `json:"accounts"`
-					Topics   string `json:"topics"`
-				}
-				json.Unmarshal(originalArgs, &args)
-				q := args.Topics
-				if q == "" {
-					q = args.Accounts
-				}
-				if q == "" {
-					q = "trending"
-				}
-				b, _ := json.Marshal(map[string]string{"query": "site:x.com " + q})
-				return b
-			},
-		},
-	}
-}
 
 // --- Service Initialization ---
 
@@ -96,17 +35,17 @@ func buildFallbackMap() llm.FallbackMap {
 type serviceBundle struct {
 	Bot              *tgbotapi.BotAPI
 	Updates          tgbotapi.UpdatesChannel
-	DTC              *tools.DeepThinkerClient
+	DTC              *clients.DeepThinkerClient
 	SynthesizeFunc   memory.SynthesizeFunc
 	SubagentFunc     memory.SubagentFunc
-	BgSubagentFunc   memory.SubagentFunc        // non-blocking: skips when backends busy
 	GrammarFunc      memory.GrammarSubagentFunc  // blocking + GBNF grammar (save_memory enrichment)
 	BgGrammarFunc    memory.GrammarSubagentFunc  // non-blocking + GBNF grammar for entity extraction
 	QueueFunc        memory.WorkQueueFunc        // background work queue (enrichment, distillation)
-	Subagent         *tools.SubagentClient
+	DTCQueueFunc     memory.WorkQueueFunc        // DTC work queue for distillation
+	Subagent         *clients.SubagentClient
 	StateMgr         *engine.StateManager
 	InterruptChan    chan struct{}
-	TriageRetryQueue *tools.RetryQueue
+	TriageRetryQueue *pipelines.RetryQueue
 }
 
 func initServices(cfg *config.AppConfig) *serviceBundle {
@@ -137,9 +76,9 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 	updates := bot.GetUpdatesChan(u)
 
 	// Deep thinker client.
-	var dtc *tools.DeepThinkerClient
+	var dtc *clients.DeepThinkerClient
 	if cfg.DeepThinkerURL != "" {
-		dtc = tools.NewDeepThinkerClient(cfg.DeepThinkerURL, cfg.DeepThinkerModel)
+		dtc = clients.NewDeepThinkerClient(cfg.DeepThinkerURL, cfg.DeepThinkerModel)
 	}
 
 	// SynthesizeFunc closure.
@@ -151,11 +90,19 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		}
 	}
 
+	// DTC work queue closure.
+	var dtcQueueFn memory.WorkQueueFunc
+	if dtc != nil {
+		capturedDTC := dtc
+		dtcQueueFn = func(req memory.WorkRequest) {
+			capturedDTC.QueueWork(req)
+		}
+	}
+
 	// SubagentClient + SubagentFunc closure.
 	// Use dedicated SubagentURL if set, otherwise fall back to the on-demand router.
-	var subagent *tools.SubagentClient
+	var subagent *clients.SubagentClient
 	var subagentFunc memory.SubagentFunc
-	var bgSubagentFunc memory.SubagentFunc          // non-blocking variant for background work
 	var grammarFunc memory.GrammarSubagentFunc        // blocking + GBNF grammar (save_memory enrichment)
 	var bgGrammarFunc memory.GrammarSubagentFunc     // non-blocking + GBNF grammar for entity extraction
 	var queueFunc memory.WorkQueueFunc               // background work queue (enrichment, distillation)
@@ -164,17 +111,14 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		subagentURL = cfg.DeepThinkerURL
 	}
 	if subagentURL != "" && cfg.SubagentModel != "" {
-		subagent = tools.NewSubagentClientNamed("subagent-gemma3", subagentURL, cfg.SubagentModel, cfg.SubagentSlots)
+		subagent = clients.NewSubagentClientNamed("subagent", subagentURL, cfg.SubagentModel, cfg.SubagentSlots)
 
-		// Gemma3-only: Qwen3.5-27B is dedicated to DTC (consolidation,
-		// synthesis, consulting). Gemma3-4B handles all subagent
-		// work — triage, rewriting, re-ranking, tool calling. TryComplete
+		// Subagent handles all lightweight structured tasks — triage,
+		// rewriting, re-ranking, tool calling. DTC is dedicated to heavy
+		// reasoning (consolidation, synthesis, consulting). TryComplete
 		// skips gracefully when slots are full.
 		subagentFunc = func(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
 			return subagent.Complete(ctx, systemPrompt, userPrompt, 1024)
-		}
-		bgSubagentFunc = func(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-			return subagent.TryComplete(ctx, systemPrompt, userPrompt, 1024)
 		}
 		grammarFunc = func(ctx context.Context, systemPrompt, userPrompt, grammar string) (string, error) {
 			return subagent.CompleteWithGrammar(ctx, systemPrompt, userPrompt, grammar, 1024)
@@ -185,7 +129,7 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		queueFunc = func(req memory.WorkRequest) {
 			subagent.QueueWork(req)
 		}
-		logger.Log.Info("[startup] subagent: gemma3-only (Qwen3.5-27B dedicated to DTC)")
+		logger.Log.Info("[startup] subagent initialized (DTC dedicated to heavy reasoning)")
 	}
 
 	// OAuth via Telegram.
@@ -230,7 +174,7 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		logger.Log.Warn("ALLOWED_TELEGRAM_IDS is empty — bot will respond to everyone")
 	}
 
-	triageRetryQueue := tools.NewRetryQueue(tools.RetryQueueConfig{
+	triageRetryQueue := pipelines.NewRetryQueue(pipelines.RetryQueueConfig{
 		Name: "triage",
 	})
 	triageRetryQueue.Start()
@@ -241,10 +185,10 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		DTC:              dtc,
 		SynthesizeFunc:   synthesizeFunc,
 		SubagentFunc:     subagentFunc,
-		BgSubagentFunc:   bgSubagentFunc,
 		GrammarFunc:      grammarFunc,
 		BgGrammarFunc:    bgGrammarFunc,
 		QueueFunc:        queueFunc,
+		DTCQueueFunc:   dtcQueueFn,
 		Subagent:         subagent,
 		StateMgr:         stateMgr,
 		InterruptChan:    interruptChan,
@@ -286,12 +230,14 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	triageGrammar := grammar.BuildTriageGrammar()
 
 	logger.Log.Info("Warming up LLM model...")
-	_, err := llmClient.Chat(context.Background(), llm.ChatRequest{
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err := llmClient.Chat(warmupCtx, llm.ChatRequest{
 		Model:    cfg.LLMModel,
 		Messages: []llm.Message{{Role: "user", Content: "ping"}},
 	})
+	warmupCancel()
 	if err != nil {
-		logger.Log.Warnf("LLM warmup failed: %v", err)
+		logger.Log.Warnf("LLM warmup failed: %v (continuing anyway)", err)
 	} else {
 		logger.Log.Info("LLM model loaded and ready")
 	}
@@ -313,8 +259,8 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 	var consolidateFunc func(ctx context.Context) (int, error)
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
 		consolidateFunc = func(ctx context.Context) (int, error) {
-			return tools.ConsolidateCore(ctx, db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel, tools.ConsolidateOpts{
-				SalienceThreshold: 8,
+			return pipelines.ConsolidateCore(ctx, db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel, pipelines.ConsolidateOpts{
+				SalienceThreshold: int(memory.SalienceHigh),
 				MemoryLimit:       cfg.ConsolidationMemoryLimit,
 			}, svc.GrammarFunc)
 		}
@@ -341,6 +287,8 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		ToolExec:            registry.Execute,
 		Mu:                  &mu,
 		Interval:            cfg.HeartbeatInterval,
+		RoutineInterval:     cfg.RoutineInterval,
+		RoutineTimeout:      cfg.RoutineTimeout,
 		SM:                  svc.StateMgr,
 		DB:                  db.Pool,
 		EmbedEndpoint:       cfg.EmbedURL,
@@ -363,6 +311,7 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		},
 		InterruptChan: svc.InterruptChan,
 		Gatekeeper:    svc.Subagent,
+		DTCQueueFunc:       svc.DTCQueueFunc,
 		SubagentFunc:  svc.SubagentFunc,
 		GrammarFunc:   svc.GrammarFunc,
 		BgGrammarFunc: svc.BgGrammarFunc,
@@ -374,38 +323,67 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
 		capturedDTC := svc.DTC
 		eng.OnFirstTick = func() {
-			tools.CleanupPreTriageMemories(db.Pool)
-			tools.RunInitialConsolidation(db.Pool, capturedDTC, cfg.EmbedURL, cfg.EmbedModel, cfg.ConsolidationMemoryLimit, svc.GrammarFunc)
+			pipelines.CleanupPreTriageMemories(db.Pool)
+			pipelines.RunInitialConsolidation(db.Pool, capturedDTC, cfg.EmbedURL, cfg.EmbedModel, cfg.ConsolidationMemoryLimit, svc.GrammarFunc)
 			eng.RefreshProfile()
 			eng.RefreshPersonality()
 		}
 	}
 
-	go eng.Run()
 	return eng
 }
 
 // --- Startup Tasks ---
 
-func runStartupTasks(cfg *config.AppConfig) {
+func runStartupTasks() {
 	if db.Pool == nil {
 		return
 	}
 
-	// Migrate personality traits from monolithic profile (one-time, synchronous).
-	if cfg.EmbedURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), timeouts.PersonalityMigration)
-		if err := tools.MigrateProfileToPersonality(ctx, db.Pool, cfg.EmbedURL, cfg.EmbedModel); err != nil {
-			logger.Log.Warnf("[startup] personality migration failed: %v", err)
-		}
-		cancel()
-	}
+	// One-time migration: move pending rows from legacy tasks table to work_items.
+	migrateTasksTable()
 
 	// Sync routines from TOML file → DB (TOML is source of truth).
-	SyncRoutinesFromFile("routines.toml")
+	routines.SyncFromFile(db.Pool, "routines.toml")
 
 	// Cleanup and initial consolidation are now deferred to OnFirstTick in
 	// the engine, so Qwen3.5-27B is free for interactive requests during startup.
+}
+
+// migrateTasksTable migrates pending rows from the old tasks table to
+// work_items and drops the old table. Safe to call multiple times — no-ops
+// if the tasks table doesn't exist.
+func migrateTasksTable() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var exists bool
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM information_schema.tables
+			WHERE table_name = 'tasks' AND table_schema = 'public'
+		)`).Scan(&exists); err != nil || !exists {
+		return
+	}
+
+	result, err := db.Pool.Exec(ctx,
+		`INSERT INTO work_items (type, directive, status, due_at, recurrence, created_at)
+		 SELECT 'scheduled', description, status, due_at, recurrence, created_at
+		 FROM tasks WHERE status = 'pending'
+		 ON CONFLICT DO NOTHING`)
+	if err != nil {
+		logger.Log.Warnf("[startup] failed to migrate tasks: %v", err)
+		return
+	}
+	if result.RowsAffected() > 0 {
+		logger.Log.Infof("[startup] migrated %d pending tasks to work_items", result.RowsAffected())
+	}
+
+	if _, err := db.Pool.Exec(ctx, `DROP TABLE IF EXISTS tasks`); err != nil {
+		logger.Log.Warnf("[startup] failed to drop legacy tasks table: %v", err)
+	} else {
+		logger.Log.Info("[startup] dropped legacy tasks table")
+	}
 }
 
 // --- Main ---
@@ -425,14 +403,14 @@ func main() {
 		logger.Log.Fatal("TELEGRAM_BOT_TOKEN is not set")
 	}
 
+	memory.MaxSupersededProfiles = cfg.MaxSupersededProfiles
+
 	svc := initServices(cfg)
 	defer db.Close()
 
 	registry, emailTriageCfg, delegateConfig := registerTools(cfg, svc)
 
-	// Deterministic fallback chains: when a tool fails, automatically try a
-	// known-good alternative instead of burning orchestrator rounds on retries.
-	fallbacks := buildFallbackMap()
+	var fallbacks llm.FallbackMap
 
 	lb := initLLM(cfg, registry)
 
@@ -461,17 +439,22 @@ func main() {
 		}
 	}
 
-	// Background task runner (needs engine.SendFunc).
-	var bgRunner *tools.BackgroundTaskRunner
+	// Work tracker: unified tracking for background plans, routines, and scheduled tasks.
+	var workTracker *tools.WorkTracker
 	if db.Pool != nil {
-		bgRunner = tools.NewBackgroundTaskRunner(db.Pool, eng.SendFunc)
-		bgRunner.CleanupOrphans()
-		bgRunner.CleanupOldTasks()
+		workTracker = tools.NewWorkTracker(db.Pool, eng.SendFunc)
+		workTracker.OnComplete = func(directive, status string) {
+			summary := fmt.Sprintf("Background task %s: %s", status, textutil.Truncate(directive, 80))
+			eng.RecordBackgroundCompletion("background_task", summary)
+		}
+		workTracker.CleanupOrphans()
+		workTracker.CleanupOldTasks()
+		eng.WorkMonitor = workTracker
 	}
 
 	// Register tools that need the engine for refresh callbacks.
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
-		registry.Register("consolidate_memory", tools.NewConsolidateMemory(
+		registry.Register("consolidate_memory", pipelines.NewConsolidateMemory(
 			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
 			cfg.ConsolidationMemoryLimit, svc.GrammarFunc, func() {
 				eng.RefreshProfile()
@@ -529,15 +512,18 @@ func main() {
 
 	tools.AllowedInternalHosts = collectInternalHosts(cfg)
 	registerSkillTools(registry, "skills", rebuildGrammar, db.Pool)
-	registerPlanTools(registry, svc.DTC, svc.Subagent, delegateConfig, bgRunner)
+	registerPlanTools(registry, svc.DTC, svc.Subagent, delegateConfig, workTracker)
 	rebuildGrammar() // include disk-loaded skills + plan tools in grammar
 
-	// Wire hot-reload: sync skills + routines from disk on each heartbeat.
+	// Wire hot-reload: skills sync on heartbeat tick, routines sync on
+	// the independent routine scheduler tick.
 	skillMtimes := map[string]time.Time{}
-	var routineMtime time.Time
 	eng.SyncFunc = func() {
 		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, db.Pool)
-		syncRoutinesFile("routines.toml", &routineMtime)
+	}
+	var routineMtime time.Time
+	eng.RoutineSyncFunc = func() {
+		routines.SyncIfChanged(db.Pool, "routines.toml", &routineMtime)
 	}
 
 	// Wire reflection routing: inject reflection insights into conversation context.
@@ -549,13 +535,26 @@ func main() {
 	}
 
 	// Wire curiosity function for proactive research during cognitive lulls.
-	if bgRunner != nil && svc.DTC != nil && svc.Subagent != nil && delegateConfig != nil {
+	if workTracker != nil && svc.DTC != nil && svc.Subagent != nil && delegateConfig != nil {
 		eng.Cognitive.CuriosityFunc = func(directive string, priority int) (int64, error) {
-			return tools.LaunchBackgroundPlan(bgRunner, svc.DTC, svc.Subagent, delegateConfig, registry, directive, priority)
+			return tools.LaunchBackgroundPlan(workTracker, svc.DTC, svc.Subagent, delegateConfig, registry, directive, priority)
 		}
 	}
 
-	runStartupTasks(cfg)
+	// Wire goal inference for cognitive processing.
+	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
+		capturedDTC := svc.DTC
+		eng.Cognitive.GoalInferenceFunc = func(ctx context.Context) error {
+			return engine.RunGoalInference(ctx, db.Pool, capturedDTC.Complete, cfg.EmbedURL, cfg.EmbedModel, svc.GrammarFunc)
+		}
+	}
+
+	runStartupTasks()
+
+	// Start the engine after all fields, callbacks, and startup DB state are
+	// fully wired. Any goroutine started earlier (SubagentClient workers, etc.)
+	// does not access eng fields, so this is the correct synchronization point.
+	go eng.Run()
 
 	// Split the Telegram updates channel into messages and callback queries.
 	// This allows confirmToolExec (used by both the message loop and the engine
@@ -580,6 +579,19 @@ func main() {
 	// Wire the engine with the confirmation-gated executor too, so heartbeat-triggered
 	// tools (e.g. send_email from a routine) also require user approval.
 	eng.ToolExec = confirmExec
+
+	mc := messageContext{
+		cfg:            cfg,
+		svc:            svc,
+		eng:            eng,
+		lb:             lb,
+		registry:       registry,
+		emailTriageCfg: emailTriageCfg,
+		fallbacks:      fallbacks,
+		confirmExec:    confirmExec,
+		skillMtimes:    skillMtimes,
+		rebuildGrammar: rebuildGrammar,
+	}
 
 	for msg := range messageChan {
 		from := msg.From
@@ -635,149 +647,18 @@ func main() {
 
 		chatID := msg.Chat.ID
 
-		// Direct-dispatch slash commands — bypass the orchestrator entirely.
-		if strings.TrimSpace(msgText) == "/reload" {
-			// Force re-sync all TOML configs from disk → DB.
-			added, updated, deleted := SyncRoutinesFromFile("routines.toml")
-			skillsChanged := tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, db.Pool)
-			var parts []string
-			if len(added)+len(updated)+len(deleted) > 0 {
-				parts = append(parts, fmt.Sprintf("Routines: +%d ~%d -%d", len(added), len(updated), len(deleted)))
-			}
-			if skillsChanged {
-				parts = append(parts, "Skills: reloaded")
-			}
-			text := "Everything up to date."
-			if len(parts) > 0 {
-				text = "Reloaded: " + strings.Join(parts, ", ")
-			}
-			reply := tgbotapi.NewMessage(chatID, text)
-			reply.ReplyToMessageID = msg.MessageID
-			svc.Bot.Send(reply)
-			continue
-		}
-		if strings.TrimSpace(msgText) == "/bootstrap" {
-			if db.Pool == nil || svc.DTC == nil || cfg.EmbedURL == "" {
-				reply := tgbotapi.NewMessage(chatID, "Bootstrap requires database, deep thinker, and embedding service.")
-				reply.ReplyToMessageID = msg.MessageID
-				svc.Bot.Send(reply)
-				continue
-			}
-			bootstrapSend := func(text string) {
-				for id := range cfg.AllowedIDs {
-					m := tgbotapi.NewMessage(id, text)
-					svc.Bot.Send(m)
-				}
-			}
-			go tools.RunBootstrap(tools.BootstrapConfig{
-				Pool:          db.Pool,
-				DTC:           svc.DTC,
-				EmbedEndpoint: cfg.EmbedURL,
-				EmbedModel:    cfg.EmbedModel,
-				AgentName:     cfg.AgentName,
-				SendFunc:      bootstrapSend,
-				OnProfile: func() {
-					eng.RefreshProfile()
-					eng.RefreshPersonality()
-				},
-			})
-			reply := tgbotapi.NewMessage(chatID, "Profile generation started in the background. I'll notify you when it's ready.")
-			reply.ReplyToMessageID = msg.MessageID
-			svc.Bot.Send(reply)
-			continue
-		}
-
-		typingCtx, typingCancel := context.WithCancel(context.Background())
-		go sendTypingPeriodically(svc.Bot, chatID, typingCtx)
-
-		// Phase 1: Snapshot history (StateManager has its own RWMutex).
-		history := svc.StateMgr.ReadMessages()
-
-		// Phase 2: Prefetch (network I/O — no engine state needed).
-		var prefetchContent string
-		var prefetchIDs []int64
-		var prefetchSummaries string
-		if db.Pool != nil && cfg.EmbedURL != "" && strings.TrimSpace(msgText) != "" {
-			pfCtx, pfCancel := context.WithTimeout(context.Background(), tools.TimeoutPrefetch)
-			if pf := subconsciousPrefetch(pfCtx, db.Pool, cfg.EmbedURL, cfg.EmbedModel, msgText, history); pf != nil {
-				prefetchContent = pf.Summaries
-				prefetchIDs = pf.IDs
-				prefetchSummaries = pf.Summaries
-			}
-			pfCancel()
-		}
-
-		// Phase 2.5: Build temporal context (DB query — outside the lock).
-		var temporalCtx string
-		if db.Pool != nil {
-			temporalCtx = engine.BuildTemporalContext(context.Background(), db.Pool)
-		}
-
-		// Phase 3: Lock for string snapshots + orchestrator serialization.
-		eng.Mu.Lock()
-		personalityContent := eng.PersonalityContent
-		profileContent := eng.ProfileContent
-		reply, msgs, err := llm.QueryOrchestrator(context.Background(), lb.Client, cfg.LLMModel, userPrompt, confirmExec, lb.TrimFn, &llm.QueryOrchestratorOpts{
-			Parts:              visionParts,
-			History:            history,
-			PersonalityContent: personalityContent,
-			ProfileContent:     profileContent,
-			TemporalContext:    temporalCtx,
-			PrefetchContent:    prefetchContent,
-			MaxToolResultLen:   cfg.MaxToolResultLen,
-			MaxWebSources:      cfg.MaxWebSources,
-			ToolAgent:          lb.ToolAgent,
-			Fallbacks:          fallbacks,
-		})
-		eng.Mu.Unlock()
-		typingCancel()
-
-		condensed := condenseToolResults(msgs)
-		for _, m := range condensed {
-			svc.StateMgr.AppendMessage(m)
-		}
-		if db.Pool != nil && cfg.EmbedURL != "" {
-			engine.SlideAndArchiveContext(context.Background(), svc.StateMgr, eng.MaxMessages, engine.ArchiveDeps{
-				DB: db.Pool, EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel, SubagentFn: svc.SubagentFunc, GrammarFn: svc.GrammarFunc, BgGrammarFn: svc.BgGrammarFunc, QueueFn: svc.QueueFunc,
-			})
-		}
-
-		if err == nil && db.Pool != nil && cfg.EmbedURL != "" && svc.DTC != nil {
-			toolCtx, toolsUsed := summarizeToolContext(msgs)
-			exchange := toolCtx + fmt.Sprintf("user: %s\nassistant: %s", msgText, reply)
-			tools.TriageAndSaveConversationAsync(*emailTriageCfg, exchange, toolsUsed)
-		}
-
-		if err == nil && len(prefetchIDs) > 0 && db.Pool != nil && svc.Subagent != nil {
-			capturedIDs := prefetchIDs
-			capturedReply := reply
-			capturedMsgText := msgText
-			capturedSubagent := svc.Subagent
-			capturedSummaries := prefetchSummaries
-			go evaluateMemoryUsefulnessViaSubagent(db.Pool, capturedSubagent, capturedIDs, capturedMsgText, capturedReply, capturedSummaries)
-		}
-
-		if err != nil {
-			logger.Log.Errorf("LLM error: %v", err)
-			reply = "Sorry, something went wrong processing your message."
-		}
-
-		// Don't send orchestrator control tags to the user.
-		if strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
-			continue
-		}
-
-		// Format reply with entity-based markdown. `reply` already includes
-		// accumulated intermediate text from tool-call rounds (prepended by
-		// the supervisor). Thinking is logged in the supervisor, not shown in UI.
-		fm := formatReply(reply)
-		if _, err := sendFormatted(svc.Bot, chatID, msg.MessageID, fm); err != nil {
-			logger.Log.Warnf("Entity send failed, falling back to plain text: %v", err)
-			replyMsg := tgbotapi.NewMessage(chatID, reply)
-			replyMsg.ReplyToMessageID = msg.MessageID
-			if _, err := svc.Bot.Send(replyMsg); err != nil {
-				logger.Log.Errorf("Error sending message: %v", err)
-			}
+		// Direct-dispatch slash commands bypass the orchestrator entirely.
+		switch strings.TrimSpace(msgText) {
+		case "/reload":
+			r := tgbotapi.NewMessage(chatID, handleReload(mc))
+			r.ReplyToMessageID = msg.MessageID
+			svc.Bot.Send(r)
+		case "/bootstrap":
+			r := tgbotapi.NewMessage(chatID, handleBootstrap(mc))
+			r.ReplyToMessageID = msg.MessageID
+			svc.Bot.Send(r)
+		default:
+			processMessage(mc, msg, chatID, msgText, userPrompt, visionParts)
 		}
 	}
 }

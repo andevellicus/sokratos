@@ -16,10 +16,20 @@ import (
 )
 
 // GatekeeperClient is the interface for fast gatekeeper calls. Satisfied by
-// *tools.SubagentClient — defined as an interface here to avoid a circular
-// import between engine and tools.
+// *clients.SubagentClient — defined as an interface here to avoid a circular
+// import between engine and clients.
 type GatekeeperClient interface {
 	CompleteWithGrammar(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error)
+}
+
+// WorkMonitor tracks running work items (routines, background plans, scheduled
+// tasks) and can kill hung work that exceeds its timeout. Satisfied by
+// *tools.WorkTracker — defined as an interface to avoid circular imports.
+type WorkMonitor interface {
+	TrackStart(workType, directive string, timeout time.Duration) int64
+	SetCancel(id int64, cancel context.CancelFunc)
+	TrackEnd(id int64, status, errMsg string)
+	KillHungWork() int
 }
 
 // LLMConfig groups model and orchestrator-related fields.
@@ -42,6 +52,7 @@ type CognitiveConfig struct {
 	ReflectionPrompt          string                                                                  // system prompt for reflection synthesis
 	SynthesizeFunc            func(ctx context.Context, systemPrompt, content string) (string, error) // LLM call for synthesis
 	CuriosityFunc             CuriosityFunc                                                           // launches background research tasks (nil = disabled)
+	GoalInferenceFunc         func(ctx context.Context) error                                        // infer user goals from recent patterns (nil = disabled)
 }
 
 // Engine holds all dependencies for the heartbeat loop.
@@ -51,6 +62,7 @@ type Engine struct {
 	ToolExec           func(context.Context, json.RawMessage) (string, error)
 	Mu                 *sync.Mutex
 	Interval           time.Duration
+	RoutineInterval    time.Duration // polling interval for the routine scheduler (default 30s)
 	SM                 *StateManager
 	DB                 *pgxpool.Pool // nil when running without database
 	EmbedEndpoint      string        // empty when embeddings unavailable
@@ -65,18 +77,23 @@ type Engine struct {
 	SendFunc            func(text string)    // sends a message to the user via Telegram
 	InterruptChan       chan struct{}        // signals the task scheduler to recalculate
 	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
+	DTCQueueFunc        memory.WorkQueueFunc       // DTC work queue — preferred for distillation (less hallucination)
 	SubagentFunc        memory.SubagentFunc        // for conversation archive distillation (nil = skip distillation)
 	GrammarFunc         memory.GrammarSubagentFunc // for grammar-constrained quality scoring (nil = skip enrichment)
 	BgGrammarFunc       memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
 	QueueFunc           memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
-	SyncFunc             func()               // hot-reload skills + routines from disk (called each heartbeat tick)
+	WorkMonitor          WorkMonitor           // tracks running work items; nil = no tracking
+	RoutineTimeout       time.Duration         // max duration for a single routine execution (default 5m)
+	SyncFunc             func()               // hot-reload skills from disk (called each heartbeat tick)
+	RoutineSyncFunc      func()               // hot-reload routines from disk (called each routine scheduler tick)
 	ReflectionNotifyFunc func(summary string) // inject reflection insights into conversation context (nil = skip)
 	OnFirstTick          func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
 
 	// Internal timers (not configured externally).
-	lastCognitiveRun   time.Time
-	lastMaintenanceRun time.Time
-	lastCuriosityRun   time.Time
+	lastCognitiveRun      time.Time
+	lastMaintenanceRun    time.Time
+	lastCuriosityRun      time.Time
+	lastGoalInferenceRun  time.Time
 	lastHeartbeatHash  [32]byte // SHA-256 of last proactive heartbeat reply (dedup guard)
 	recentActions      []actionRecord // last ≤5 actions taken (routines + heartbeat); no mutex — sequential callers only
 }
@@ -94,6 +111,14 @@ func (e *Engine) recordAction(typ, summary string) {
 	if len(e.recentActions) > 5 {
 		e.recentActions = e.recentActions[len(e.recentActions)-5:]
 	}
+}
+
+// RecordBackgroundCompletion records a background task completion as a recent
+// action, safe for concurrent use from background goroutines.
+func (e *Engine) RecordBackgroundCompletion(typ, summary string) {
+	e.Mu.Lock()
+	defer e.Mu.Unlock()
+	e.recordAction(typ, summary)
 }
 
 // withOrchestratorLock runs fn while holding the orchestrator mutex.
@@ -135,17 +160,14 @@ func (e *Engine) sendDeduped(text, logLabel string) bool {
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.
 func (e *Engine) archiveDeps() ArchiveDeps {
-	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, SubagentFn: e.SubagentFunc, GrammarFn: e.GrammarFunc, BgGrammarFn: e.BgGrammarFunc, QueueFn: e.QueueFunc}
+	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, DTCQueueFn: e.DTCQueueFunc, SubagentFn: e.SubagentFunc, GrammarFn: e.GrammarFunc, BgGrammarFn: e.BgGrammarFunc, QueueFn: e.QueueFunc}
 }
 
-// Run starts a blocking loop that fires at the given interval. Each tick, it
-// reads the current agent state, builds a heartbeat prompt with the state
-// in Markdown, and sends it to the LLM orchestrator. Maintenance (decay,
-// pruning) and cognitive processing (reflection, episode synthesis, profile
-// consolidation) are evaluated within each heartbeat tick using volume + lull
-// triggers. It serializes LLM access through Mu.
-// If a database is available, it starts a PostgreSQL-backed task scheduler
-// goroutine alongside the heartbeat loop.
+// Run starts the engine's background loops. Three independent loops run
+// concurrently: (1) the heartbeat loop for contextual reasoning, maintenance,
+// and cognitive processing; (2) the routine scheduler for executing due
+// routines; and (3) the task scheduler for PostgreSQL-backed scheduled tasks.
+// All three serialize LLM access through Mu.
 // Intended to be called as a goroutine.
 func (e *Engine) Run() {
 	// Load identity profile and personality traits from DB on startup.
@@ -155,6 +177,11 @@ func (e *Engine) Run() {
 	// Start the DB-backed task scheduler.
 	if e.DB != nil && e.InterruptChan != nil {
 		go e.runTaskScheduler()
+	}
+
+	// Start the independent routine scheduler.
+	if e.DB != nil {
+		go e.runRoutineScheduler()
 	}
 
 	e.lastCognitiveRun = time.Now()

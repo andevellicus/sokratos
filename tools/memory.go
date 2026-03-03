@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 
+	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/timefmt"
@@ -59,7 +60,7 @@ type searchResult struct {
 // rewriteQuery calls the subagent to produce up to 3 concise reformulations
 // of the user's query. Returns nil on failure (caller falls back to the
 // original query).
-func rewriteQuery(ctx context.Context, sc *SubagentClient, query string) []string {
+func rewriteQuery(ctx context.Context, sc *clients.SubagentClient, query string) []string {
 	rewriteCtx, cancel := context.WithTimeout(ctx, TimeoutSubagentCall)
 	defer cancel()
 
@@ -122,7 +123,7 @@ func queryMemories(ctx context.Context, pool *pgxpool.Pool, emb []float32, query
 		args = append(args, memoryType)
 	} else {
 		// Exclude internal memory types from general searches.
-		extraWhere += "\n\t            AND memory_type NOT IN ('identity', 'reflection')"
+		extraWhere += "\n\t            AND memory_type NOT IN (" + memory.FormatSQLExclusion(memory.ExcludeInternal) + ")"
 	}
 
 	query := fmt.Sprintf(`SELECT id, summary, created_at,
@@ -157,7 +158,7 @@ func queryMemories(ctx context.Context, pool *pgxpool.Pool, emb []float32, query
 //  3. Query DB per embedding (LIMIT 5 each), deduplicate by content hash
 //  4. Re-rank candidates via subagent (if available and candidates > limit)
 //  5. Return top results sorted by relevance
-func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *SubagentClient, limit int) (string, error) {
+func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *clients.SubagentClient, limit int) (string, error) {
 	if limit <= 0 {
 		limit = 3
 	}
@@ -318,7 +319,7 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 // rerankResults calls the subagent to re-rank candidates by relevance to the
 // query. Returns up to limit results in preferred order. Falls back to the
 // original ordering on any failure.
-func rerankResults(ctx context.Context, sc *SubagentClient, query string, results []searchResult, limit int) []searchResult {
+func rerankResults(ctx context.Context, sc *clients.SubagentClient, query string, results []searchResult, limit int) []searchResult {
 	// Build a numbered list of summaries for the re-ranker.
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Query: %s\n\nResults:\n", query)
@@ -432,7 +433,7 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string,
 		if bgGrammarFn != nil {
 			id, err = memory.CheckAndWriteWithContradiction(ctx, pool, req, bgGrammarFn, queueFn)
 		} else {
-			id, err = memory.ScoreAndWrite(ctx, pool, req, grammarFn)
+			id, err = memory.ScoreAndWrite(ctx, pool, req, grammarFn, queueFn)
 		}
 		if err != nil {
 			logger.Log.Errorf("[save_memory] failed: %v", err)
@@ -442,45 +443,10 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string,
 	}()
 }
 
-// HighSalienceMemory pairs a memory ID with its summary text.
-type HighSalienceMemory struct {
-	ID      int
-	Summary string
-}
-
-// QueryHighSalienceMemories returns memories with salience >= threshold
-// created in the last 24 hours, including their IDs. Used by the
-// consolidation pipeline for profile updates and memory merging.
-func QueryHighSalienceMemories(ctx context.Context, pool *pgxpool.Pool, threshold, limit int) ([]HighSalienceMemory, error) {
-	rows, err := pool.Query(ctx,
-		`SELECT id, summary FROM memories
-		 WHERE salience >= $1
-		   AND superseded_by IS NULL
-		   AND created_at >= NOW() - INTERVAL '24 hours'
-		 ORDER BY salience DESC, created_at DESC
-		 LIMIT $2`,
-		threshold, limit,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("query high-salience memories: %w", err)
-	}
-	defer rows.Close()
-
-	var results []HighSalienceMemory
-	for rows.Next() {
-		var m HighSalienceMemory
-		if err := rows.Scan(&m.ID, &m.Summary); err != nil {
-			return nil, fmt.Errorf("scan high-salience row: %w", err)
-		}
-		results = append(results, m)
-	}
-	return results, rows.Err()
-}
-
 // --- Registry wiring ---
 
 // NewSearchMemory returns a ToolFunc that closes over the pool, endpoints, and subagent.
-func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *SubagentClient, limit int) ToolFunc {
+func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *clients.SubagentClient, limit int) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		return SearchMemory(ctx, args, pool, embedEndpoint, embedModel, subagent, limit)
 	}
