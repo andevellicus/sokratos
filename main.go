@@ -545,7 +545,7 @@ func main() {
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
 		capturedDTC := svc.DTC
 		eng.Cognitive.GoalInferenceFunc = func(ctx context.Context) error {
-			return engine.RunGoalInference(ctx, db.Pool, capturedDTC.Complete, cfg.EmbedURL, cfg.EmbedModel, svc.GrammarFunc)
+			return engine.RunGoalInference(ctx, db.Pool, capturedDTC.Complete, cfg.EmbedURL, cfg.EmbedModel, svc.GrammarFunc, svc.QueueFunc)
 		}
 	}
 

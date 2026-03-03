@@ -77,7 +77,7 @@ func (e *Engine) runGoalInferenceIfReady() {
 
 // RunGoalInference performs goal inference using the deep thinker. It queries
 // recent memories + identity profile, calls DTC, and saves novel inferred goals.
-func RunGoalInference(ctx context.Context, db *pgxpool.Pool, dtcComplete func(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error), embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc) error {
+func RunGoalInference(ctx context.Context, db *pgxpool.Pool, dtcComplete func(ctx context.Context, systemPrompt, userContent string, maxTokens int) (string, error), embedEndpoint, embedModel string, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc) error {
 	// Gather recent high-salience memories.
 	mems, err := memory.QueryRecentMemories(ctx, db, 48, memory.SalienceLow, 30)
 	if err != nil {
@@ -154,7 +154,7 @@ func RunGoalInference(ctx context.Context, db *pgxpool.Pool, dtcComplete func(ct
 			Source:        "goal_inference",
 			EmbedEndpoint: embedEndpoint,
 			EmbedModel:    embedModel,
-		}, grammarFn, nil)
+		}, grammarFn, queueFn)
 		saved++
 		logger.Log.Infof("[goals] saved inferred goal (salience=%.0f): %s", salience, textutil.Truncate(g.Goal, 80))
 	}

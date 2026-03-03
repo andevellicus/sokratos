@@ -126,7 +126,6 @@ func escapeHTML(s string) string {
 	return s
 }
 
-
 // telegramEntity is a Bot API MessageEntity with expandable_blockquote support.
 // The library's tgbotapi.MessageEntity lacks this type, so we use our own for
 // JSON serialization via the entities parameter.
@@ -238,10 +237,7 @@ func processAllInlineFormatting(s string, entities *[]telegramEntity) string {
 		// Bold: **text**
 		if loc := boldRe.FindStringIndex(s); loc != nil {
 			if sub := boldRe.FindStringSubmatch(s); len(sub) >= 2 {
-				m := &inlineMatch{replaceStart: loc[0], replaceEnd: loc[1], inner: sub[1], entityType: "bold"}
-				if best == nil || m.replaceStart < best.replaceStart {
-					best = m
-				}
+				best = &inlineMatch{replaceStart: loc[0], replaceEnd: loc[1], inner: sub[1], entityType: "bold"}
 			}
 		}
 
@@ -353,4 +349,3 @@ func editFormatted(bot *tgbotapi.BotAPI, chatID int64, msgID int, fm formattedMe
 	_, err := bot.MakeRequest("editMessageText", params)
 	return err
 }
-

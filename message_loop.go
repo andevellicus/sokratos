@@ -77,6 +77,7 @@ func handleBootstrap(mc messageContext) string {
 			mc.eng.RefreshPersonality()
 		},
 		BgGrammarFn: mc.svc.BgGrammarFunc,
+		QueueFn:     mc.svc.QueueFunc,
 	})
 	return "Profile generation started in the background. I'll notify you when it's ready."
 }

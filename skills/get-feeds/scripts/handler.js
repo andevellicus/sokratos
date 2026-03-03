@@ -17,6 +17,7 @@ if (feeds.length === 0) {
 }
 
 var rsshubBase = env("RSSHUB_URL") || "http://localhost:1200";
+var FETCH_MULTIPLIER = 4; // over-fetch from source to compensate for dedup
 
 // --- Dedup helpers (per-feed, persisted via kv_store) ---
 
@@ -60,6 +61,66 @@ function fetchRsshub(route, count) {
 function extractDomain(url) {
     var m = url.match(/^https?:\/\/(?:www\.)?([^\/]+)/);
     return m ? m[1] : "";
+}
+
+// --- Direct RSS/Atom fetch (for sites with native feeds) ---
+
+function fetchDirectRSS(feedUrl, count) {
+    var resp = http_request("GET", feedUrl, {
+        "User-Agent": "sokratos:feeds:v1.0 (personal assistant bot)",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml"
+    }, "");
+    if (resp.status !== 200) {
+        console.warn("Direct RSS fetch failed for " + feedUrl + ": status " + resp.status);
+        return [];
+    }
+    var body = resp.body || "";
+    var items = [];
+
+    // Detect format: Atom uses <entry>, RSS 2.0 uses <item>.
+    if (body.indexOf("<entry>") !== -1 || body.indexOf("<entry ") !== -1) {
+        // Atom format (same parser as Reddit).
+        var entries = body.match(/<entry[\s\S]*?<\/entry>/g) || [];
+        for (var i = 0; i < entries.length && i < count; i++) {
+            var e = entries[i];
+            var titleMatch = e.match(/<title[^>]*>([\s\S]*?)<\/title>/);
+            var linkMatch = e.match(/<link[^>]*href="([^"]+)"/);
+            var updatedMatch = e.match(/<updated>([\s\S]*?)<\/updated>/);
+            var summaryMatch = e.match(/<summary[^>]*>([\s\S]*?)<\/summary>/);
+            items.push({
+                url: linkMatch ? linkMatch[1] : "",
+                title: decodeXmlEntities(titleMatch ? titleMatch[1] : ""),
+                summary: stripHtml(decodeXmlEntities(summaryMatch ? summaryMatch[1] : "")),
+                date: updatedMatch ? updatedMatch[1] : ""
+            });
+        }
+    } else {
+        // RSS 2.0 format.
+        var rssItems = body.match(/<item>[\s\S]*?<\/item>/g) || [];
+        for (var i = 0; i < rssItems.length && i < count; i++) {
+            var e = rssItems[i];
+            var titleMatch = e.match(/<title[^>]*>([\s\S]*?)<\/title>/);
+            var linkMatch = e.match(/<link[^>]*>([\s\S]*?)<\/link>/);
+            var pubDateMatch = e.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
+            var descMatch = e.match(/<description[^>]*>([\s\S]*?)<\/description>/);
+            var title = titleMatch ? titleMatch[1] : "";
+            var desc = descMatch ? descMatch[1] : "";
+            // Strip CDATA wrappers.
+            title = title.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
+            desc = desc.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
+            items.push({
+                url: linkMatch ? linkMatch[1].trim() : "",
+                title: decodeXmlEntities(title),
+                summary: stripHtml(decodeXmlEntities(desc)),
+                date: pubDateMatch ? pubDateMatch[1] : ""
+            });
+        }
+    }
+    return items;
+}
+
+function decodeXmlEntities(s) {
+    return (s || "").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&#39;/g,"'").replace(/&quot;/g,'"');
 }
 
 // --- Reddit fetch (native JSON API) with backoff on 429 ---
@@ -184,7 +245,7 @@ for (var i = 0; i < feeds.length; i++) {
         var added = 0;
 
         for (var li = 0; li < lists.length; li++) {
-            var items = fetchRsshub("/twitter/list/" + lists[li], perSource);
+            var items = fetchRsshub("/twitter/list/" + lists[li], perSource * FETCH_MULTIPLIER);
             for (var j = 0; j < items.length && added < count; j++) {
                 var it = items[j];
                 var url = it.url || it.id || "";
@@ -197,7 +258,7 @@ for (var i = 0; i < feeds.length; i++) {
 
         for (var ai = 0; ai < accounts.length; ai++) {
             var handle = accounts[ai].replace(/^@/, "");
-            var items = fetchRsshub("/twitter/user/" + handle, perSource);
+            var items = fetchRsshub("/twitter/user/" + handle, perSource * FETCH_MULTIPLIER);
             for (var j = 0; j < items.length && added < count; j++) {
                 var it = items[j];
                 var url = it.url || it.id || "";
@@ -211,7 +272,7 @@ for (var i = 0; i < feeds.length; i++) {
 
     } else if (feed.type === "reddit") {
         // Reddit native JSON API.
-        var items = fetchReddit(feed.subreddit || "", feed.sort || "hot", count);
+        var items = fetchReddit(feed.subreddit || "", feed.sort || "hot", count * FETCH_MULTIPLIER);
         var added = 0;
         for (var j = 0; j < items.length && added < count; j++) {
             var it = items[j];
@@ -222,13 +283,24 @@ for (var i = 0; i < feeds.length; i++) {
 
     } else if (feed.type === "rsshub") {
         // Generic RSSHub feed.
-        var items = fetchRsshub(feed.route, count);
+        var items = fetchRsshub(feed.route, count * FETCH_MULTIPLIER);
         var added = 0;
         for (var j = 0; j < items.length && added < count; j++) {
             var it = items[j];
             var url = it.url || it.id || "";
             var summary = it.content_text || stripHtml(it.content_html);
             if (addItem(url, it.title, summary, extractDomain(url), it.date_published || "")) {
+                added++;
+            }
+        }
+
+    } else if (feed.type === "rss") {
+        // Direct RSS/Atom feed (no RSSHub proxy).
+        var items = fetchDirectRSS(feed.url, count * FETCH_MULTIPLIER);
+        var added = 0;
+        for (var j = 0; j < items.length && added < count; j++) {
+            var it = items[j];
+            if (addItem(it.url, it.title, it.summary, extractDomain(it.url), it.date)) {
                 added++;
             }
         }

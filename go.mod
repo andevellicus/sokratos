@@ -3,6 +3,7 @@ module sokratos
 go 1.25.7
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/dop251/goja v0.0.0-20260219130522-0ba9a5494a59
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
 	github.com/jackc/pgx/v5 v5.8.0
@@ -18,7 +19,6 @@ require (
 	cloud.google.com/go/auth v0.18.1 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dlclark/regexp2 v1.11.4 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect

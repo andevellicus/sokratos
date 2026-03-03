@@ -40,6 +40,7 @@ type BootstrapConfig struct {
 	SendFunc      func(string)               // Telegram notification on completion/failure
 	OnProfile     func()                      // refresh engine profile/personality
 	BgGrammarFn   memory.GrammarSubagentFunc  // entity enrichment for saved memories
+	QueueFn       memory.WorkQueueFunc       // work queue for enrichment retries (nil = fire-and-forget)
 }
 
 // bootstrapResult classifies the outcome of a single bootstrap attempt.
@@ -82,7 +83,7 @@ func RunBootstrap(cfg BootstrapConfig) {
 	backoff := 5 * time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		result, state := bootstrapAttempt(ctx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, prompt, userContent, cfg.OnProfile, cfg.BgGrammarFn, attempt)
+		result, state := bootstrapAttempt(ctx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, prompt, userContent, cfg.OnProfile, cfg.BgGrammarFn, cfg.QueueFn, attempt)
 
 		switch state {
 		case bsSuccess:
@@ -175,7 +176,7 @@ func isTransientDTCError(err error) bool {
 }
 
 // bootstrapAttempt runs one DTC call + parse cycle. Returns (result, state).
-func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), bgGrammarFn memory.GrammarSubagentFunc, attempt int) (string, bootstrapResult) {
+func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), bgGrammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc, attempt int) (string, bootstrapResult) {
 	raw, err := dtc.CompleteNoThink(ctx, prompt, userContent, 8192)
 	if err != nil {
 		logger.Log.Errorf("[bootstrap] deep thinker call failed: %v", err)
@@ -195,7 +196,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.Deep
 	// Try dual structure first; fall back to legacy single-object format.
 	var dual bootstrapOutput
 	if err := json.Unmarshal([]byte(cleaned), &dual); err == nil && len(dual.Personality) > 0 {
-		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, bgGrammarFn, dual)
+		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, bgGrammarFn, queueFn, dual)
 		if bErr != nil {
 			logger.Log.Errorf("[bootstrap] failed: %v", bErr)
 			return "Bootstrap failed — could not save profile. Check the logs for details.", bsFatal
@@ -233,7 +234,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.Deep
 // bootstrapDual processes the dual-structure bootstrap output: writes personality
 // traits, extracts user preferences and recurring topics to their native stores,
 // and writes a compact identity card (name + important_people only).
-func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, bgGrammarFn memory.GrammarSubagentFunc, dual bootstrapOutput) (string, error) {
+func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, bgGrammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc, dual bootstrapOutput) (string, error) {
 	// Write personality traits.
 	traitCount := 0
 	for _, t := range dual.Personality {
@@ -300,7 +301,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 			Source:        "bootstrap",
 			EmbedEndpoint: embedEndpoint,
 			EmbedModel:    embedModel,
-		}, bgGrammarFn, nil)
+		}, bgGrammarFn, queueFn)
 		topicCount++
 	}
 	if topicCount > 0 {
