@@ -162,13 +162,7 @@ func buildSupervisorSystemPrompt(toolDescs, profileContent, personalityContent s
 	// Replace tool-call format placeholder with TOOL_INTENT tag instructions.
 	sp = strings.Replace(sp,
 		"- Call ONE tool per turn. You may include reasoning and context alongside your tool call.",
-		"- When you need to use a tool, wrap your intent in XML tags. You MUST use the closing tag </TOOL_INTENT> (with a forward slash):\n  <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>\n- ALWAYS include the arguments JSON object, even if empty: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>\n- Call ONE tool per turn. You may include brief context outside the tags.\n- CRITICAL: Any text alongside a TOOL_INTENT IS sent to the user immediately. After the tool executes you get a follow-up turn. In that turn, do NOT repeat or rephrase what you already said. Keep the follow-up to ONE short sentence confirming the result. If your pre-tool text already covered everything, just confirm with a brief acknowledgment like \"Done.\" or the key fact from the result.",
-		1)
-
-	// Replace idle instruction with plain text idle.
-	sp = strings.Replace(sp,
-		"Otherwise output: <NO_ACTION_REQUIRED>",
-		"Otherwise just respond with: idle",
+		"- When you need to use a tool, wrap your intent in XML tags. You MUST use the closing tag </TOOL_INTENT> (with a forward slash):\n  <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>\n- ALWAYS include the arguments JSON object, even if empty: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>\n- Call ONE tool per turn. Keep text alongside tool intents minimal — it is NOT shown to the user.\n- After all tools complete, write your FULL response to the user. Do not assume the user saw anything from earlier rounds — each round's prose is discarded. Your final message is the only one the user receives.",
 		1)
 
 	return sp

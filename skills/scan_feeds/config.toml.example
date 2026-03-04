@@ -1,0 +1,75 @@
+# scan_feeds config — categories are TOML array-of-tables headers.
+# Each [[category]] entry defines one feed source.
+#
+# Fields:
+#   name      — unique identifier (used in logs and feed filter)
+#   type      — "rss" | "reddit" | "twitter" | "rsshub"
+#   count     — max items to fetch from this source
+#
+# Type-specific fields:
+#   rss:      url       — direct RSS/Atom feed URL
+#   reddit:   subreddit — subreddit name (without r/)
+#             sort      — "hot" | "new" | "top" | "rising"
+#   twitter:  lists     — array of Twitter list IDs (fetched via RSSHub)
+#             accounts  — array of Twitter handles (fetched via RSSHub)
+#   rsshub:   route     — RSSHub route path (e.g. "/reuters/world")
+#
+# Twitter sources require SKILL_TWITTER_AUTH_TOKEN in .env.
+
+# --- News ---
+
+[[news]]
+name = "reuters"
+type = "rsshub"
+route = "/reuters/world"
+count = 5
+
+[[news]]
+name = "bbc-news"
+type = "rss"
+url = "http://feeds.bbci.co.uk/news/world/rss.xml"
+count = 5
+
+[[news]]
+name = "ap-news"
+type = "rss"
+url = "https://apnews.com/feed"
+count = 5
+
+# --- Tech ---
+
+[[tech]]
+name = "ars-technica"
+type = "rss"
+url = "https://feeds.arstechnica.com/arstechnica/index"
+count = 5
+
+[[tech]]
+name = "hackernews"
+type = "rsshub"
+route = "/hackernews/best"
+count = 5
+
+# --- Social / Reddit ---
+
+[[social]]
+name = "reddit-technology"
+type = "reddit"
+subreddit = "technology"
+sort = "hot"
+count = 5
+
+# --- Twitter ---
+# Requires SKILL_TWITTER_AUTH_TOKEN in .env
+
+# [[general]]
+# name = "twitter-news"
+# type = "twitter"
+# lists = ["YOUR_LIST_ID"]
+# count = 5
+
+# [[tech]]
+# name = "twitter-ai"
+# type = "twitter"
+# accounts = ["kaborepro", "ylecun"]
+# count = 5

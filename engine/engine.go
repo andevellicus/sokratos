@@ -103,6 +103,7 @@ type Engine struct {
 	lastMaintenanceRun    time.Time
 	lastCuriosityRun      time.Time
 	lastGoalInferenceRun  time.Time
+	lastGoalPursuitRun    time.Time
 	lastHeartbeatHash  [32]byte // SHA-256 of last proactive heartbeat reply (dedup guard)
 	recentActions      []actionRecord // last ≤5 actions taken (routines + heartbeat); no mutex — sequential callers only
 }

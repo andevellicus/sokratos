@@ -113,6 +113,9 @@ func (e *Engine) heartbeatTick() {
 		SlideAndArchiveContext(context.Background(), e.SM, e.MaxMessages, e.archiveDeps())
 	}
 
+	// Goal pursuit: actively work on highest-salience goals.
+	e.runGoalPursuitIfReady()
+
 	// Phase 3: Periodic maintenance (decay + pruning).
 	e.runMaintenanceIfDue()
 

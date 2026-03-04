@@ -4,15 +4,36 @@ An autonomous AI assistant with long-term memory, powered by a multi-model archi
 
 ## Architecture
 
-Sokratos uses a **supervisor pattern with regex-based tool parsing**. Three llama-server instances run on a separate Mac (M3 Ultra):
+Sokratos uses a **three-tier dispatch architecture** with two LLM backends and a **supervisor pattern with regex-based tool parsing**. Three llama-server instances run on a separate Mac (M3 Ultra):
 
 | Service | Port | Model | Purpose |
 |---------|------|-------|---------|
-| Brain | 11434 | Qwen3.5-122B-A10B (UD-Q4_K_XL) | Deep thinking, consolidation, triage, synthesis; orchestrator fallback |
-| 9B | 11436 | Qwen3.5-9B (UD-Q4_K_XL) | Primary orchestrator (supervisor), subagent structured tasks, 3 slots |
+| Brain | 11434 | Qwen3.5-122B-A10B (UD-Q4_K_XL) | Deep reasoning, orchestrator for complex requests, consolidation |
+| 9B | 11436 | Qwen3.5-9B (UD-Q4_K_XL) | Dispatch triage, synthesis, subagent tasks, orchestrator fallback (3 slots) |
 | Embedding | 8081 | BGE-large-en-v1.5 (q8_0) | 1024-dim vectors for pgvector |
 
-The 9B serves as the primary orchestrator and the 122B Brain handles deep thinking + acts as orchestrator fallback via slot routing. The orchestrator runs without grammar constraints, emitting `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds).
+### Message Flow
+
+Every user message goes through the 9B for **grammar-constrained triage**, which decides one of three paths:
+
+1. **Dispatch (single tool)** — 9B sends an ack, executes the tool, and synthesizes the response. Fully handled by the 9B.
+2. **Dispatch (multi-step)** — 9B sends an ack, then a `SubagentSupervisor` loop runs 2-5 tool rounds with grammar-constrained decisions.
+3. **Escalate to Brain** — 9B sends an instant ack ("Let me think about that..."), the Brain handles reasoning + tool calls silently, and the Brain's final response is sent directly to the user (no synthesis layer).
+
+A **slot router** manages backend allocation — Brain preferred for interactive messages (accuracy), 9B preferred for background work (throughput). During tool execution, slots are released and reacquired after, preventing long-running tools from blocking LLM access. See [docs/dispatch.md](docs/dispatch.md) for the full technical reference.
+
+### Supervisor Pattern
+
+The orchestrator runs without grammar constraints, emitting `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds). The Brain's system prompt ensures intermediate prose is discarded — only the final message reaches the user.
+
+### Client Hierarchy
+
+Both LLM backends share a `baseClient` (`clients/base_client.go`) providing HTTP transport, health probes (`ensureLoaded`), and circuit breakers. Two specialized clients build on it:
+
+- **DeepThinkerClient** — Brain (122B): `Complete()` with chain-of-thought thinking, `CompleteNoThink()` without
+- **SubagentClient** — 9B: semaphore-gated structured tasks, grammar-constrained output, concurrent slot management
+
+A **work queue** (`clients/workqueue.go`) manages background LLM tasks with priority-based admission control, retry with backoff, and deferred re-queuing of low-priority items under pressure.
 
 ## Prerequisites
 
@@ -145,15 +166,15 @@ The orchestrator has access to the following built-in tools:
 | `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
-| `create_skill` / `manage_skills` | Create or manage user-defined JavaScript tools |
+| `create_skill` / `manage_skills` | Create or manage user-defined TypeScript/JavaScript tools |
 
 ## Skill System
 
-Skills are user-created JavaScript tools that persist to disk and auto-load on startup. Each skill lives in `skills/<name>/` with a `SKILL.md` manifest, `scripts/handler.js`, and optional `config.toml`.
+Skills are user-created TypeScript tools that persist to disk and auto-load on startup. Each skill lives in `skills/<name>/` with a `SKILL.md` manifest, `scripts/handler.ts`, and optional `config.toml`. TypeScript is transpiled to JavaScript via esbuild at load time (pure Go, <1ms). Plain `.js` handlers are also supported as a fallback.
 
 ### Runtime Globals
 
-Skills execute in a goja ES5 sandbox (30s timeout) with:
+Skills execute in a goja ES2020 sandbox (30s timeout; 5min with delegation deps) with:
 
 | Global | Description |
 |--------|-------------|
@@ -167,6 +188,9 @@ Skills execute in a goja ES5 sandbox (30s timeout) with:
 | `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Per-skill PostgreSQL key-value store |
 | `hash_sha256(s)` | SHA-256 hex digest |
 | `hash_hmac_sha256(key, msg)` | HMAC-SHA256 hex digest |
+| `call_tool(name, args)` | Synchronous tool invocation (self-call prevented) |
+| `delegate(directive, context)` | Single subagent dispatch (60s timeout) |
+| `delegate_batch(tasks)` | Parallel fan-out (`[{directive, context}, ...]` → `[{result, error}, ...]`, 3min timeout) |
 
 ### Built-in Skills
 
@@ -177,7 +201,11 @@ Skills execute in a goja ES5 sandbox (30s timeout) with:
 
 ### Creating Skills
 
-The orchestrator can create new skills at runtime via `create_skill`. Skills are validated (JS syntax check + test execution), written to disk, registered in the live tool registry, and the GBNF grammar is rebuilt. Skills can also be managed via `manage_skills` (list/delete).
+The orchestrator can create new skills at runtime via `create_skill`. Skills are validated (transpiled if TypeScript, test execution), written to disk, registered in the live tool registry, and the GBNF grammar is rebuilt. Skills can also be managed via `manage_skills` (list/delete).
+
+## Dispatch Architecture
+
+See [docs/dispatch.md](docs/dispatch.md) for the full technical reference on message routing, triage, slot routing, and synthesis.
 
 ## Memory System
 
@@ -261,20 +289,28 @@ See `routines.toml.example` for more examples.
 ```
 sokratos/
   main.go              # Telegram bot, message loop, prefetch, wiring
+  message_loop.go      # Dispatch triage, escalation ack, Brain orchestration
   register_tools.go    # Domain-grouped tool registration
   config.go            # Environment variable helpers
   confirm.go           # Telegram confirmation gate for sensitive tools
   prefetch.go          # Subconscious memory prefetch for message loop
   telegram.go          # Telegram helpers (photo download, typing indicator)
   format.go            # Markdown-to-Telegram HTML converter
+  clients/             # LLM client hierarchy (baseClient, DTC, SubagentClient)
+    base_client.go     # Shared HTTP client, health probe, circuit breaker
+    deep_thinker_client.go  # Brain (122B) — thinking/no-think modes
+    subagent_client.go      # 9B — semaphore-gated structured tasks
+    subagent_supervisor.go  # Multi-turn grammar-constrained tool loop
+    workqueue.go       # Priority work queue with retry and admission control
   db/                  # PostgreSQL connection and schema auto-apply
     schema.sql         # memories, tasks, routines, personality_traits, skill_kv, etc.
-  engine/              # Heartbeat loop, context sliding, state
-    engine.go          # Heartbeat: phase 1 routines, phase 2 contextual reasoning
+  engine/              # Heartbeat loop, context sliding, state, slot routing
+    engine.go          # Engine construction and Run() (3 independent loops)
     cognitive.go       # Event-driven cognitive processing (consolidation, episodes, reflection)
     routines.go        # Routine execution within heartbeat (uses routines/ package)
     scheduler.go       # PostgreSQL-backed task scheduler
     slide.go           # Context window management and archival (ArchiveDeps)
+    slot_router.go     # Routes orchestrator calls between Brain and 9B
     state.go           # Thread-safe in-memory agent state with DB-backed prefs
   routines/            # Routine definitions, scheduling, file I/O, DB sync
     routines.go        # Entry, DueRoutine, NilIfEmpty, IsEmptyResult
@@ -283,7 +319,7 @@ sokratos/
     file.go            # FileWriter interface, FileAdapter, LoadFile
     sync.go            # SyncFromFile, SyncIfChanged, Upsert, Delete, QueryDue, AdvanceTimer
   llm/                 # LLM client, supervisor pattern, tool intent extraction
-    client.go          # Chat API, thinking mode, grammar constraints
+    client.go          # Chat API, QueryOrchestrator, FallbackMap
     supervisor.go      # Supervisor loop with regex-based tool parsing
   memory/              # Embedding, storage, scoring, decay, synthesis
     save.go            # SaveToMemoryAsync, SaveToMemoryWithSalienceAsync, identity profile
@@ -301,7 +337,9 @@ sokratos/
     tools.go           # Registry, Execute, NewScopedToolExec factory
     memory.go          # search_memory, save_memory, retrieval tracking
     skills.go          # Skill loader, executor, and registry integration
-    create_skill.go    # create_skill tool (JS validation, test, persist)
+    create_skill.go    # create_skill tool (TS transpile, test, persist)
+    transpile.go       # TypeScript → JS transpilation via esbuild
+    skill_vm.go        # Goja VM setup and skill runtime globals
     personality.go     # manage_personality tool
     routines.go        # manage_routines tool (uses routines/ package)
     delegate_task.go   # delegate_task tool (scoped tool access)
@@ -309,14 +347,19 @@ sokratos/
     search_web.go      # search_web tool (SearXNG)
     read_url.go        # read_url tool (web page fetching)
     run_code.go        # run_code tool (sandboxed JS execution)
+  pipelines/           # Multi-step processing pipelines
+    consolidate_memory.go  # Memory consolidation (ConsolidateCore, ConsolidateImmediate)
+    triage_conversation.go # Conversation/email triage and save
+    transition.go      # Paradigm shift fast-path
+    bootstrap_profile.go   # Initial profile generation (/bootstrap)
+  google/              # Google OAuth2, Gmail, Calendar clients
   httputil/            # HTTP client factory (shared transport config)
   textutil/            # Shared text processing (strip tags, extract JSON, truncate)
-  googleauth/          # OAuth2 helpers for Gmail/Calendar via Telegram
-  grammar/             # GBNF grammar builder from tool schemas
+  grammar/             # GBNF grammar builders (triage, dispatch, tool schemas)
   prompts/             # Embedded prompt templates (//go:embed)
-  skills/              # JavaScript tools (auto-loaded on startup)
+  skills/              # JavaScript/TypeScript tools (auto-loaded on startup)
     <name>/SKILL.md    # Frontmatter manifest (name, description, parameters)
-    <name>/scripts/handler.js  # Skill source code
+    <name>/scripts/handler.ts  # Skill source code (TS preferred, JS fallback)
     <name>/config.toml # Optional TOML config (injected as skill_config)
   routines.toml        # Routine definitions (synced bidirectionally with DB)
   timeouts/            # Shared timeout constants (DB, embedding, synthesis, save)

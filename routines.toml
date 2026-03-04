@@ -30,3 +30,8 @@ actions = ["search_calendar", "search_email", "scan_feeds"]
 goal = "Generate an evening recap. Structure: tomorrow's schedule at a glance, any emails still needing attention from today, and 2-3 top stories you may have missed. Keep it under 15 lines — relaxed tone, no urgency unless something is actually urgent."
 action_args.search_calendar = { time_min = "{{tomorrow}}", time_max = "{{tomorrow+1d}}" }
 action_args.scan_feeds = { count = 3 }
+
+[weekly-review]
+interval = "7 days"
+action = "weekly_review"
+goal = "Synthesize a weekly review. Cover: goal progress (recommend retiring completed goals via save_memory), key conversation themes, notable work, and what to focus on next week. Keep it scannable — under 25 lines."

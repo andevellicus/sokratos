@@ -62,6 +62,26 @@ func (e *Engine) runCuriosityIfReady() {
 		return
 	}
 
+	// Query active goals (same pattern as heartbeat).
+	var goals []activeGoal
+	goalRows, gErr := e.DB.Query(ctx,
+		`SELECT id, summary FROM memories
+		 WHERE memory_type = 'goal'
+		   AND superseded_by IS NULL
+		   AND salience >= 6
+		   AND created_at >= NOW() - INTERVAL '14 days'
+		 ORDER BY salience DESC, created_at DESC
+		 LIMIT 3`)
+	if gErr == nil {
+		for goalRows.Next() {
+			var g activeGoal
+			if err := goalRows.Scan(&g.ID, &g.Summary); err == nil {
+				goals = append(goals, g)
+			}
+		}
+		goalRows.Close()
+	}
+
 	// Ask the gatekeeper (Flash) to generate a research question.
 	prompt := `You are generating a proactive research question based on recent conversation patterns.
 Given recent memory summaries, identify ONE knowledge gap or interesting tangent worth exploring.
@@ -70,9 +90,22 @@ Rules:
 - The directive must be actionable via search_web + read_url tools.
 - Focus on topics the user has shown interest in but where knowledge is incomplete.
 - Do NOT repeat research that has already been done (check the summaries).
+- If active goals exist, STRONGLY prefer research that advances one of them. Reference which goal the research serves in the directive.
+- Only explore random tangents if no active goals exist or none have actionable research angles.
 - If nothing is worth researching, output: {"directive": "", "reasoning": "no gaps found"}`
 
-	userContent := "Recent memories:\n" + strings.Join(summaries, "\n")
+	// Build user content with goals prepended.
+	var uc strings.Builder
+	if len(goals) > 0 {
+		uc.WriteString("Active goals:\n")
+		for i, g := range goals {
+			fmt.Fprintf(&uc, "%d. %s\n", i+1, cleanGoalSummary(g.Summary))
+		}
+		uc.WriteString("\n")
+	}
+	uc.WriteString("Recent memories:\n")
+	uc.WriteString(strings.Join(summaries, "\n"))
+	userContent := uc.String()
 	grammarStr := `root ::= "{" ws "\"directive\":" ws string "," ws "\"reasoning\":" ws string ws "}"
 string ::= "\"" chars "\""
 chars ::= char*

@@ -291,32 +291,6 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 	typingCancel()
 
 	toolCtx, toolsUsed := summarizeToolContext(msgs)
-
-	// When tools were used, synthesize via 9B for a clean single-voice response.
-	if toolsUsed && err == nil && mc.svc.Subagent != nil {
-		synthesisPrompt := buildSynthesisPrompt(dctx)
-		truncatedToolCtx := toolCtx
-		if len(truncatedToolCtx) > dispatchMaxResultLen {
-			truncatedToolCtx = truncatedToolCtx[:dispatchMaxResultLen] + "\n... (truncated)"
-		}
-		synthesisInput := fmt.Sprintf("The user said: %s\n\nHere's what came back:\n%s", msgText, truncatedToolCtx)
-
-		synthCtx, synthCancel := context.WithTimeout(context.Background(), timeoutDispatchSynthesis)
-		synthReply, synthErr := mc.svc.Subagent.Complete(synthCtx, synthesisPrompt, synthesisInput, dispatchMaxSynthTokens)
-		synthCancel()
-
-		if synthErr != nil && mc.svc.DTC != nil {
-			dtcCtx, dtcCancel := context.WithTimeout(context.Background(), timeoutDispatchDTCSynthesis)
-			synthReply, synthErr = mc.svc.DTC.CompleteNoThink(dtcCtx, synthesisPrompt, synthesisInput, dispatchMaxSynthTokens)
-			dtcCancel()
-		}
-
-		if synthErr == nil {
-			reply = textutil.StripThinkTags(synthReply)
-		}
-		// On synthesis failure, fall through to Brain's raw reply.
-	}
-
 	completeMessageHandling(mc, msg, chatID, messageResult{
 		Reply:             reply,
 		Messages:          condenseToolResults(msgs),
