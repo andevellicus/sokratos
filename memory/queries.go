@@ -100,11 +100,13 @@ type HighSalienceMemory struct {
 // QueryHighSalienceMemories returns memories with salience >= threshold
 // created in the last 24 hours, including their IDs. Used by the
 // consolidation pipeline for profile updates and memory merging.
+// Excludes identity profiles (read separately via GetIdentityProfile).
 func QueryHighSalienceMemories(ctx context.Context, db *pgxpool.Pool, threshold, limit int) ([]HighSalienceMemory, error) {
 	rows, err := db.Query(ctx,
 		`SELECT id, summary FROM memories
 		 WHERE salience >= $1
 		   AND superseded_by IS NULL
+		   AND memory_type != 'identity'
 		   AND created_at >= NOW() - INTERVAL '24 hours'
 		 ORDER BY salience DESC, created_at DESC
 		 LIMIT $2`,
@@ -124,6 +126,30 @@ func QueryHighSalienceMemories(ctx context.Context, db *pgxpool.Pool, threshold,
 		results = append(results, m)
 	}
 	return results, rows.Err()
+}
+
+// HasNewMemoriesSinceConsolidation checks whether any non-consolidation
+// memories with sufficient salience exist since the last consolidation run.
+// Returns false when the only high-salience memories are prior consolidation
+// outputs, preventing runaway re-consolidation on restart.
+func HasNewMemoriesSinceConsolidation(ctx context.Context, db *pgxpool.Pool, threshold int) (bool, error) {
+	var count int
+	err := db.QueryRow(ctx, `
+		WITH last_consol AS (
+			SELECT COALESCE(MAX(created_at), '1970-01-01'::timestamptz) AS ts
+			FROM memories
+			WHERE source = 'consolidation' AND superseded_by IS NULL
+		)
+		SELECT count(*) FROM memories m, last_consol lc
+		WHERE m.salience >= $1
+		  AND m.superseded_by IS NULL
+		  AND m.source IS DISTINCT FROM 'consolidation'
+		  AND m.memory_type != 'identity'
+		  AND m.created_at > lc.ts`, threshold).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check new memories since consolidation: %w", err)
+	}
+	return count > 0, nil
 }
 
 // QueryRecentSummaries returns summary strings for recent non-backfill memories

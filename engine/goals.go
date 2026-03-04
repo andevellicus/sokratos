@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -114,11 +113,9 @@ func RunGoalInference(ctx context.Context, db *pgxpool.Pool, dtcComplete func(ct
 		return fmt.Errorf("DTC goal inference: %w", err)
 	}
 
-	raw = textutil.CleanLLMJSON(raw)
-
-	var result goalInferenceResult
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		return fmt.Errorf("parse goal inference: %w (raw: %s)", err, textutil.Truncate(raw, 200))
+	result, err := textutil.ParseLLMJSON[goalInferenceResult](raw)
+	if err != nil {
+		return fmt.Errorf("parse goal inference: %w", err)
 	}
 
 	if len(result.Goals) == 0 {

@@ -1,18 +1,58 @@
-package calendar
+package google
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	cal "google.golang.org/api/calendar/v3"
+	"google.golang.org/api/option"
 
+	"sokratos/logger"
 	"sokratos/textutil"
-
 	"sokratos/timefmt"
 )
+
+// CalendarService is the application-wide Google Calendar API client.
+var CalendarService *cal.Service
+
+// InitCalendarFromToken sets up the Google Calendar API client using only a previously
+// saved token. No interactive flow — returns nil if no token exists. Used at
+// startup for non-blocking initialization.
+func InitCalendarFromToken(ctx context.Context, credentialsPath, tokenPath string) error {
+	client, err := GetClientFromToken(ctx, "Calendar", credentialsPath, tokenPath, []string{cal.CalendarScope})
+	if err != nil {
+		return err
+	}
+	if client == nil {
+		return nil
+	}
+
+	svc, err := cal.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return fmt.Errorf("create calendar service: %w", err)
+	}
+
+	CalendarService = svc
+	logger.Log.Info("Google Calendar API initialized (from token)")
+	return nil
+}
+
+// InitCalendarFromClient sets up the Google Calendar API client from an already-authenticated
+// HTTP client. Used when a single OAuth token covers both Gmail and Calendar.
+func InitCalendarFromClient(ctx context.Context, client *http.Client) error {
+	svc, err := cal.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return fmt.Errorf("create calendar service: %w", err)
+	}
+	CalendarService = svc
+	logger.Log.Info("Google Calendar API initialized")
+	return nil
+}
 
 // Event holds parsed fields from a Google Calendar event.
 type Event struct {
@@ -65,11 +105,22 @@ func cachedCalendars(svc *cal.Service) []calInfo {
 	}
 	cals, err := listVisibleCalendars(svc)
 	if err != nil || len(cals) == 0 {
+		logger.Log.Warnf("[calendar] listVisibleCalendars failed or empty (err=%v), falling back to primary", err)
 		return []calInfo{{ID: "primary", Name: "Primary"}}
 	}
+	logger.Log.Debugf("[calendar] discovered %d calendars", len(cals))
 	calCache = cals
 	calCacheTime = time.Now()
 	return cals
+}
+
+// InvalidateCache clears the cached calendar list so the next search
+// re-discovers calendars. Called after /google re-auth.
+func InvalidateCache() {
+	calCacheMu.Lock()
+	calCache = nil
+	calCacheTime = time.Time{}
+	calCacheMu.Unlock()
 }
 
 // ParseEvent extracts an Event from a raw Google Calendar API event.
@@ -179,11 +230,12 @@ func SearchEvents(svc *cal.Service, query string, timeMin, timeMax *time.Time, m
 			req = req.TimeMax(timeMax.Format(time.RFC3339))
 		}
 
+		logger.Log.Debugf("[calendar] querying %s (timeMin=%v, timeMax=%v, q=%q)",
+			c.Name, timeMin, timeMax, query)
+
 		list, err := req.Do()
 		if err != nil {
-			// Skip calendars that error (e.g. permission issues) rather
-			// than failing the entire search.
-			continue
+			return nil, fmt.Errorf("list events for %s: %w", c.Name, err)
 		}
 
 		for _, item := range list.Items {

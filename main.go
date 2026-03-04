@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -11,13 +12,11 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 
-	"sokratos/calendar"
 	"sokratos/clients"
 	"sokratos/config"
 	"sokratos/db"
 	"sokratos/engine"
-	"sokratos/gmail"
-	"sokratos/googleauth"
+	"sokratos/google"
 	"sokratos/grammar"
 	"sokratos/llm"
 	"sokratos/logger"
@@ -38,14 +37,15 @@ type serviceBundle struct {
 	DTC              *clients.DeepThinkerClient
 	SynthesizeFunc   memory.SynthesizeFunc
 	SubagentFunc     memory.SubagentFunc
-	GrammarFunc      memory.GrammarSubagentFunc  // blocking + GBNF grammar (save_memory enrichment)
-	BgGrammarFunc    memory.GrammarSubagentFunc  // non-blocking + GBNF grammar for entity extraction
-	QueueFunc        memory.WorkQueueFunc        // background work queue (enrichment, distillation)
-	DTCQueueFunc     memory.WorkQueueFunc        // DTC work queue for distillation
+	GrammarFunc      memory.GrammarSubagentFunc // blocking + GBNF grammar (save_memory enrichment)
+	BgGrammarFunc    memory.GrammarSubagentFunc // non-blocking + GBNF grammar for entity extraction
+	QueueFunc        memory.WorkQueueFunc       // background work queue (enrichment, distillation)
+	DTCQueueFunc     memory.WorkQueueFunc       // DTC work queue for distillation
 	Subagent         *clients.SubagentClient
 	StateMgr         *engine.StateManager
 	InterruptChan    chan struct{}
 	TriageRetryQueue *pipelines.RetryQueue
+	AuthErrorOnce    *sync.Once // fires once per token expiry
 }
 
 func initServices(cfg *config.AppConfig) *serviceBundle {
@@ -103,9 +103,9 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 	// Use dedicated SubagentURL if set, otherwise fall back to the on-demand router.
 	var subagent *clients.SubagentClient
 	var subagentFunc memory.SubagentFunc
-	var grammarFunc memory.GrammarSubagentFunc        // blocking + GBNF grammar (save_memory enrichment)
-	var bgGrammarFunc memory.GrammarSubagentFunc     // non-blocking + GBNF grammar for entity extraction
-	var queueFunc memory.WorkQueueFunc               // background work queue (enrichment, distillation)
+	var grammarFunc memory.GrammarSubagentFunc   // blocking + GBNF grammar (save_memory enrichment)
+	var bgGrammarFunc memory.GrammarSubagentFunc // non-blocking + GBNF grammar for entity extraction
+	var queueFunc memory.WorkQueueFunc           // background work queue (enrichment, distillation)
 	subagentURL := cfg.SubagentURL
 	if subagentURL == "" {
 		subagentURL = cfg.DeepThinkerURL
@@ -132,39 +132,6 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		logger.Log.Info("[startup] subagent initialized (DTC dedicated to heavy reasoning)")
 	}
 
-	// OAuth via Telegram.
-	telegramSend, telegramReceive := func(msg string) {
-		for id := range cfg.AllowedIDs {
-			m := tgbotapi.NewMessage(id, msg)
-			bot.Send(m)
-		}
-	}, func() (string, error) {
-		for update := range updates {
-			if update.Message == nil || update.Message.Text == "" {
-				continue
-			}
-			if len(cfg.AllowedIDs) > 0 {
-				if _, ok := cfg.AllowedIDs[update.Message.From.ID]; !ok {
-					continue
-				}
-			}
-			return strings.TrimSpace(update.Message.Text), nil
-		}
-		return "", fmt.Errorf("update channel closed")
-	}
-
-	if err := gmail.Init(context.Background(), cfg.GmailCredsPath, cfg.GmailTokenPath, &googleauth.AuthIO{
-		Send: telegramSend, Receive: telegramReceive,
-	}); err != nil {
-		logger.Log.Warnf("Gmail init failed: %v — Gmail features disabled", err)
-	}
-
-	if err := calendar.Init(context.Background(), cfg.GmailCredsPath, cfg.CalendarTokenPath, &googleauth.AuthIO{
-		Send: telegramSend, Receive: telegramReceive,
-	}); err != nil {
-		logger.Log.Warnf("Calendar init failed: %v — Calendar features disabled", err)
-	}
-
 	stateMgr := engine.NewStateManager(db.Pool)
 	stateMgr.LoadConversationSnapshot()
 
@@ -188,11 +155,12 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		GrammarFunc:      grammarFunc,
 		BgGrammarFunc:    bgGrammarFunc,
 		QueueFunc:        queueFunc,
-		DTCQueueFunc:   dtcQueueFn,
+		DTCQueueFunc:     dtcQueueFn,
 		Subagent:         subagent,
 		StateMgr:         stateMgr,
 		InterruptChan:    interruptChan,
 		TriageRetryQueue: triageRetryQueue,
+		AuthErrorOnce:    &sync.Once{},
 	}
 }
 
@@ -218,8 +186,8 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	// be rebuilt with the full compact index + dynamic skill descriptions by
 	// rebuildGrammar() after all tools are registered.
 	compactIndex := registry.CompactIndex()
-	toolDescs := strings.Replace(prompts.ToolsCompact, "%TOOL_INDEX%", compactIndex, 1)
-	if dynDescs := registry.DynamicToolDescriptions(); dynDescs != "" {
+	toolDescs := strings.Replace(prompts.Tools, "%TOOL_INDEX%", compactIndex, 1)
+	if dynDescs := registry.DynamicSkillDescriptions(); dynDescs != "" {
 		toolDescs += "\n" + dynDescs
 	}
 	toolAgentConfig := &llm.ToolAgentConfig{
@@ -259,10 +227,14 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 	var consolidateFunc func(ctx context.Context) (int, error)
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
 		consolidateFunc = func(ctx context.Context) (int, error) {
-			return pipelines.ConsolidateCore(ctx, db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel, pipelines.ConsolidateOpts{
+			return pipelines.ConsolidateCore(ctx, pipelines.PipelineDeps{
+				Pool: db.Pool, DTC: svc.DTC,
+				EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel,
+				GrammarFn: svc.GrammarFunc,
+			}, pipelines.ConsolidateOpts{
 				SalienceThreshold: int(memory.SalienceHigh),
 				MemoryLimit:       cfg.ConsolidationMemoryLimit,
-			}, svc.GrammarFunc)
+			})
 		}
 	}
 
@@ -284,18 +256,23 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 			ReflectionPrompt:          strings.TrimSpace(prompts.Reflection),
 			SynthesizeFunc:            svc.SynthesizeFunc,
 		},
-		ToolExec:            registry.Execute,
-		Mu:                  &mu,
-		Interval:            cfg.HeartbeatInterval,
-		RoutineInterval:     cfg.RoutineInterval,
-		RoutineTimeout:      cfg.RoutineTimeout,
-		SM:                  svc.StateMgr,
-		DB:                  db.Pool,
-		EmbedEndpoint:       cfg.EmbedURL,
-		EmbedModel:          cfg.EmbedModel,
-		MaxMessages:         40,
-		MaintenanceInterval: cfg.MaintenanceInterval,
-		MemoryStalenessDays: cfg.MemoryStalenessDays,
+		ToolExec:               registry.Execute,
+		Mu:                     &mu,
+		Interval:               cfg.HeartbeatInterval,
+		RoutineInterval:        cfg.RoutineInterval,
+		RoutineTimeout:         cfg.RoutineTimeout,
+		SM:                     svc.StateMgr,
+		DB:                     db.Pool,
+		EmbedEndpoint:          cfg.EmbedURL,
+		EmbedModel:             cfg.EmbedModel,
+		MaxMessages:            40,
+		MaintenanceInterval:    cfg.MaintenanceInterval,
+		MemoryStalenessDays:    cfg.MemoryStalenessDays,
+		WorkItemsTTLDays:       cfg.WorkItemsTTLDays,
+		ProcessedEmailsTTLDays: cfg.ProcessedEmailsTTLDays,
+		ProcessedEventsTTLDays: cfg.ProcessedEventsTTLDays,
+		FailedOpsTTLDays:       cfg.FailedOpsTTLDays,
+		SkillKVTTLDays:         cfg.SkillKVTTLDays,
 		SendFunc: func(text string) {
 			for id := range cfg.AllowedIDs {
 				msg := tgbotapi.NewMessage(id, mdToTelegramHTML(text))
@@ -311,7 +288,7 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		},
 		InterruptChan: svc.InterruptChan,
 		Gatekeeper:    svc.Subagent,
-		DTCQueueFunc:       svc.DTCQueueFunc,
+		DTCQueueFunc:  svc.DTCQueueFunc,
 		SubagentFunc:  svc.SubagentFunc,
 		GrammarFunc:   svc.GrammarFunc,
 		BgGrammarFunc: svc.BgGrammarFunc,
@@ -321,10 +298,14 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 	// Defer initial consolidation until after the first heartbeat tick so
 	// Qwen3.5-27B is available for interactive requests during startup.
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
-		capturedDTC := svc.DTC
+		consolidateDeps := pipelines.PipelineDeps{
+			Pool: db.Pool, DTC: svc.DTC,
+			EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel,
+			GrammarFn: svc.GrammarFunc,
+		}
 		eng.OnFirstTick = func() {
 			pipelines.CleanupPreTriageMemories(db.Pool)
-			pipelines.RunInitialConsolidation(db.Pool, capturedDTC, cfg.EmbedURL, cfg.EmbedModel, cfg.ConsolidationMemoryLimit, svc.GrammarFunc)
+			pipelines.RunInitialConsolidation(consolidateDeps, cfg.ConsolidationMemoryLimit)
 			eng.RefreshProfile()
 			eng.RefreshPersonality()
 		}
@@ -403,12 +384,48 @@ func main() {
 		logger.Log.Fatal("TELEGRAM_BOT_TOKEN is not set")
 	}
 
+	// Two-model mode: when BRAIN_URL is set, the 9B serves as the primary
+	// orchestrator (fast, user-facing) and the 122B Brain serves as the deep
+	// thinker (consolidation, triage, synthesis). The Brain is also the
+	// orchestrator fallback when all 9B slots are busy.
+	if cfg.BrainURL != "" {
+		cfg.LLMURL = cfg.SubagentURL
+		cfg.LLMModel = cfg.SubagentModel
+		cfg.DeepThinkerURL = cfg.BrainURL
+		cfg.DeepThinkerModel = cfg.BrainModel
+		logger.Log.Infof("[startup] two-model mode: Orchestrator=%s/%s, Brain=%s/%s",
+			cfg.SubagentURL, cfg.SubagentModel, cfg.BrainURL, cfg.BrainModel)
+	}
+
 	memory.MaxSupersededProfiles = cfg.MaxSupersededProfiles
 
 	svc := initServices(cfg)
 	defer db.Close()
 
+	// Non-blocking Google auth: load existing tokens silently.
+	if err := google.InitGmailFromToken(context.Background(), cfg.GmailCredsPath, cfg.GoogleTokenPath); err != nil {
+		logger.Log.Warnf("Gmail init failed: %v — Gmail features disabled", err)
+	}
+	if err := google.InitCalendarFromToken(context.Background(), cfg.GmailCredsPath, cfg.GoogleTokenPath); err != nil {
+		logger.Log.Warnf("Calendar init failed: %v — Calendar features disabled", err)
+	}
+
 	registry, emailTriageCfg, delegateConfig := registerTools(cfg, svc)
+
+	// Wire proactive auth-error notification: when any Google API call fails
+	// due to an expired/revoked token, notify the user once via Telegram.
+	registry.OnAuthError = func(toolName string) {
+		svc.AuthErrorOnce.Do(func() {
+			logger.Log.Warnf("[auth] detected auth expiry via %s — notifying user", toolName)
+			os.Remove(cfg.GoogleTokenPath)
+			google.GmailService = nil
+			google.CalendarService = nil
+			for id := range cfg.AllowedIDs {
+				m := tgbotapi.NewMessage(id, "⚠️ Google authorization expired. Use /google to re-authenticate.")
+				svc.Bot.Send(m)
+			}
+		})
+	}
 
 	var fallbacks llm.FallbackMap
 
@@ -418,6 +435,16 @@ func main() {
 	// closure captures the pointer, so it sees the grammar when invoked.
 	if emailTriageCfg != nil {
 		emailTriageCfg.TriageGrammar = lb.TriageGrammar
+	}
+
+	// Register Telegram slash commands so they appear in the input menu.
+	commands := tgbotapi.NewSetMyCommands(
+		tgbotapi.BotCommand{Command: "reload", Description: "Reload skills and routines from disk"},
+		tgbotapi.BotCommand{Command: "bootstrap", Description: "Generate profile from memories"},
+		tgbotapi.BotCommand{Command: "google", Description: "Re-authenticate Google (Gmail + Calendar)"},
+	)
+	if _, err := svc.Bot.Request(commands); err != nil {
+		logger.Log.Warnf("Failed to set Telegram commands: %v", err)
 	}
 
 	// Send startup message to all allowed users.
@@ -439,6 +466,21 @@ func main() {
 		}
 	}
 
+	// Slot router: in two-model mode, route orchestrator calls to 9B (primary)
+	// with 122B Brain as fallback when all 9B slots are busy.
+	var router engine.SlotRouter
+	if cfg.BrainURL != "" && svc.DTC != nil && svc.Subagent != nil {
+		brainClient := llm.NewClient(cfg.BrainURL)
+		router = engine.NewSlotRouter(
+			lb.Client, cfg.LLMModel, // 9B (primary orchestrator)
+			brainClient, cfg.BrainModel, // 122B Brain (fallback)
+			svc.Subagent, // 9B slots (cap 3)
+			svc.DTC,      // Brain slots (cap 1)
+		)
+		eng.Router = router
+		logger.Log.Infof("[startup] slot router initialized: 9B orchestrator + Brain fallback")
+	}
+
 	// Work tracker: unified tracking for background plans, routines, and scheduled tasks.
 	var workTracker *tools.WorkTracker
 	if db.Pool != nil {
@@ -455,8 +497,11 @@ func main() {
 	// Register tools that need the engine for refresh callbacks.
 	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
 		registry.Register("consolidate_memory", pipelines.NewConsolidateMemory(
-			db.Pool, svc.DTC, cfg.EmbedURL, cfg.EmbedModel,
-			cfg.ConsolidationMemoryLimit, svc.GrammarFunc, func() {
+			pipelines.PipelineDeps{
+				Pool: db.Pool, DTC: svc.DTC,
+				EmbedEndpoint: cfg.EmbedURL, EmbedModel: cfg.EmbedModel,
+				GrammarFn: svc.GrammarFunc,
+			}, cfg.ConsolidationMemoryLimit, func() {
 				eng.RefreshProfile()
 				eng.RefreshPersonality()
 			},
@@ -485,8 +530,8 @@ func main() {
 	rebuildGrammar := func() {
 		// Rebuild tool descriptions: compact index + dynamic skill descriptions.
 		compactIdx := registry.CompactIndex()
-		td := strings.Replace(prompts.ToolsCompact, "%TOOL_INDEX%", compactIdx, 1)
-		if dynDescs := registry.DynamicToolDescriptions(); dynDescs != "" {
+		td := strings.Replace(prompts.Tools, "%TOOL_INDEX%", compactIdx, 1)
+		if dynDescs := registry.DynamicSkillDescriptions(); dynDescs != "" {
 			td += "\n" + dynDescs
 		}
 		if lb.ToolAgent != nil {
@@ -511,7 +556,8 @@ func main() {
 	}
 
 	tools.AllowedInternalHosts = collectInternalHosts(cfg)
-	registerSkillTools(registry, "skills", rebuildGrammar, db.Pool)
+	skillDeps := tools.SkillDeps{Pool: db.Pool, Registry: registry, SC: svc.Subagent, DC: delegateConfig}
+	registerSkillTools(registry, "skills", rebuildGrammar, skillDeps)
 	registerPlanTools(registry, svc.DTC, svc.Subagent, delegateConfig, workTracker)
 	rebuildGrammar() // include disk-loaded skills + plan tools in grammar
 
@@ -519,7 +565,7 @@ func main() {
 	// the independent routine scheduler tick.
 	skillMtimes := map[string]time.Time{}
 	eng.SyncFunc = func() {
-		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, db.Pool)
+		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, skillDeps)
 	}
 	var routineMtime time.Time
 	eng.RoutineSyncFunc = func() {
@@ -580,6 +626,12 @@ func main() {
 	// tools (e.g. send_email from a routine) also require user approval.
 	eng.ToolExec = confirmExec
 
+	// If no router was created (3-model mode or missing deps), provide a
+	// passthrough that always uses the primary orchestrator.
+	if router == nil {
+		router = engine.NewPassthroughRouter(lb.Client, cfg.LLMModel)
+	}
+
 	mc := messageContext{
 		cfg:            cfg,
 		svc:            svc,
@@ -590,7 +642,11 @@ func main() {
 		fallbacks:      fallbacks,
 		confirmExec:    confirmExec,
 		skillMtimes:    skillMtimes,
+		skillDeps:      skillDeps,
 		rebuildGrammar: rebuildGrammar,
+		router:         router,
+		delegateConfig: delegateConfig,
+		messageChan:    messageChan,
 	}
 
 	for msg := range messageChan {
@@ -623,15 +679,30 @@ func main() {
 				continue
 			}
 
+			dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(imgData))
+
+			// Generate a text caption via the VL subagent so image context
+			// survives text-only pipelines (triage, memory, archival).
 			caption := msg.Caption
 			if caption == "" {
 				caption = "What's in this image?"
 			}
+			if svc.Subagent != nil {
+				capCtx, capCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				imgCaption, capErr := svc.Subagent.CaptionImage(capCtx, "Describe the image in one or two sentences. Be specific about key subjects, text, and context.", dataURI, 256)
+				capCancel()
+				if capErr != nil {
+					logger.Log.Debugf("[photo] caption skipped: %v", capErr)
+				} else if imgCaption = strings.TrimSpace(imgCaption); imgCaption != "" {
+					caption = fmt.Sprintf("[Image: %s]\n%s", imgCaption, caption)
+					logger.Log.Infof("[photo] captioned: %s", imgCaption)
+				}
+			}
+
 			msgText = caption
 			logger.Log.Infof("[%s] [photo] %s", tag, caption)
 
 			userPrompt = caption + "\n\n[Current Agent State]\n" + stateCtx
-			dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(imgData))
 			visionParts = []llm.ContentPart{
 				{Type: "text", Text: userPrompt},
 				{Type: "image_url", ImageURL: &llm.ImageURL{URL: dataURI}},
@@ -655,6 +726,10 @@ func main() {
 			svc.Bot.Send(r)
 		case "/bootstrap":
 			r := tgbotapi.NewMessage(chatID, handleBootstrap(mc))
+			r.ReplyToMessageID = msg.MessageID
+			svc.Bot.Send(r)
+		case "/google":
+			r := tgbotapi.NewMessage(chatID, handleGoogle(mc))
 			r.ReplyToMessageID = msg.MessageID
 			svc.Bot.Send(r)
 		default:

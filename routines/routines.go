@@ -10,9 +10,9 @@ import (
 type Entry struct {
 	Interval      string      `toml:"interval,omitempty"        json:"interval,omitempty"`
 	Schedule      interface{} `toml:"schedule,omitempty"        json:"schedule,omitempty"` // string or []string
-	Tool          string      `toml:"tool,omitempty"            json:"tool,omitempty"`
-	Tools         []string    `toml:"tools,omitempty"           json:"tools,omitempty"`
-	ToolArgs      map[string]map[string]interface{} `toml:"tool_args,omitempty" json:"tool_args,omitempty"`
+	Action        string      `toml:"action,omitempty"          json:"action,omitempty"`
+	Actions       []string    `toml:"actions,omitempty"         json:"actions,omitempty"`
+	ActionArgs    map[string]map[string]interface{} `toml:"action_args,omitempty" json:"action_args,omitempty"`
 	Goal          string      `toml:"goal,omitempty"            json:"goal,omitempty"`
 	SilentIfEmpty bool        `toml:"silent_if_empty,omitempty" json:"silent_if_empty,omitempty"`
 	Instruction   string      `toml:"instruction,omitempty"     json:"instruction,omitempty"`
@@ -23,9 +23,9 @@ type DueRoutine struct {
 	ID            int
 	Name          string
 	Instruction   string
-	Tool          *string
-	Tools         []string
-	ToolArgs      map[string]json.RawMessage // tool_name → JSON args (from JSONB)
+	Action        *string
+	Actions       []string
+	ActionArgs    map[string]json.RawMessage // action_name → JSON args (from JSONB)
 	Goal          *string
 	SilentIfEmpty bool
 	Schedules     []string // parsed from comma-separated schedule column

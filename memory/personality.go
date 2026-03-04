@@ -116,6 +116,52 @@ func DeletePersonalityTrait(ctx context.Context, db *pgxpool.Pool, category, key
 	return deleted, nil
 }
 
+// PersonalityUpdate describes a single personality mutation (set or remove).
+// Used by both consolidation and bootstrap to apply personality changes.
+type PersonalityUpdate struct {
+	Action   string `json:"action"`
+	Category string `json:"category"`
+	Key      string `json:"key"`
+	Value    string `json:"value,omitempty"`
+	Context  string `json:"context,omitempty"`
+}
+
+// ApplyPersonalityUpdates processes a slice of personality mutations (set/remove).
+// Returns the count of successfully applied updates.
+func ApplyPersonalityUpdates(ctx context.Context, db *pgxpool.Pool, updates []PersonalityUpdate, logPrefix string) int {
+	applied := 0
+	for _, u := range updates {
+		action := strings.ToLower(u.Action)
+		if action == "" {
+			action = "set" // default for bootstrap-style inputs without explicit action
+		}
+		switch action {
+		case "set":
+			if u.Category == "" || u.Key == "" || u.Value == "" {
+				continue
+			}
+			if _, err := UpsertPersonalityTrait(ctx, db, u.Category, u.Key, u.Value, u.Context); err != nil {
+				logger.Log.Warnf("[%s] failed to upsert trait %s/%s: %v", logPrefix, u.Category, u.Key, err)
+				continue
+			}
+			applied++
+		case "remove":
+			if u.Category == "" || u.Key == "" {
+				continue
+			}
+			if _, err := DeletePersonalityTrait(ctx, db, u.Category, u.Key); err != nil {
+				logger.Log.Warnf("[%s] failed to delete trait %s/%s: %v", logPrefix, u.Category, u.Key, err)
+				continue
+			}
+			applied++
+		}
+	}
+	if applied > 0 {
+		logger.Log.Infof("[%s] applied %d personality updates", logPrefix, applied)
+	}
+	return applied
+}
+
 // categoryDisplayOrder defines the preferred display order for categories.
 var categoryDisplayOrder = []string{"worldview", "interest", "hobby", "goal", "style", "preference"}
 

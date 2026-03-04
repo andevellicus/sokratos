@@ -13,16 +13,16 @@ import (
 )
 
 type routineArgs struct {
-	Action        string      `json:"action"`                    // "upsert" or "delete"
-	Name          string      `json:"name"`                      // unique routine name
-	Interval      string      `json:"interval,omitempty"`        // Go duration, e.g. "24h", "1h"
-	Schedule      interface{} `json:"schedule,omitempty"`        // string or []string
-	Tool          string      `json:"tool,omitempty"`            // tool to call directly
-	Tools         []string    `json:"tools,omitempty"`           // multi-tool list (mutually exclusive with tool)
-	ToolArgs      map[string]map[string]interface{} `json:"tool_args,omitempty"` // per-tool arguments
-	Goal          string      `json:"goal,omitempty"`            // what to do with tool results
-	SilentIfEmpty bool        `json:"silent_if_empty,omitempty"` // skip if tool returns empty
-	Instruction   string      `json:"instruction,omitempty"`     // legacy: full instruction text
+	Op            string      `json:"op"`                          // "upsert" or "delete"
+	Name          string      `json:"name"`                        // unique routine name
+	Interval      string      `json:"interval,omitempty"`          // Go duration, e.g. "24h", "1h"
+	Schedule      interface{} `json:"schedule,omitempty"`          // string or []string
+	Action        string      `json:"action,omitempty"`            // action to call directly
+	Actions       []string    `json:"actions,omitempty"`           // multi-action list (mutually exclusive with action)
+	ActionArgs    map[string]map[string]interface{} `json:"action_args,omitempty"` // per-action arguments
+	Goal          string      `json:"goal,omitempty"`              // what to do with action results
+	SilentIfEmpty bool        `json:"silent_if_empty,omitempty"`   // skip if action returns empty
+	Instruction   string      `json:"instruction,omitempty"`       // legacy: full instruction text
 }
 
 // NewManageRoutines returns a ToolFunc that creates, updates, or deletes
@@ -38,10 +38,10 @@ func NewManageRoutines(pool *pgxpool.Pool, fileWriter routines.FileWriter) ToolF
 			return "error: name is required", nil
 		}
 
-		switch a.Action {
+		switch a.Op {
 		case "upsert":
-			if a.Tool == "" && len(a.Tools) == 0 && a.Instruction == "" {
-				return "error: tool, tools, or instruction is required for upsert", nil
+			if a.Action == "" && len(a.Actions) == 0 && a.Instruction == "" {
+				return "error: action, actions, or instruction is required for upsert", nil
 			}
 
 			schedStr := routines.NormalizeSchedule(a.Schedule)
@@ -79,32 +79,32 @@ func NewManageRoutines(pool *pgxpool.Pool, fileWriter routines.FileWriter) ToolF
 
 			// Build instruction from goal for backward compat.
 			instruction := a.Instruction
-			if (a.Tool != "" || len(a.Tools) > 0) && instruction == "" {
+			if (a.Action != "" || len(a.Actions) > 0) && instruction == "" {
 				instruction = a.Goal
 			}
 
-			var toolsArg interface{}
-			if len(a.Tools) > 0 {
-				toolsArg = a.Tools
+			var actionsArg interface{}
+			if len(a.Actions) > 0 {
+				actionsArg = a.Actions
 			}
 
-			// Marshal tool_args to JSONB.
-			var toolArgsArg interface{}
-			if len(a.ToolArgs) > 0 {
-				b, err := json.Marshal(a.ToolArgs)
+			// Marshal action_args to JSONB.
+			var actionArgsArg interface{}
+			if len(a.ActionArgs) > 0 {
+				b, err := json.Marshal(a.ActionArgs)
 				if err == nil {
-					toolArgsArg = b
+					actionArgsArg = b
 				}
 			}
 
 			_, err := pool.Exec(ctx,
-				`INSERT INTO routines (name, interval_duration, instruction, tool, goal, silent_if_empty, schedule, tools, tool_args)
+				`INSERT INTO routines (name, interval_duration, instruction, action, goal, silent_if_empty, schedule, actions, action_args)
 				 VALUES ($1, $2::interval, $3, $4, $5, $6, $7, $8, $9)
 				 ON CONFLICT (name) DO UPDATE
-				 SET interval_duration = $2::interval, instruction = $3, tool = $4, goal = $5,
-				     silent_if_empty = $6, schedule = $7, tools = $8, tool_args = $9, last_executed = now()`,
-				a.Name, intervalArg, instruction, routines.NilIfEmpty(a.Tool), routines.NilIfEmpty(a.Goal),
-				a.SilentIfEmpty, routines.NilIfEmpty(schedStr), toolsArg, toolArgsArg)
+				 SET interval_duration = $2::interval, instruction = $3, action = $4, goal = $5,
+				     silent_if_empty = $6, schedule = $7, actions = $8, action_args = $9, last_executed = now()`,
+				a.Name, intervalArg, instruction, routines.NilIfEmpty(a.Action), routines.NilIfEmpty(a.Goal),
+				a.SilentIfEmpty, routines.NilIfEmpty(schedStr), actionsArg, actionArgsArg)
 			if err != nil {
 				return fmt.Sprintf("failed to upsert routine: %v", err), nil
 			}
@@ -114,9 +114,9 @@ func NewManageRoutines(pool *pgxpool.Pool, fileWriter routines.FileWriter) ToolF
 				entry := routines.Entry{
 					Interval:      a.Interval,
 					Schedule:      a.Schedule,
-					Tool:          a.Tool,
-					Tools:         a.Tools,
-					ToolArgs:      a.ToolArgs,
+					Action:        a.Action,
+					Actions:       a.Actions,
+					ActionArgs:    a.ActionArgs,
 					Goal:          a.Goal,
 					SilentIfEmpty: a.SilentIfEmpty,
 					Instruction:   a.Instruction,
@@ -146,7 +146,7 @@ func NewManageRoutines(pool *pgxpool.Pool, fileWriter routines.FileWriter) ToolF
 			return fmt.Sprintf("Routine %q deleted.", a.Name), nil
 
 		default:
-			return "error: action must be 'upsert' or 'delete'", nil
+			return "error: op must be 'upsert' or 'delete'", nil
 		}
 	}
 }

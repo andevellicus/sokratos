@@ -65,6 +65,7 @@ func submitDeferredEntityExtraction(queueFn WorkQueueFunc, db *pgxpool.Pool, ids
 		MaxTokens:    512,
 		Timeout:      TimeoutQualityScore,
 		Retries:      2,
+		Priority:     PriorityLow,
 		OnComplete: func(raw string, err error) {
 			if err != nil {
 				logger.Log.Warnf("[memory] deferred entity extraction failed: %v", err)

@@ -36,9 +36,43 @@ type chatRequest struct {
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"` // Jinja template vars (e.g. enable_thinking for Qwen3.5)
 }
 
+// contentPart represents one element in the OpenAI vision content array.
+// Local to the clients package to avoid importing llm/.
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+}
+
+// imageURL carries an image data-URI or URL for the vision API.
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+// chatMessage represents a single chat message. When Parts is set (e.g. for
+// vision messages), the JSON content field is serialized as an array of
+// content parts; otherwise it is a plain string.
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string        `json:"-"`
+	Content string        `json:"-"`
+	Parts   []contentPart `json:"-"`
+}
+
+// MarshalJSON serializes chatMessage. If Parts is non-empty, content is an
+// array of content parts (OpenAI vision format); otherwise it is a plain string.
+func (m chatMessage) MarshalJSON() ([]byte, error) {
+	if len(m.Parts) > 0 {
+		type wire struct {
+			Role    string        `json:"role"`
+			Content []contentPart `json:"content"`
+		}
+		return json.Marshal(wire{Role: m.Role, Content: m.Parts})
+	}
+	type wire struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	return json.Marshal(wire{Role: m.Role, Content: m.Content})
 }
 
 type chatResponse struct {

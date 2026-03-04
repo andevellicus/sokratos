@@ -2,10 +2,6 @@ package tools
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +17,7 @@ import (
 	"github.com/dop251/goja"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sokratos/clients"
 	"sokratos/httputil"
 	"sokratos/logger"
 )
@@ -34,6 +31,7 @@ var AllowedInternalHosts []string
 type SkillManifest struct {
 	Name        string
 	Description string
+	Language    string // "javascript" (default) or "typescript"
 }
 
 // Skill represents a fully loaded skill ready for registration.
@@ -42,6 +40,15 @@ type Skill struct {
 	Params   []ParamSchema
 	Source   string // handler.js content
 	Dir      string // skill directory (for config.txt loading)
+}
+
+// SkillDeps groups optional dependencies for skill execution. Replaces the
+// former pool *pgxpool.Pool parameter on ExecuteSkill/RegisterSkill/SyncSkills.
+type SkillDeps struct {
+	Pool     *pgxpool.Pool
+	Registry *Registry
+	SC       *clients.SubagentClient
+	DC       *DelegateConfig
 }
 
 // LoadSkills discovers and loads all skills from the given directory.
@@ -82,22 +89,41 @@ func LoadSkills(dir string) ([]Skill, error) {
 			continue
 		}
 
-		handlerPath := filepath.Join(skillDir, "scripts", "handler.js")
-		source, err := os.ReadFile(handlerPath)
-		if err != nil {
-			logger.Log.Warnf("[skills] missing handler.js for %s: %v", skillName, err)
-			continue
-		}
+		// Try handler.ts first (TypeScript), then fall back to handler.js.
+		var source string
+		tsPath := filepath.Join(skillDir, "scripts", "handler.ts")
+		jsPath := filepath.Join(skillDir, "scripts", "handler.js")
 
-		if err := ValidateSkillSource(string(source)); err != nil {
-			logger.Log.Warnf("[skills] invalid JS in %s: %v", skillName, err)
+		if tsData, tsErr := os.ReadFile(tsPath); tsErr == nil {
+			// TypeScript: transpile to JS.
+			transpiled, tErr := transpileTS(string(tsData))
+			if tErr != nil {
+				logger.Log.Warnf("[skills] TS transpilation failed for %s: %v", skillName, tErr)
+				continue
+			}
+			if err := ValidateSkillSource(transpiled); err != nil {
+				logger.Log.Warnf("[skills] invalid transpiled JS in %s: %v", skillName, err)
+				continue
+			}
+			source = transpiled
+			if manifest.Language == "" {
+				manifest.Language = "typescript"
+			}
+		} else if jsData, jsErr := os.ReadFile(jsPath); jsErr == nil {
+			if err := ValidateSkillSource(string(jsData)); err != nil {
+				logger.Log.Warnf("[skills] invalid JS in %s: %v", skillName, err)
+				continue
+			}
+			source = string(jsData)
+		} else {
+			logger.Log.Warnf("[skills] missing handler.ts/handler.js for %s: %v", skillName, jsErr)
 			continue
 		}
 
 		skills = append(skills, Skill{
 			Manifest: manifest,
 			Params:   params,
-			Source:   string(source),
+			Source:   source,
 			Dir:      skillDir,
 		})
 		logger.Log.Infof("[skills] loaded skill: %s", skillName)
@@ -141,6 +167,8 @@ func parseFrontmatter(fm string) (SkillManifest, error) {
 
 		if after, ok := strings.CutPrefix(trimmed, "name:"); ok {
 			m.Name = strings.TrimSpace(after)
+		} else if after, ok := strings.CutPrefix(trimmed, "language:"); ok {
+			m.Language = strings.TrimSpace(after)
 		} else if after, ok := strings.CutPrefix(trimmed, "description:"); ok {
 			value := strings.TrimSpace(after)
 			if value == "|" {
@@ -249,7 +277,7 @@ func parseParamsTable(body string) []ParamSchema {
 // RegisterSkill creates a ToolFunc closure wrapping ExecuteSkill and registers
 // the skill in the tool registry. The handler.js source is read from disk on
 // each invocation so edits take effect immediately without a restart.
-func RegisterSkill(registry *Registry, skill Skill, pool *pgxpool.Pool) {
+func RegisterSkill(registry *Registry, skill Skill, deps SkillDeps) {
 	name := skill.Manifest.Name
 	source := skill.Source // fallback if dir is empty (e.g. create_skill test)
 	dir := skill.Dir
@@ -257,11 +285,18 @@ func RegisterSkill(registry *Registry, skill Skill, pool *pgxpool.Pool) {
 	fn := func(ctx context.Context, args json.RawMessage) (string, error) {
 		currentSource := source
 		if dir != "" {
-			if data, err := os.ReadFile(filepath.Join(dir, "scripts", "handler.js")); err == nil {
-				currentSource = string(data)
+			// Try handler.ts first → transpile → fall back to handler.js.
+			if tsData, err := os.ReadFile(filepath.Join(dir, "scripts", "handler.ts")); err == nil {
+				if transpiled, tErr := transpileTS(string(tsData)); tErr == nil {
+					currentSource = transpiled
+				} else {
+					logger.Log.Warnf("[skills] %s: TS transpile failed on live-reload: %v", name, tErr)
+				}
+			} else if jsData, err := os.ReadFile(filepath.Join(dir, "scripts", "handler.js")); err == nil {
+				currentSource = string(jsData)
 			}
 		}
-		return ExecuteSkill(ctx, name, currentSource, dir, args, pool)
+		return ExecuteSkill(ctx, name, currentSource, dir, args, deps)
 	}
 
 	schema := ToolSchema{
@@ -277,17 +312,17 @@ func RegisterSkill(registry *Registry, skill Skill, pool *pgxpool.Pool) {
 // ExecuteSkill creates a fresh goja runtime, injects args and the HTTP bridge,
 // and executes the skill's JavaScript source. Returns the last expression value
 // as a string. If dir is non-empty and contains a config.toml, its contents are
-// injected as the skill_config global object (read fresh each call). The pool
-// parameter enables the kv_get/kv_set/kv_delete per-skill key-value store; pass
-// nil to disable KV (functions will throw a TypeError).
-func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMessage, pool *pgxpool.Pool) (string, error) {
+// injected as the skill_config global object (read fresh each call). Pass a
+// SkillDeps with Pool set to enable KV; with Registry/SC/DC set to enable
+// call_tool/delegate/delegate_batch.
+func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMessage, deps SkillDeps) (string, error) {
 	vm := goja.New()
 
 	// Inject args as a global object.
 	var argsObj any
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &argsObj); err != nil {
-			return fmt.Sprintf("Failed to parse skill arguments: %v", err), nil
+			return "", Errorf("Failed to parse skill arguments: %v", err)
 		}
 	}
 	if argsObj == nil {
@@ -324,156 +359,24 @@ func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMe
 		return httpBridge(vm, call)
 	})
 
-	// --- console.log / console.warn / console.error ---
+	// Register VM globals via helpers (skill_vm.go).
 	var logBuf []string
-	consoleObj := vm.NewObject()
-	for _, level := range []string{"log", "warn", "error"} {
-		lvl := level
-		consoleObj.Set(lvl, func(call goja.FunctionCall) goja.Value {
-			parts := make([]string, len(call.Arguments))
-			for i, arg := range call.Arguments {
-				parts[i] = arg.String()
-			}
-			logBuf = append(logBuf, fmt.Sprintf("[%s] %s", strings.ToUpper(lvl), strings.Join(parts, " ")))
-			return goja.Undefined()
-		})
-	}
-	vm.Set("console", consoleObj)
+	skillSetupConsole(vm, &logBuf)
+	skillSetupUtils(vm, ctx)
+	skillSetupKV(vm, deps, ctx, name)
+	skillSetupDelegation(vm, deps, ctx, name)
 
-	// --- btoa / atob (base64) ---
-	vm.Set("btoa", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			panic(vm.NewTypeError("btoa requires 1 argument"))
-		}
-		return vm.ToValue(base64.StdEncoding.EncodeToString([]byte(call.Arguments[0].String())))
-	})
-	vm.Set("atob", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			panic(vm.NewTypeError("atob requires 1 argument"))
-		}
-		decoded, err := base64.StdEncoding.DecodeString(call.Arguments[0].String())
-		if err != nil {
-			panic(vm.NewTypeError("atob: invalid base64: " + err.Error()))
-		}
-		return vm.ToValue(string(decoded))
-	})
-
-	// --- sleep(ms) ---
-	vm.Set("sleep", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			return goja.Undefined()
-		}
-		ms := call.Arguments[0].ToInteger()
-		if ms <= 0 {
-			return goja.Undefined()
-		}
-		dur := time.Duration(ms) * time.Millisecond
-		if deadline, ok := ctx.Deadline(); ok {
-			if remaining := time.Until(deadline); dur > remaining {
-				dur = remaining
-			}
-		}
-		if dur > 5*time.Second {
-			dur = 5 * time.Second
-		}
-		time.Sleep(dur)
-		if ctx.Err() != nil {
-			panic(vm.NewTypeError("context cancelled during sleep"))
-		}
-		return goja.Undefined()
-	})
-
-	// --- env(key) — reads SKILL_<key> env vars only ---
-	vm.Set("env", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			panic(vm.NewTypeError("env requires 1 argument"))
-		}
-		val := os.Getenv("SKILL_" + call.Arguments[0].String())
-		if val == "" {
-			return goja.Undefined()
-		}
-		return vm.ToValue(val)
-	})
-
-	// --- hash_sha256 / hash_hmac_sha256 ---
-	vm.Set("hash_sha256", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 1 {
-			panic(vm.NewTypeError("hash_sha256 requires 1 argument"))
-		}
-		h := sha256.Sum256([]byte(call.Arguments[0].String()))
-		return vm.ToValue(hex.EncodeToString(h[:]))
-	})
-	vm.Set("hash_hmac_sha256", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) < 2 {
-			panic(vm.NewTypeError("hash_hmac_sha256 requires 2 arguments: key, message"))
-		}
-		mac := hmac.New(sha256.New, []byte(call.Arguments[0].String()))
-		mac.Write([]byte(call.Arguments[1].String()))
-		return vm.ToValue(hex.EncodeToString(mac.Sum(nil)))
-	})
-
-	// --- kv_get / kv_set / kv_delete (per-skill PostgreSQL KV store) ---
-	if pool != nil {
-		vm.Set("kv_get", func(call goja.FunctionCall) goja.Value {
-			if len(call.Arguments) < 1 {
-				panic(vm.NewTypeError("kv_get requires 1 argument: key"))
-			}
-			key := call.Arguments[0].String()
-			kvCtx, cancel := context.WithTimeout(ctx, TimeoutSkillKV)
-			defer cancel()
-			var val string
-			err := pool.QueryRow(kvCtx,
-				"SELECT value FROM skill_kv WHERE skill_name=$1 AND key=$2", name, key).Scan(&val)
-			if err != nil {
-				return goja.Undefined()
-			}
-			return vm.ToValue(val)
-		})
-		vm.Set("kv_set", func(call goja.FunctionCall) goja.Value {
-			if len(call.Arguments) < 2 {
-				panic(vm.NewTypeError("kv_set requires 2 arguments: key, value"))
-			}
-			key := call.Arguments[0].String()
-			value := call.Arguments[1].String()
-			kvCtx, cancel := context.WithTimeout(ctx, TimeoutSkillKV)
-			defer cancel()
-			_, err := pool.Exec(kvCtx,
-				`INSERT INTO skill_kv (skill_name, key, value, updated_at) VALUES ($1, $2, $3, now())
-				 ON CONFLICT (skill_name, key) DO UPDATE SET value=$3, updated_at=now()`,
-				name, key, value)
-			if err != nil {
-				panic(vm.NewTypeError("kv_set failed: " + err.Error()))
-			}
-			return goja.Undefined()
-		})
-		vm.Set("kv_delete", func(call goja.FunctionCall) goja.Value {
-			if len(call.Arguments) < 1 {
-				panic(vm.NewTypeError("kv_delete requires 1 argument: key"))
-			}
-			key := call.Arguments[0].String()
-			kvCtx, cancel := context.WithTimeout(ctx, TimeoutSkillKV)
-			defer cancel()
-			_, err := pool.Exec(kvCtx,
-				"DELETE FROM skill_kv WHERE skill_name=$1 AND key=$2", name, key)
-			if err != nil {
-				panic(vm.NewTypeError("kv_delete failed: " + err.Error()))
-			}
-			return goja.Undefined()
-		})
-	} else {
-		kvUnavailable := func(call goja.FunctionCall) goja.Value {
-			panic(vm.NewTypeError("kv store unavailable: no database connection"))
-		}
-		vm.Set("kv_get", kvUnavailable)
-		vm.Set("kv_set", kvUnavailable)
-		vm.Set("kv_delete", kvUnavailable)
+	// Dynamic timeout: extend to 5 minutes when delegation deps are available.
+	skillTimeout := TimeoutSkillExec
+	if deps.SC != nil {
+		skillTimeout = TimeoutSkillExecDelegation
 	}
 
 	// Set up timeout via interrupt.
 	done := make(chan struct{})
 	go func() {
 		select {
-		case <-time.After(TimeoutSkillExec):
+		case <-time.After(skillTimeout):
 			vm.Interrupt("skill execution timeout")
 		case <-ctx.Done():
 			vm.Interrupt("context cancelled")
@@ -490,7 +393,7 @@ func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMe
 
 	val, err := vm.RunString(execSource)
 	if err != nil {
-		return fmt.Sprintf("Skill %q execution error: %v", name, err), nil
+		return "", Errorf("Skill %q execution error: %v", name, err)
 	}
 
 	// If the script was wrapped in an async IIFE, the result is a Promise.
@@ -500,14 +403,14 @@ func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMe
 		case goja.PromiseStateFulfilled:
 			val = promise.Result()
 		case goja.PromiseStateRejected:
-			return fmt.Sprintf("Skill %q execution error (Promise rejected): %v", name, promise.Result()), nil
+			return "", Errorf("Skill %q execution error (Promise rejected): %v", name, promise.Result())
 		case goja.PromiseStatePending:
 			// Await pending promise
 			logger.Log.Debugf("[skills] waiting for pending promise in %s", name)
 			// goja doesn't support event loops without an extension, but our http_request
 			// bridge is fully synchronous, so the promise should already be fulfilled
 			// or rejected by the time RunString completes.
-			return fmt.Sprintf("Skill %q execution error: Async operations with true event-loop blocking are not supported in this sandbox.", name), nil
+			return "", Errorf("Skill %q execution error: Async operations with true event-loop blocking are not supported in this sandbox.", name)
 		}
 	}
 
@@ -521,7 +424,7 @@ func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMe
 		case map[string]interface{}, []interface{}:
 			b, err := json.Marshal(exported)
 			if err != nil {
-				resultStr = fmt.Sprintf("Skill %q returned non-serializable object: %v", name, err)
+				return "", Errorf("Skill %q returned non-serializable object: %v", name, err)
 			} else {
 				resultStr = string(b)
 			}
@@ -694,10 +597,15 @@ func ValidateSkillSource(source string) error {
 }
 
 // GenerateSkillMD produces a SKILL.md file content from the given fields.
-func GenerateSkillMD(name, description string, params []ParamSchema) string {
+// When language is "typescript", a `language: typescript` line is emitted in
+// the frontmatter. Empty or "javascript" omits the field (default).
+func GenerateSkillMD(name, description, language string, params []ParamSchema) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	fmt.Fprintf(&b, "name: %s\n", name)
+	if language == "typescript" {
+		b.WriteString("language: typescript\n")
+	}
 	if strings.Contains(description, "\n") {
 		b.WriteString("description: |\n")
 		for _, line := range strings.Split(description, "\n") {
@@ -728,7 +636,7 @@ func GenerateSkillMD(name, description string, params []ParamSchema) string {
 // handles new, removed, and changed skills. It tracks SKILL.md mtimes in the
 // provided cache to detect schema changes. Returns true if any changes were
 // applied (and the grammar was rebuilt).
-func SyncSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, mtimeCache map[string]time.Time, pool *pgxpool.Pool) bool {
+func SyncSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, mtimeCache map[string]time.Time, deps SkillDeps) bool {
 	diskSkills, err := LoadSkills(skillsDir)
 	if err != nil {
 		logger.Log.Warnf("[skills] hot-reload: failed to load skills: %v", err)
@@ -762,7 +670,7 @@ func SyncSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebu
 
 		if _, ok := registered[name]; !ok {
 			// New skill on disk, not in registry.
-			RegisterSkill(registry, skill, pool)
+			RegisterSkill(registry, skill, deps)
 			mtimeCache[name] = diskMtime
 			added = append(added, name)
 		} else if cached, ok := mtimeCache[name]; !ok {
@@ -771,7 +679,7 @@ func SyncSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebu
 		} else if diskMtime.After(cached) {
 			// SKILL.md changed — re-register.
 			registry.Unregister(name)
-			RegisterSkill(registry, skill, pool)
+			RegisterSkill(registry, skill, deps)
 			mtimeCache[name] = diskMtime
 			updated = append(updated, name)
 		}

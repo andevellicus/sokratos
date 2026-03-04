@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"sokratos/gmail"
+	"sokratos/google"
 	"sokratos/logger"
 
 	gm "google.golang.org/api/gmail/v1"
@@ -22,21 +22,24 @@ func NewSendEmail(svc *gm.Service) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a sendEmailArgs
 		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+			return "", Errorf("invalid arguments: %v", err)
 		}
 		if a.To == "" {
-			return "error: 'to' is required", nil
+			return "", Errorf("error: 'to' is required")
 		}
 		if a.Subject == "" {
-			return "error: 'subject' is required", nil
+			return "", Errorf("error: 'subject' is required")
 		}
 		if a.Body == "" {
-			return "error: 'body' is required", nil
+			return "", Errorf("error: 'body' is required")
 		}
 
-		if err := gmail.SendEmail(svc, a.To, a.Subject, a.Body); err != nil {
+		if err := google.SendEmail(svc, a.To, a.Subject, a.Body); err != nil {
+			if google.IsAuthError(err) {
+				return "", Errorf("%s", google.AuthErrorMessage)
+			}
 			logger.Log.Errorf("[send_email] failed: %v", err)
-			return fmt.Sprintf("Failed to send email: %v", err), nil
+			return "", Errorf("Failed to send email: %v", err)
 		}
 
 		logger.Log.Infof("[send_email] sent to=%s subject=%q", a.To, a.Subject)

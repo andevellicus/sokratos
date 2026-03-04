@@ -5,12 +5,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"sokratos/calendar"
 	"sokratos/clients"
 	"sokratos/config"
 	"sokratos/db"
 	"sokratos/engine"
-	"sokratos/gmail"
+	"sokratos/google"
 	"sokratos/grammar"
 	"sokratos/logger"
 	"sokratos/pipelines"
@@ -61,13 +60,13 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 		Name:        "manage_routines",
 		Description: "Create, update, or delete autonomous routines",
 		Params: []tools.ParamSchema{
-			{Name: "action", Type: "string", Required: true},
+			{Name: "op", Type: "string", Required: true},
 			{Name: "name", Type: "string", Required: true},
 			{Name: "interval", Type: "string", Required: false},
 			{Name: "schedule", Type: "string", Required: false},
-			{Name: "tool", Type: "string", Required: false},
-			{Name: "tools", Type: "array", Required: false},
-			{Name: "tool_args", Type: "object", Required: false},
+			{Name: "action", Type: "string", Required: false},
+			{Name: "actions", Type: "array", Required: false},
+			{Name: "action_args", Type: "object", Required: false},
 			{Name: "goal", Type: "string", Required: false},
 			{Name: "silent_if_empty", Type: "boolean", Required: false},
 			{Name: "instruction", Type: "string", Required: false},
@@ -82,91 +81,10 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 	}
 }
 
-func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, emailDisplayBatch int) {
-	if gmail.Service == nil {
-		return
-	}
-	registry.Register("search_email", tools.NewSearchEmail(gmail.Service, pool, triageCfg, emailDisplayBatch), tools.ToolSchema{
-		Name:        "search_email",
-		Description: "Search Gmail inbox with optional time bounds",
-		Params: []tools.ParamSchema{
-			{Name: "query", Type: "string", Required: false},
-			{Name: "time_min", Type: "string", Required: false},
-			{Name: "time_max", Type: "string", Required: false},
-			{Name: "max_results", Type: "number", Required: false},
-		},
-	})
-	registry.Register("send_email", tools.NewSendEmail(gmail.Service), tools.ToolSchema{
-		Name:        "send_email",
-		Description: "Send a plain-text email",
-		Params: []tools.ParamSchema{
-			{Name: "to", Type: "string", Required: true},
-			{Name: "subject", Type: "string", Required: true},
-			{Name: "body", Type: "string", Required: true},
-		},
-	})
-}
-
-func registerWebTools(registry *tools.Registry, searxngURL string) {
-	if searxngURL != "" {
-		registry.Register("search_web", tools.NewSearchWeb(searxngURL), tools.ToolSchema{
-			Name:        "search_web",
-			Description: "Search the internet via SearXNG",
-			Params: []tools.ParamSchema{
-				{Name: "query", Type: "string", Required: true},
-				{Name: "max_results", Type: "number", Required: false},
-			},
-		})
-	}
-	registry.Register("read_url", tools.NewReadURL(), tools.ToolSchema{
-		Name:        "read_url",
-		Description: "Fetch and extract text content from a URL",
-		Params: []tools.ParamSchema{
-			{Name: "url", Type: "string", Required: true},
-			{Name: "max_chars", Type: "number", Required: false},
-		},
-	})
-}
-
-func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
-	if calendar.Service == nil {
-		return
-	}
-	registry.Register("search_calendar", tools.NewSearchCalendar(calendar.Service, pool), tools.ToolSchema{
-		Name:        "search_calendar",
-		Description: "Search Google Calendar for events with optional time bounds",
-		Params: []tools.ParamSchema{
-			{Name: "query", Type: "string", Required: false},
-			{Name: "time_min", Type: "string", Required: false},
-			{Name: "time_max", Type: "string", Required: false},
-			{Name: "max_results", Type: "number", Required: false},
-		},
-	})
-	registry.Register("create_event", tools.NewCreateEvent(calendar.Service), tools.ToolSchema{
-		Name:        "create_event",
-		Description: "Create a Google Calendar event. Use the user's local timezone offset in start/end times (e.g. 2026-03-07T19:00:00-05:00), NOT Z/UTC.",
-		Params: []tools.ParamSchema{
-			{Name: "title", Type: "string", Required: true},
-			{Name: "start", Type: "string", Required: true},
-			{Name: "end", Type: "string", Required: false},
-			{Name: "description", Type: "string", Required: false},
-			{Name: "location", Type: "string", Required: false},
-			{Name: "attendees", Type: "array", Required: false},
-		},
-	})
-}
-
-func registerAITools(registry *tools.Registry, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) {
-	if dtc != nil {
-		registry.Register("consult_deep_thinker", tools.NewConsultDeepThinker(dtc, pool, embedURL, embedModel), tools.ToolSchema{
-			Name:        "consult_deep_thinker",
-			Description: "Delegate complex reasoning to a dedicated deep-thinking model",
-			Params: []tools.ParamSchema{
-				{Name: "problem_statement", Type: "string", Required: true},
-				{Name: "max_tokens", Type: "number", Required: false},
-			},
-		})
-	}
+// registerAITools is a no-op placeholder. In two-model mode, the Brain IS
+// the deep thinker — consult_deep_thinker was removed to prevent deadlock
+// (orchestrator holds the DTC sem, then DTC.Complete tries to re-acquire it).
+func registerAITools(_ *tools.Registry, _ *clients.DeepThinkerClient, _ *pgxpool.Pool, _, _ string) {
 }
 
 // registerDelegateTask registers delegate_task AFTER all delegatable tools
@@ -193,31 +111,33 @@ func registerDelegateTask(registry *tools.Registry, subagent *clients.SubagentCl
 	return dc
 }
 
-func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGrammar tools.GrammarRebuildFunc, pool *pgxpool.Pool) {
+func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGrammar tools.GrammarRebuildFunc, deps tools.SkillDeps) {
 	skills, err := tools.LoadSkills(skillsDir)
 	if err != nil {
 		logger.Log.Warnf("Failed to load skills: %v", err)
 	}
 	for _, skill := range skills {
-		tools.RegisterSkill(registry, skill, pool)
+		tools.RegisterSkill(registry, skill, deps)
 	}
-	registry.Register("create_skill", tools.NewCreateSkill(registry, skillsDir, rebuildGrammar, pool), tools.ToolSchema{
+	registry.Register("create_skill", tools.NewCreateSkill(registry, skillsDir, rebuildGrammar, deps), tools.ToolSchema{
 		Name:        "create_skill",
-		Description: "Create a new JavaScript skill registered as a live tool",
+		Description: "Create a new JavaScript or TypeScript skill registered as a live tool",
 		Params: []tools.ParamSchema{
 			{Name: "name", Type: "string", Required: true},
 			{Name: "description", Type: "string", Required: true},
 			{Name: "params", Type: "string", Required: false},
 			{Name: "code", Type: "string", Required: true},
+			{Name: "language", Type: "string", Required: false},
 			{Name: "test_args", Type: "string", Required: true},
 		},
 	})
-	registry.Register("manage_skills", tools.NewManageSkills(registry, skillsDir, rebuildGrammar), tools.ToolSchema{
+	registry.Register("manage_skills", tools.NewManageSkills(registry, skillsDir, rebuildGrammar, deps), tools.ToolSchema{
 		Name:        "manage_skills",
-		Description: "List or delete installed skills",
+		Description: "List, delete, or test installed skills",
 		Params: []tools.ParamSchema{
 			{Name: "action", Type: "string", Required: true},
 			{Name: "name", Type: "string", Required: false},
+			{Name: "test_args", Type: "string", Required: false},
 		},
 	})
 }
@@ -343,4 +263,80 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 	delegateConfig := registerDelegateTask(registry, svc.Subagent)
 
 	return registry, emailTriageCfg, delegateConfig
+}
+
+// registerGmailTools registers tools for searching and interacting with Gmail.
+func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, emailDisplayBatch int) {
+	if google.GmailService == nil {
+		return
+	}
+	registry.Register("search_email", tools.NewSearchEmail(google.GmailService, pool, triageCfg, emailDisplayBatch), tools.ToolSchema{
+		Name:        "search_email",
+		Description: "Search Gmail inbox with optional time bounds",
+		Params: []tools.ParamSchema{
+			{Name: "query", Type: "string", Required: false},
+			{Name: "time_min", Type: "string", Required: false},
+			{Name: "time_max", Type: "string", Required: false},
+			{Name: "max_results", Type: "number", Required: false},
+		},
+	})
+	registry.Register("send_email", tools.NewSendEmail(google.GmailService), tools.ToolSchema{
+		Name:        "send_email",
+		Description: "Send a plain-text email",
+		Params: []tools.ParamSchema{
+			{Name: "to", Type: "string", Required: true},
+			{Name: "subject", Type: "string", Required: true},
+			{Name: "body", Type: "string", Required: true},
+		},
+	})
+}
+
+// registerCalendarTools registers tools for searching and creating calendar events.
+func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
+	if google.CalendarService == nil {
+		return
+	}
+	registry.Register("search_calendar", tools.NewSearchCalendar(google.CalendarService, pool), tools.ToolSchema{
+		Name:        "search_calendar",
+		Description: "Search Google Calendar for events with optional time bounds",
+		Params: []tools.ParamSchema{
+			{Name: "query", Type: "string", Required: false},
+			{Name: "time_min", Type: "string", Required: false},
+			{Name: "time_max", Type: "string", Required: false},
+			{Name: "max_results", Type: "number", Required: false},
+		},
+	})
+	registry.Register("create_event", tools.NewCreateEvent(google.CalendarService), tools.ToolSchema{
+		Name:        "create_event",
+		Description: "Create a Google Calendar event. Use the user's local timezone offset in start/end times (e.g. 2026-03-07T19:00:00-05:00), NOT Z/UTC.",
+		Params: []tools.ParamSchema{
+			{Name: "title", Type: "string", Required: true},
+			{Name: "start", Type: "string", Required: true},
+			{Name: "end", Type: "string", Required: false},
+			{Name: "description", Type: "string", Required: false},
+			{Name: "location", Type: "string", Required: false},
+			{Name: "attendees", Type: "array", Required: false},
+		},
+	})
+}
+
+func registerWebTools(registry *tools.Registry, searxngURL string) {
+	if searxngURL != "" {
+		registry.Register("search_web", tools.NewSearchWeb(searxngURL), tools.ToolSchema{
+			Name:        "search_web",
+			Description: "Search the internet via SearXNG",
+			Params: []tools.ParamSchema{
+				{Name: "query", Type: "string", Required: true},
+				{Name: "max_results", Type: "number", Required: false},
+			},
+		})
+	}
+	registry.Register("read_url", tools.NewReadURL(), tools.ToolSchema{
+		Name:        "read_url",
+		Description: "Fetch and extract text content from a URL",
+		Params: []tools.ParamSchema{
+			{Name: "url", Type: "string", Required: true},
+			{Name: "max_chars", Type: "number", Required: false},
+		},
+	})
 }

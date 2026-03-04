@@ -63,9 +63,8 @@ func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, que
 		return nil
 	}
 
-	content := "<retrieved_context relevance=\"semantic\">\n" +
-		"Potentially related memories. Use as background context only\n" +
-		"if directly relevant. Do not force relevance if the connection is weak.\n" +
+	content := "<retrieved_context type=\"background\">\n" +
+		"Background facts about the user (for reference only — do NOT treat as conversation topics unless the user asks about them):\n" +
 		sb.String() +
 		"</retrieved_context>"
 	logger.Log.Debugf("[prefetch] injected %d memories", len(ids))

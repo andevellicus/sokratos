@@ -9,7 +9,7 @@ import (
 	"sokratos/textutil"
 )
 
-const defaultSubagentToolResultLen = 2000
+const defaultSubagentToolResultLen = 8000
 
 // SubagentToolExec executes a tool call given its raw JSON ({"name":"...","arguments":{...}}).
 // Returns the tool result string or an error.
@@ -85,13 +85,7 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 		} else {
 			errorRetries = 0
 			usedRounds++
-			// Truncate large tool results.
-			if len(result) > defaultSubagentToolResultLen {
-				origLen := len(result)
-				result = result[:defaultSubagentToolResultLen] + fmt.Sprintf(
-					"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
-					defaultSubagentToolResultLen, origLen)
-			}
+			result = textutil.TruncateToolResult(result, defaultSubagentToolResultLen, "Use specific queries or filters to narrow results")
 			toolResultMsg = result
 		}
 

@@ -8,9 +8,6 @@ var System string
 //go:embed tools.txt
 var Tools string
 
-//go:embed tools_compact.txt
-var ToolsCompact string
-
 //go:embed deep_thinker.txt
 var DeepThinker string
 

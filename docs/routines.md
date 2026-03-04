@@ -24,36 +24,36 @@ routines/
 ```toml
 [feed-digest]
 interval = "4 hours"
-tool = "get-feeds"
+action = "scan_feeds"
 goal = "Select 3-5 most interesting items. Send a digest."
 silent_if_empty = true
 ```
 
-The engine calls the tool directly, then passes the result + `goal` to the orchestrator. If `silent_if_empty = true` and the tool returns no data, the orchestrator is skipped.
+The engine calls the action directly, then passes the result + `goal` to the orchestrator. If `silent_if_empty = true` and the action returns no data, the orchestrator is skipped.
 
-### Multi-Tool Routine
+### Multi-Action Routine
 
 ```toml
 [morning-briefing]
 schedule = "06:00"
-tools = ["search_email", "get-weather", "search_calendar"]
+actions = ["search_email", "get_weather", "search_calendar"]
 goal = "Synthesize everything into a concise daily orientation."
 ```
 
-Tools are called in order. Results are concatenated and passed to the orchestrator as a single prompt.
+Actions are called in order. Results are concatenated and passed to the orchestrator as a single prompt.
 
 ---
 
-## Tool Arguments
+## Action Arguments
 
-`tool_args` provides per-tool arguments. Each key under `[routine-name.tool_args.tool-name]` becomes a JSON argument passed to that tool at execution time.
+`action_args` provides per-action arguments. Each key under `[routine-name.action_args.action-name]` becomes a JSON argument passed to that action at execution time.
 
 ```toml
-[morning-briefing.tool_args.search_calendar]
+[morning-briefing.action_args.search_calendar]
 time_min = "{{today}}"
 time_max = "{{tomorrow}}"
 
-[morning-briefing.tool_args.search_email]
+[morning-briefing.action_args.search_email]
 max_results = 10
 ```
 
@@ -82,7 +82,7 @@ String values containing `{{...}}` expressions are expanded at execution time us
 | `+Nd` / `-Nd` | `{{today+3d}}` | 3 days from midnight |
 | `+Nw` / `-Nw` | `{{yesterday-1w}}` | 8 days ago at midnight |
 
-Templates are expanded by `routines.ExpandAndMarshal()` in `engine/routines.go` just before the tool is called. The expansion is regex-based (`{{keyword[+-]offset}}`), so templates can appear anywhere in a string value, including embedded in larger strings.
+Templates are expanded by `routines.ExpandAndMarshal()` in `engine/routines.go` just before the action is called. The expansion is regex-based (`{{keyword[+-]offset}}`), so templates can appear anywhere in a string value, including embedded in larger strings.
 
 ---
 
@@ -127,15 +127,15 @@ Routines run on their own independent scheduler (`runRoutineScheduler`), decoupl
    - Calls `executeDueRoutines()`
 2. **`executeDueRoutines()`** calls `routines.QueryDue(pool)` which:
    - Queries routines where interval has elapsed OR schedule is non-null
-   - Parses schedules and tool_args from DB columns
+   - Parses schedules and action_args from DB columns
    - Filters schedule-based routines via `IsScheduleDue()`
    - Returns `[]DueRoutine`
 3. **`executeSingleRoutine(d)`** for each due routine:
    - Calls `routines.AdvanceTimer()` (prevents double-fire on crash)
-   - Resolves tool list: `Tools` > `Tool` > legacy `Instruction`
-   - For each tool: looks up `d.ToolArgs[toolName]`, expands via `ExpandAndMarshal()`, calls `ToolExec`
-   - Checks `IsEmptyResult()` on each tool result
-   - If `SilentIfEmpty` and all tools empty, returns silently
+   - Resolves action list: `Actions` > `Action` > legacy `Instruction`
+   - For each action: looks up `d.ActionArgs[actionName]`, expands via `ExpandAndMarshal()`, calls `ToolExec`
+   - Checks `IsEmptyResult()` on each action result
+   - If `SilentIfEmpty` and all actions empty, returns silently
    - Otherwise passes concatenated results + goal to the orchestrator
 
 ---
@@ -181,9 +181,9 @@ CREATE TABLE routines (
     interval_duration INTERVAL,           -- nullable for schedule-only
     last_executed TIMESTAMPTZ DEFAULT now(),
     instruction TEXT,                      -- nullable for structured routines
-    tool VARCHAR(255),
-    tools TEXT[],
-    tool_args JSONB,                       -- {"tool_name": {"key": "value"}}
+    action VARCHAR(255),
+    actions TEXT[],
+    action_args JSONB,                     -- {"action_name": {"key": "value"}}
     goal TEXT,
     silent_if_empty BOOLEAN DEFAULT false,
     schedule TEXT                           -- "HH:MM" or "HH:MM,HH:MM"
@@ -201,9 +201,9 @@ Unified type for TOML, JSON, and DB representation. `Schedule` is `interface{}` 
 ### `routines.DueRoutine`
 
 Execution candidate with parsed fields:
-- `ToolArgs map[string]json.RawMessage` — per-tool JSON args from the JSONB column
+- `ActionArgs map[string]json.RawMessage` — per-action JSON args from the JSONB column
 - `Schedules []string` — parsed from comma-separated schedule column
-- `Tool *string`, `Goal *string` — nullable DB fields
+- `Action *string`, `Goal *string` — nullable DB fields
 
 ### `routines.FileWriter`
 

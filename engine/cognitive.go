@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,24 +12,55 @@ import (
 )
 
 // runMaintenanceIfDue runs lightweight maintenance (salience decay, stale memory
-// pruning) at most every MaintenanceInterval.
+// pruning, table housekeeping) at most every MaintenanceInterval.
 func (e *Engine) runMaintenanceIfDue() {
 	if e.DB == nil || time.Since(e.lastMaintenanceRun) < e.MaintenanceInterval {
 		return
 	}
 	e.lastMaintenanceRun = time.Now()
+	ctx := context.Background()
 
-	if n, err := memory.MaterializeDecay(context.Background(), e.DB); err != nil {
+	// --- Memory maintenance ---
+
+	if n, err := memory.MaterializeDecay(ctx, e.DB); err != nil {
 		logger.Log.Warnf("[engine] salience decay failed: %v", err)
 	} else if n > 0 {
 		logger.Log.Infof("[engine] decayed salience for %d memories", n)
 	}
 
 	if e.MemoryStalenessDays > 0 {
-		if n, err := memory.PruneStaleMemories(context.Background(), e.DB, e.MemoryStalenessDays); err != nil {
+		if n, err := memory.PruneStaleMemories(ctx, e.DB, e.MemoryStalenessDays); err != nil {
 			logger.Log.Warnf("[engine] memory pruning failed: %v", err)
 		} else if n > 0 {
 			logger.Log.Infof("[engine] pruned %d stale memories", n)
+		}
+	}
+
+	// --- Table housekeeping ---
+	// Prune rows from tables that grow without bounds. Each query is cheap
+	// (index-backed timestamp filter) and runs at most every MaintenanceInterval.
+	// TTLs are configurable via environment variables (0 = disabled).
+
+	type pruneSpec struct {
+		label string
+		query string
+		days  int
+	}
+	for _, pq := range []pruneSpec{
+		{"work_items", `DELETE FROM work_items WHERE status IN ('completed','failed','cancelled') AND completed_at < now() - ($1 || ' days')::interval`, e.WorkItemsTTLDays},
+		{"processed_emails", `DELETE FROM processed_emails WHERE seen_at < now() - ($1 || ' days')::interval`, e.ProcessedEmailsTTLDays},
+		{"processed_events", `DELETE FROM processed_events WHERE seen_at < now() - ($1 || ' days')::interval`, e.ProcessedEventsTTLDays},
+		{"failed_operations", `DELETE FROM failed_operations WHERE created_at < now() - ($1 || ' days')::interval`, e.FailedOpsTTLDays},
+		{"skill_kv", `DELETE FROM skill_kv WHERE updated_at < now() - ($1 || ' days')::interval`, e.SkillKVTTLDays},
+	} {
+		if pq.days <= 0 {
+			continue
+		}
+		res, err := e.DB.Exec(ctx, pq.query, strconv.Itoa(pq.days))
+		if err != nil {
+			logger.Log.Warnf("[engine] %s pruning failed: %v", pq.label, err)
+		} else if n := res.RowsAffected(); n > 0 {
+			logger.Log.Infof("[engine] pruned %d rows from %s", n, pq.label)
 		}
 	}
 

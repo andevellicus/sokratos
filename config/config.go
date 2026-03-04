@@ -26,9 +26,12 @@ type AppConfig struct {
 	DeepThinkerURL   string
 	DeepThinkerModel string
 
-	SubagentURL string
+	SubagentURL   string
 	SubagentModel string
 	SubagentSlots int
+
+	BrainURL   string // when set, enables two-model mode (Brain + Subagent)
+	BrainModel string
 
 	MaxWebSources     int
 	MemorySearchLimit int
@@ -44,23 +47,27 @@ type AppConfig struct {
 	CognitiveCeiling         time.Duration
 
 	MemoryStalenessDays       int
+	WorkItemsTTLDays          int
+	ProcessedEmailsTTLDays    int
+	ProcessedEventsTTLDays    int
+	FailedOpsTTLDays          int
+	SkillKVTTLDays            int
 	ReflectionMemoryThreshold int
 
-	MaintenanceInterval time.Duration
-	DBMaxConns          int
-	DBMinConns          int
-	DBMaxConnLifetime   time.Duration
-	DBMaxConnIdleTime   time.Duration
-	DBHealthCheckPeriod time.Duration
-	ConfirmationTimeout time.Duration
+	MaintenanceInterval   time.Duration
+	DBMaxConns            int
+	DBMinConns            int
+	DBMaxConnLifetime     time.Duration
+	DBMaxConnIdleTime     time.Duration
+	DBHealthCheckPeriod   time.Duration
+	ConfirmationTimeout   time.Duration
 	MaxSupersededProfiles int
-	EmailDisplayBatch    int
+	EmailDisplayBatch     int
 
 	DatabaseURL string
 
-	GmailCredsPath    string
-	GmailTokenPath    string
-	CalendarTokenPath string
+	GmailCredsPath  string
+	GoogleTokenPath string
 
 	AgentName string
 }
@@ -83,13 +90,16 @@ func Load() *AppConfig {
 		DeepThinkerURL:   os.Getenv("DEEP_THINKER_URL"),
 		DeepThinkerModel: os.Getenv("DEEP_THINKER_MODEL"),
 
-		SubagentURL: os.Getenv("SUBAGENT_URL"),
+		SubagentURL:   os.Getenv("SUBAGENT_URL"),
 		SubagentModel: os.Getenv("SUBAGENT_MODEL"),
 		SubagentSlots: EnvInt("SUBAGENT_SLOTS", 2),
 
+		BrainURL:   os.Getenv("BRAIN_URL"),
+		BrainModel: os.Getenv("BRAIN_MODEL"),
+
 		MaxWebSources:     EnvInt("MAX_WEB_SOURCES", 2),
 		MemorySearchLimit: EnvInt("MEMORY_SEARCH_LIMIT", 10),
-		MaxToolResultLen:  EnvInt("MAX_TOOL_RESULT_LEN", 2000),
+		MaxToolResultLen:  EnvInt("MAX_TOOL_RESULT_LEN", 8000),
 
 		ConsolidationMemoryLimit: EnvInt("CONSOLIDATION_MEMORY_LIMIT", 50),
 		HeartbeatInterval:        EnvDuration("HEARTBEAT_INTERVAL", 5*time.Minute),
@@ -101,23 +111,27 @@ func Load() *AppConfig {
 		CognitiveCeiling:         EnvDuration("COGNITIVE_CEILING", 4*time.Hour),
 
 		MemoryStalenessDays:       EnvInt("MEMORY_STALENESS_DAYS", 90),
+		WorkItemsTTLDays:          EnvInt("WORK_ITEMS_TTL_DAYS", 7),
+		ProcessedEmailsTTLDays:    EnvInt("PROCESSED_EMAILS_TTL_DAYS", 90),
+		ProcessedEventsTTLDays:    EnvInt("PROCESSED_EVENTS_TTL_DAYS", 90),
+		FailedOpsTTLDays:          EnvInt("FAILED_OPS_TTL_DAYS", 30),
+		SkillKVTTLDays:            EnvInt("SKILL_KV_TTL_DAYS", 90),
 		ReflectionMemoryThreshold: EnvInt("REFLECTION_MEMORY_THRESHOLD", 50),
 
-		MaintenanceInterval: EnvDuration("MAINTENANCE_INTERVAL", 30*time.Minute),
-		DBMaxConns:          EnvInt("DB_MAX_CONNS", 20),
-		DBMinConns:          EnvInt("DB_MIN_CONNS", 2),
-		DBMaxConnLifetime:   EnvDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute),
-		DBMaxConnIdleTime:   EnvDuration("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
-		DBHealthCheckPeriod: EnvDuration("DB_HEALTH_CHECK_PERIOD", 30*time.Second),
-		ConfirmationTimeout:  EnvDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
+		MaintenanceInterval:   EnvDuration("MAINTENANCE_INTERVAL", 30*time.Minute),
+		DBMaxConns:            EnvInt("DB_MAX_CONNS", 20),
+		DBMinConns:            EnvInt("DB_MIN_CONNS", 2),
+		DBMaxConnLifetime:     EnvDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute),
+		DBMaxConnIdleTime:     EnvDuration("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
+		DBHealthCheckPeriod:   EnvDuration("DB_HEALTH_CHECK_PERIOD", 30*time.Second),
+		ConfirmationTimeout:   EnvDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
 		MaxSupersededProfiles: EnvInt("MAX_SUPERSEDED_PROFILES", 20),
-		EmailDisplayBatch:    EnvInt("EMAIL_DISPLAY_BATCH", 5),
+		EmailDisplayBatch:     EnvInt("EMAIL_DISPLAY_BATCH", 5),
 
 		DatabaseURL: os.Getenv("DATABASE_URL"),
 
-		GmailCredsPath:    EnvString("GMAIL_CREDENTIALS_PATH", ".credentials/credentials.json"),
-		GmailTokenPath:    EnvString("GMAIL_TOKEN_PATH", ".credentials/token.json"),
-		CalendarTokenPath: EnvString("CALENDAR_TOKEN_PATH", ".credentials/calendar_token.json"),
+		GmailCredsPath:  EnvString("GMAIL_CREDENTIALS_PATH", ".credentials/credentials.json"),
+		GoogleTokenPath: EnvString("GOOGLE_TOKEN_PATH", ".credentials/token.json"),
 
 		AgentName: EnvString("AGENT_NAME", "Sokratos"),
 	}

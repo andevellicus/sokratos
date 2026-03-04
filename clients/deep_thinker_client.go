@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"sokratos/httputil"
-	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/timeouts"
 )
@@ -17,8 +15,8 @@ import (
 // limits concurrency to 1, matching the DTC server's single 32K slot.
 type DeepThinkerClient struct {
 	baseClient
-	sem    chan struct{}
-	workCh chan memory.WorkRequest
+	sem chan struct{}
+	wq  *WorkQueue
 }
 
 // NewDeepThinkerClient returns a ready-to-use client with the HTTP safety-net
@@ -34,59 +32,47 @@ func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 			cb:     newCircuitBreaker("dtc"),
 			logTag: "[dtc]",
 		},
-		sem:    make(chan struct{}, 1),
-		workCh: make(chan memory.WorkRequest, 16),
+		sem: make(chan struct{}, 1),
 	}
-	go d.processWorkQueue()
+	d.wq = NewWorkQueue(16, 1, d.logTag, func(ctx context.Context, req memory.WorkRequest) (string, error) {
+		if req.Grammar != "" {
+			return d.CompleteNoThinkWithGrammar(ctx, req.SystemPrompt, req.UserPrompt, req.Grammar, req.MaxTokens)
+		}
+		return d.CompleteNoThink(ctx, req.SystemPrompt, req.UserPrompt, req.MaxTokens)
+	})
 	return d
 }
 
-// QueueWork submits a background task to the DTC work queue. Items are
-// processed sequentially (single slot). Each item gets a fresh context with
-// item.Timeout, so queue wait time doesn't eat into inference time.
+// QueueWork submits a background task to the shared work queue.
 func (d *DeepThinkerClient) QueueWork(item memory.WorkRequest) {
+	d.wq.QueueWork(item)
+}
+
+// TryAcquire attempts to acquire the Brain's single slot non-blockingly.
+// Returns true if acquired (caller MUST call Release). Used by the slot
+// router to check if the Brain is available for orchestrator work.
+func (d *DeepThinkerClient) TryAcquire() bool {
 	select {
-	case d.workCh <- item:
-		logger.Log.Debugf("%s queued: %s (depth=%d/%d)", d.logTag, item.Label, len(d.workCh), cap(d.workCh))
+	case d.sem <- struct{}{}:
+		return true
 	default:
-		logger.Log.Warnf("%s %s dropped: queue full (%d/%d)", d.logTag, item.Label, len(d.workCh), cap(d.workCh))
-		if item.OnComplete != nil {
-			item.OnComplete("", fmt.Errorf("DTC work queue full"))
-		}
+		return false
 	}
 }
 
-// processWorkQueue drains the DTC work channel sequentially (single slot).
-func (d *DeepThinkerClient) processWorkQueue() {
-	for item := range d.workCh {
-		ctx, cancel := context.WithTimeout(context.Background(), item.Timeout)
-		var result string
-		var err error
-		if item.Grammar != "" {
-			result, err = d.CompleteNoThinkWithGrammar(ctx, item.SystemPrompt, item.UserPrompt, item.Grammar, item.MaxTokens)
-		} else {
-			result, err = d.CompleteNoThink(ctx, item.SystemPrompt, item.UserPrompt, item.MaxTokens)
-		}
-		cancel()
-
-		if err != nil && item.Retries > 0 {
-			item.Retries--
-			backoff := 2 * time.Second
-			logger.Log.Warnf("%s %s failed (%v), retrying in %v (%d left)",
-				d.logTag, item.Label, err, backoff, item.Retries)
-			time.Sleep(backoff)
-			select {
-			case d.workCh <- item:
-				continue
-			default:
-				logger.Log.Warnf("%s %s retry failed: queue full, delivering error", d.logTag, item.Label)
-			}
-		}
-
-		if item.OnComplete != nil {
-			item.OnComplete(result, err)
-		}
+// Acquire blocks until the Brain's slot is available or ctx is cancelled.
+func (d *DeepThinkerClient) Acquire(ctx context.Context) error {
+	select {
+	case d.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+// Release frees the Brain's slot. Must be called after TryAcquire/Acquire succeeds.
+func (d *DeepThinkerClient) Release() {
+	<-d.sem
 }
 
 // Complete sends a system+user message pair to the deep thinker with thinking

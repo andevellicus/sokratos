@@ -25,6 +25,16 @@ type SubagentFunc func(ctx context.Context, systemPrompt, userPrompt string) (st
 // dump chain-of-thought reasoning unless grammar-constrained.
 type GrammarSubagentFunc func(ctx context.Context, systemPrompt, userPrompt, grammar string) (string, error)
 
+// WorkPriority controls admission under queue pressure. Higher values have
+// higher priority. Zero is treated as PriorityNormal for backward compat.
+type WorkPriority int
+
+const (
+	PriorityLow    WorkPriority = 1 // background enrichment — droppable under pressure
+	PriorityNormal WorkPriority = 2 // retryable correctness work (quality scoring, contradiction)
+	PriorityHigh   WorkPriority = 3 // critical work (distillation — data lost if dropped)
+)
+
 // WorkRequest describes a background LLM task to be processed by the work
 // queue. Each item gets its own fresh context (with Timeout duration), so
 // queue wait time does not eat into inference time.
@@ -35,13 +45,15 @@ type WorkRequest struct {
 	Grammar      string
 	MaxTokens    int
 	Timeout      time.Duration
-	Retries      int // remaining retry attempts on transient failure (0 = no retry)
+	Retries      int          // remaining retry attempts on transient failure (0 = no retry)
+	Priority     WorkPriority // 0 treated as PriorityNormal
 	OnComplete   func(result string, err error)
 }
 
 // WorkQueueFunc submits a background LLM task to the work queue. Items are
-// processed sequentially as server slots become available. Nothing is dropped
-// unless the queue buffer is completely full (64 items).
+// processed as worker goroutines become available. Low-priority items are
+// dropped (and deferred for retry) when the queue is ≥75% full; all items
+// are dropped when the buffer is completely full.
 type WorkQueueFunc func(req WorkRequest)
 
 // MemoryWriteRequest describes a memory to be quality-scored and written.

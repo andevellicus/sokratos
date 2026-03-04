@@ -90,11 +90,6 @@ func contentHash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// parseISO8601 delegates to timefmt.ParseISO8601 for centralized time parsing.
-func parseISO8601(s string) (time.Time, error) {
-	return timefmt.ParseISO8601(s)
-}
-
 // retrievalOrderBy is the composite ranking expression used by all retrieval
 // queries. Lower values = better. Combines cosine distance, BM25 full-text
 // boost, salience, usefulness (weight 0.15), temporal decay, confidence,
@@ -173,14 +168,14 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 	// Parse optional temporal bounds. nil → COALESCE falls through to ±infinity.
 	var startDate, endDate *time.Time
 	if a.StartDate != "" {
-		t, err := parseISO8601(a.StartDate)
+		t, err := timefmt.ParseISO8601(a.StartDate)
 		if err != nil {
 			return fmt.Sprintf("invalid start_date %q: %v", a.StartDate, err), nil
 		}
 		startDate = &t
 	}
 	if a.EndDate != "" {
-		t, err := parseISO8601(a.EndDate)
+		t, err := timefmt.ParseISO8601(a.EndDate)
 		if err != nil {
 			return fmt.Sprintf("invalid end_date %q: %v", a.EndDate, err), nil
 		}

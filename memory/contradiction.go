@@ -302,6 +302,7 @@ func submitDeferredContradiction(queueFn WorkQueueFunc, db *pgxpool.Pool, newID 
 		MaxTokens:    512,
 		Timeout:      TimeoutContradictionCheck,
 		Retries:      2,
+		Priority:     PriorityNormal,
 		OnComplete: func(raw string, err error) {
 			if err != nil {
 				logger.Log.Warnf("[memory] deferred contradiction check failed: %v", err)

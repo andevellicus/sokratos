@@ -1,6 +1,6 @@
 # Skill System
 
-Skills are user-created JavaScript tools that persist to disk, auto-load on startup, and integrate with the tool registry and grammar system. They run in a sandboxed ES5 environment with HTTP bridging, key-value storage, and cryptographic helpers.
+Skills are user-created tools that persist to disk, auto-load on startup, and integrate with the tool registry and grammar system. They run in a sandboxed ES2020 environment (goja) with HTTP bridging, key-value storage, and cryptographic helpers. Skills can be written in JavaScript or TypeScript (transpiled via esbuild).
 
 ---
 
@@ -9,16 +9,20 @@ Skills are user-created JavaScript tools that persist to disk, auto-load on star
 ```
 skills/
   <name>/
-    SKILL.md              # Frontmatter manifest (name, description, parameters)
-    scripts/handler.js    # Skill source code (ES5)
+    SKILL.md              # Frontmatter manifest (name, description, language, parameters)
+    scripts/handler.ts    # TypeScript source (preferred)
+    scripts/handler.js    # JavaScript source (fallback if no .ts)
     config.toml           # Optional per-skill configuration (parsed as JS object)
 ```
+
+If both `handler.ts` and `handler.js` exist, `.ts` takes priority. TypeScript is transpiled to JavaScript at load time via esbuild (pure Go, <1ms).
 
 ### SKILL.md Format
 
 ```markdown
 ---
-name: get-weather
+name: get_weather
+language: typescript
 description: |
   Fetch current weather and forecast for a configured location.
   Returns JSON with current conditions and 3-day forecast.
@@ -31,7 +35,7 @@ description: |
 | location | string | no |
 ```
 
-The YAML frontmatter defines `name`, `description`, and optionally documents parameters. The description is used in the tool's schema and in dynamic tool descriptions injected into the orchestrator's prompt.
+The YAML frontmatter defines `name`, `description`, optionally `language` (`"javascript"` default, `"typescript"`), and documents parameters. The description is used in the tool's schema and in dynamic tool descriptions injected into the orchestrator's prompt.
 
 ### config.toml
 
@@ -42,13 +46,13 @@ location = "New York, NY"
 units = "imperial"
 ```
 
-Accessed in JS as `skill_config.location`, `skill_config.units`, etc.
+Accessed in JS/TS as `skill_config.location`, `skill_config.units`, etc.
 
 ---
 
 ## Runtime Environment
 
-Skills execute in a **goja** ES5 sandbox with a 30-second timeout. The following globals are available:
+Skills execute in a **goja** ES2020 sandbox with a 30-second timeout (5 minutes with delegation deps). The following globals are available:
 
 | Global | Description |
 |--------|-------------|
@@ -62,6 +66,21 @@ Skills execute in a **goja** ES5 sandbox with a 30-second timeout. The following
 | `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Per-skill PostgreSQL key-value store |
 | `hash_sha256(s)` | SHA-256 hex digest |
 | `hash_hmac_sha256(key, msg)` | HMAC-SHA256 hex digest |
+| `call_tool(name, args)` | Synchronous tool invocation (self-call prevented) |
+| `delegate(directive, context)` | Single subagent dispatch (60s timeout) |
+| `delegate_batch(tasks)` | Parallel fan-out (3min timeout) |
+
+### TypeScript Support
+
+TypeScript skills use `declare` statements for sandbox globals (type-only, stripped at transpile time):
+
+```typescript
+declare const args: { location?: string };
+declare const skill_config: { location?: string } | undefined;
+declare function http_request(method: string, url: string, headers: Record<string, string>, body: string): { status: number; body: string };
+```
+
+esbuild transpiles TS to ES2020 JS. Type annotations, interfaces, and enums are stripped; the resulting JS runs in goja identically to hand-written JS.
 
 ### HTTP Bridge
 
@@ -79,13 +98,13 @@ The KV store is namespaced per skill in the `skill_kv` PostgreSQL table. Useful 
 
 Skills can be created two ways:
 
-1. **`create_skill` tool** (runtime) — The orchestrator generates the JS code, validates syntax, runs a test execution with `test_args`, writes to disk, registers in the live registry, and rebuilds tool descriptions.
+1. **`create_skill` tool** (runtime) — The orchestrator generates the code, validates syntax (transpiles if TS), runs a test execution with `test_args`, writes to disk, registers in the live registry, and rebuilds tool descriptions. Pass `"language": "typescript"` for TS skills.
 
 2. **Manual** — Create the directory structure by hand, then `/reload` or restart to pick it up.
 
 ### Hot-Reload
 
-On each heartbeat tick, `SyncSkills()` checks mtimes of skill directories. Changed files trigger re-registration and grammar rebuild. Also triggered by `/reload`.
+On each heartbeat tick, `SyncSkills()` checks mtimes of skill directories. Changed files trigger re-registration and grammar rebuild. TypeScript files are re-transpiled on each invocation so edits take effect immediately. Also triggered by `/reload`.
 
 ### Deletion
 
@@ -95,20 +114,20 @@ Via `manage_skills` tool (`action: "delete"`) or manual removal of the directory
 
 ## Using Skills in Routines
 
-Skills are tools like any other — they can be called from routines via the `tool` or `tools` field:
+Skills are actions like any other — they can be called from routines via the `action` or `actions` field:
 
 ```toml
 [feed-digest]
 interval = "4 hours"
-tool = "get-feeds"
+action = "scan_feeds"
 goal = "Send a digest of the top items."
 silent_if_empty = true
 ```
 
-Tool arguments can be passed via `tool_args` with template expansion:
+Action arguments can be passed via `action_args` with template expansion:
 
 ```toml
-[feed-digest.tool_args.get-feeds]
+[feed-digest.action_args.scan_feeds]
 count = 5
 feed = "hackernews"
 ```
@@ -117,22 +136,29 @@ See [routines.md](routines.md) for the full template syntax.
 
 ---
 
+## Naming Convention
+
+Skill names use **snake_case** to match built-in tools (`search_web`, `search_memory`, etc.). The regex allows `[a-z][a-z0-9_-]{1,48}` but snake_case is preferred for consistency.
+
+---
+
 ## Built-in Skills
 
 | Skill | Description | Key Config |
 |-------|-------------|------------|
-| `get-weather` | Current conditions + 3-day forecast via wttr.in | `location` |
-| `get-feeds` | RSS/Atom aggregator: Twitter (RSSHub), Reddit (native RSS), any RSSHub route | `[[feeds]]` with `type`, `route`/`subreddit`/`lists` |
+| `get_weather` | Current conditions + 3-day forecast via Open-Meteo | `location` |
+| `scan_feeds` | RSS/Atom aggregator with parallel article summarization | `[[category]]` with `type`, `route`/`subreddit`/`lists`/`url` |
 
-### get-feeds Feed Types
+### scan_feeds Feed Types
 
 | Type | Source | Config Fields |
 |------|--------|--------------|
 | `twitter` | RSSHub `/twitter/list/` or `/twitter/user/` | `lists`, `accounts` |
 | `reddit` | Native Reddit RSS (`/r/<sub>/<sort>.rss`) | `subreddit`, `sort` |
 | `rsshub` | Any RSSHub route | `route` (e.g. `/hackernews/best`, `/arstechnica/index`) |
+| `rss` | Direct RSS/Atom feed | `url` |
 
-All feed types support `count` (max items) and `name` (identifier for dedup tracking). See `skills/get-feeds/config.toml.example` for examples.
+All feed types support `count` (max items) and `name` (identifier for dedup tracking). See `skills/scan_feeds/config.toml` for examples.
 
 ---
 

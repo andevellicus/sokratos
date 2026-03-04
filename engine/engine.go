@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/timeouts"
+	"sokratos/timefmt"
 )
 
 // GatekeeperClient is the interface for fast gatekeeper calls. Satisfied by
@@ -72,8 +75,13 @@ type Engine struct {
 	ProfileContent     string        // identity profile JSON for system prompt injection
 	TemporalContent    string        // temporal context XML for system prompt injection
 
-	MaintenanceInterval time.Duration        // interval between maintenance runs (decay, pruning); 0 = 30m default
-	MemoryStalenessDays int                  // prune stale memories older than this many days (0 = disabled)
+	MaintenanceInterval    time.Duration // interval between maintenance runs (decay, pruning); 0 = 30m default
+	MemoryStalenessDays    int           // prune decayed memories older than this many days (0 = disabled)
+	WorkItemsTTLDays       int           // prune terminal work items older than this (0 = disabled)
+	ProcessedEmailsTTLDays int           // prune email dedup entries older than this (0 = disabled)
+	ProcessedEventsTTLDays int           // prune calendar event dedup entries older than this (0 = disabled)
+	FailedOpsTTLDays       int           // prune failed operation logs older than this (0 = disabled)
+	SkillKVTTLDays         int           // prune skill KV entries older than this (0 = disabled)
 	SendFunc            func(text string)    // sends a message to the user via Telegram
 	InterruptChan       chan struct{}        // signals the task scheduler to recalculate
 	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
@@ -84,6 +92,7 @@ type Engine struct {
 	QueueFunc           memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
 	WorkMonitor          WorkMonitor           // tracks running work items; nil = no tracking
 	RoutineTimeout       time.Duration         // max duration for a single routine execution (default 5m)
+	Router               SlotRouter            // routes orchestrator calls to Brain or subagent fallback; nil = use LLM.Client
 	SyncFunc             func()               // hot-reload skills from disk (called each heartbeat tick)
 	RoutineSyncFunc      func()               // hot-reload routines from disk (called each routine scheduler tick)
 	ReflectionNotifyFunc func(summary string) // inject reflection insights into conversation context (nil = skip)
@@ -121,11 +130,75 @@ func (e *Engine) RecordBackgroundCompletion(typ, summary string) {
 	e.recordAction(typ, summary)
 }
 
+// FormatRecentActionsXML returns recent system actions (routines, heartbeats)
+// as an XML block for injection into the interactive prompt. Actions older than
+// maxAge are excluded. Returns empty string if nothing recent.
+func (e *Engine) FormatRecentActionsXML(maxAge time.Duration) string {
+	e.Mu.Lock()
+	actions := make([]actionRecord, len(e.recentActions))
+	copy(actions, e.recentActions)
+	e.Mu.Unlock()
+
+	cutoff := time.Now().Add(-maxAge)
+	var sb strings.Builder
+	for _, a := range actions {
+		if a.Time.Before(cutoff) {
+			continue
+		}
+		fmt.Fprintf(&sb, "<action type=%q time=%q>%s</action>\n", a.Type, timefmt.FormatDateTime(a.Time), a.Summary)
+	}
+	if sb.Len() == 0 {
+		return ""
+	}
+	return "<recent_system_actions>\n" + sb.String() + "</recent_system_actions>"
+}
+
 // withOrchestratorLock runs fn while holding the orchestrator mutex.
 func (e *Engine) withOrchestratorLock(fn func()) {
 	e.Mu.Lock()
 	defer e.Mu.Unlock()
 	fn()
+}
+
+// runOrchestrator acquires a slot (Brain or fallback), wires the
+// acquire/release/reacquire callbacks, and runs a QueryOrchestrator call
+// under the orchestrator lock. This eliminates the repeated boilerplate
+// across routines, heartbeat, and scheduler call sites.
+// The configure callback lets callers customise opts (e.g. set History)
+// before the LLM call fires. It runs inside the orchestrator lock.
+func (e *Engine) runOrchestrator(ctx context.Context, preferBrain bool, prompt string,
+	configure func(opts *llm.QueryOrchestratorOpts)) (string, []llm.Message, error) {
+
+	choice := e.resolveOrchestrator(ctx, preferBrain)
+	acquired := true
+	defer func() {
+		if acquired {
+			choice.Release()
+		}
+	}()
+
+	var reply string
+	var msgs []llm.Message
+	var err error
+	e.withOrchestratorLock(func() {
+		opts := e.baseOrchestratorOpts()
+		opts.OnToolStart = func() { choice.Release(); acquired = false }
+		opts.OnToolEnd = func(reCtx context.Context) error {
+			if reErr := choice.Reacquire(reCtx); reErr != nil {
+				return reErr
+			}
+			acquired = true
+			return nil
+		}
+		if configure != nil {
+			configure(opts)
+		}
+		reply, msgs, err = llm.QueryOrchestrator(
+			ctx, choice.Client, choice.Model, prompt,
+			e.ToolExec, DefaultTrimFn, opts,
+		)
+	})
+	return reply, msgs, err
 }
 
 // baseOrchestratorOpts returns the common QueryOrchestratorOpts shared across
@@ -156,6 +229,22 @@ func (e *Engine) sendDeduped(text, logLabel string) bool {
 	}
 	logger.Log.Infof("heartbeat: %s delivered", logLabel)
 	return true
+}
+
+// resolveOrchestrator returns the client/model to use for an orchestrator call.
+// In two-model mode, routes to Brain or subagent based on slot availability.
+// When preferBrain is true, the Brain is tried first (interactive messages).
+// When Router is nil, always uses the primary orchestrator.
+func (e *Engine) resolveOrchestrator(ctx context.Context, preferBrain bool) OrchestratorChoice {
+	if e.Router != nil {
+		return e.Router.AcquireOrFallback(ctx, preferBrain)
+	}
+	return OrchestratorChoice{
+		Client:    e.LLM.Client,
+		Model:     e.LLM.Model,
+		Release:   func() {},
+		Reacquire: func(context.Context) error { return nil },
+	}
 }
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.

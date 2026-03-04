@@ -1,6 +1,8 @@
 package textutil
 
 import (
+	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -17,6 +19,23 @@ func Truncate(s string, n int) string {
 		n--
 	}
 	return s[:n] + "..."
+}
+
+// TruncateToolResult truncates a tool result string to maxLen characters,
+// appending a descriptive suffix with the original length. The hint parameter
+// is appended after the truncation notice (e.g. " Use specific queries or
+// filters to narrow results."). Pass empty string for no hint.
+func TruncateToolResult(s string, maxLen int, hint string) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	origLen := len(s)
+	suffix := fmt.Sprintf("\n... (truncated: showing %d of %d chars", maxLen, origLen)
+	if hint != "" {
+		suffix += ". " + hint
+	}
+	suffix += ")"
+	return s[:maxLen] + suffix
 }
 
 // thinkTagRe matches <think>...</think> blocks (including across newlines).
@@ -82,13 +101,11 @@ func StripCodeFences(s string) string {
 }
 
 // toolIntentCodeTagRe matches <TOOL_INTENT>...<CODE>...</CODE> with an
-// optional (possibly malformed) closing TOOL_INTENT tag.
-var toolIntentCodeTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?</CODE>)\s*(?:<[/\\]?TOOL_INT[A-Z]*>)?`)
+// optional closing </TOOL_INTENT> tag.
+var toolIntentCodeTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?</CODE>)\s*(?:</TOOL_INTENT>)?`)
 
-// toolIntentTagRe matches <TOOL_INTENT>...</TOOL_INTENT> blocks, including
-// common model mistakes: backslash closer (<\TOOL_INTENT>), truncated tags,
-// and other <TOOL_INT...> variants.
-var toolIntentTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)<[/\\]?TOOL_INT[A-Z]*>`)
+// toolIntentTagRe matches <TOOL_INTENT>...</TOOL_INTENT> blocks.
+var toolIntentTagRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)</TOOL_INTENT>`)
 
 // StripToolIntentTags removes all <TOOL_INTENT>...</TOOL_INTENT> blocks from
 // text, returning only surrounding prose. Handles CODE blocks and common model
@@ -119,6 +136,18 @@ func CleanLLMJSON(s string) string {
 	jsonStr = decimalSpaceRe.ReplaceAllString(jsonStr, "$1$2")
 	jsonStr = trailingDotRe.ReplaceAllString(jsonStr, "$1$2")
 	return trailingCommaRe.ReplaceAllString(jsonStr, "$1")
+}
+
+// ParseLLMJSON applies CleanLLMJSON to the raw LLM output and unmarshals the
+// result into T. Returns a descriptive error including a truncated snippet of
+// the cleaned output on parse failure.
+func ParseLLMJSON[T any](raw string) (T, error) {
+	var result T
+	cleaned := CleanLLMJSON(raw)
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		return result, fmt.Errorf("parse LLM JSON: %w (raw: %s)", err, Truncate(cleaned, 300))
+	}
+	return result, nil
 }
 
 // ExtractJSON finds the first top-level JSON object in s by locating the first

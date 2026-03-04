@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 
-	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
@@ -20,24 +18,22 @@ import (
 // Returns the new memory ID (0 if skipped) and any error.
 func generateTransitionMemory(
 	ctx context.Context,
-	pool *pgxpool.Pool,
-	embedEndpoint, embedModel string,
-	dtc *clients.DeepThinkerClient,
+	deps PipelineDeps,
 	newEventSummary string,
 	tags []string,
 ) (int64, error) {
-	if dtc == nil {
+	if deps.DTC == nil {
 		return 0, nil
 	}
 
 	// Embed the new event for similarity search.
-	emb, err := memory.GetEmbedding(ctx, embedEndpoint, embedModel, newEventSummary)
+	emb, err := memory.GetEmbedding(ctx, deps.EmbedEndpoint, deps.EmbedModel, newEventSummary)
 	if err != nil {
 		return 0, fmt.Errorf("embedding failed: %w", err)
 	}
 
 	// Query top 10 related non-superseded memories from last 6 months.
-	rows, err := pool.Query(ctx,
+	rows, err := deps.Pool.Query(ctx,
 		`SELECT id, summary FROM memories
 		 WHERE superseded_by IS NULL
 		   AND (embedding <=> $1) < 0.4
@@ -81,7 +77,7 @@ func generateTransitionMemory(
 	}
 
 	// Call deep thinker with thinking enabled for creative synthesis.
-	raw, err := dtc.Complete(ctx, strings.TrimSpace(prompts.Transition), b.String(), 1024)
+	raw, err := deps.DTC.Complete(ctx, strings.TrimSpace(prompts.Transition), b.String(), 1024)
 	if err != nil {
 		return 0, fmt.Errorf("deep thinker synthesis failed: %w", err)
 	}
@@ -101,10 +97,10 @@ func generateTransitionMemory(
 		Salience:      10,
 		MemoryType:    "transition",
 		Source:        "transition",
-		EmbedEndpoint: embedEndpoint,
-		EmbedModel:    embedModel,
+		EmbedEndpoint: deps.EmbedEndpoint,
+		EmbedModel:    deps.EmbedModel,
 	}
-	id, err := memory.ScoreAndWrite(ctx, pool, req, nil, nil) // nil grammarFn/queueFn = skip enrichment
+	id, err := memory.ScoreAndWrite(ctx, deps.Pool, req, nil, nil) // nil grammarFn/queueFn = skip enrichment
 	if err != nil {
 		return 0, fmt.Errorf("save failed: %w", err)
 	}

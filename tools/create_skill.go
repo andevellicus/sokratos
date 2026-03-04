@@ -8,8 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-
-	"github.com/jackc/pgx/v5/pgxpool"
+	"time"
 
 	"sokratos/logger"
 )
@@ -22,13 +21,14 @@ var skillNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{1,48}$`)
 
 // NewCreateSkill returns a ToolFunc that creates a new JavaScript skill on
 // disk, registers it in the live registry, and rebuilds the grammar.
-func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, pool *pgxpool.Pool) ToolFunc {
+func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
 			Name        string          `json:"name"`
 			Description string          `json:"description"`
 			Params      string          `json:"params"`
 			Code        string          `json:"code"`
+			Language    string          `json:"language"`
 			TestArgs    json.RawMessage `json:"test_args"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -61,9 +61,28 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			}
 		}
 
-		// Compile-check the JavaScript.
-		if err := ValidateSkillSource(a.Code); err != nil {
-			return fmt.Sprintf("JavaScript syntax error: %v", err), nil
+		// Normalize language.
+		lang := strings.ToLower(strings.TrimSpace(a.Language))
+		switch lang {
+		case "ts", "typescript":
+			lang = "typescript"
+		default:
+			lang = "javascript"
+		}
+
+		// Compile-check the source (transpile if TypeScript).
+		var execSource string
+		if lang == "typescript" {
+			transpiled, tErr := ValidateTypeScriptSource(a.Code)
+			if tErr != nil {
+				return fmt.Sprintf("TypeScript error: %v", tErr), nil
+			}
+			execSource = transpiled
+		} else {
+			if err := ValidateSkillSource(a.Code); err != nil {
+				return fmt.Sprintf("JavaScript syntax error: %v", err), nil
+			}
+			execSource = a.Code
 		}
 
 		// Normalize test_args: accept both JSON string and JSON object.
@@ -90,7 +109,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			return "Invalid JSON in test_args", nil
 		}
 
-		testResult, err := ExecuteSkill(ctx, a.Name, a.Code, "", testArgsRaw, pool)
+		testResult, err := ExecuteSkill(ctx, a.Name, execSource, "", testArgsRaw, deps)
 		if err != nil {
 			return fmt.Sprintf("Skill failed test execution: %v", err), nil
 		}
@@ -107,25 +126,31 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			return "", fmt.Errorf("create skill directory: %w", err)
 		}
 
-		mdContent := GenerateSkillMD(a.Name, a.Description, params)
+		mdContent := GenerateSkillMD(a.Name, a.Description, lang, params)
 		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(mdContent), 0644); err != nil {
 			return "", fmt.Errorf("write SKILL.md: %w", err)
 		}
 
-		if err := os.WriteFile(filepath.Join(scriptsDir, "handler.js"), []byte(a.Code), 0644); err != nil {
-			return "", fmt.Errorf("write handler.js: %w", err)
+		// Save as handler.ts for TypeScript, handler.js for JavaScript.
+		handlerFile := "handler.js"
+		if lang == "typescript" {
+			handlerFile = "handler.ts"
+		}
+		if err := os.WriteFile(filepath.Join(scriptsDir, handlerFile), []byte(a.Code), 0644); err != nil {
+			return "", fmt.Errorf("write %s: %w", handlerFile, err)
 		}
 
-		// Register the skill in the live registry.
+		// Register the skill in the live registry. Source is always transpiled JS.
 		skill := Skill{
 			Manifest: SkillManifest{
 				Name:        a.Name,
 				Description: a.Description,
+				Language:    lang,
 			},
 			Params: params,
-			Source: a.Code,
+			Source: execSource,
 		}
-		RegisterSkill(registry, skill, pool)
+		RegisterSkill(registry, skill, deps)
 
 		// Rebuild grammar so the subagent can produce valid JSON for this tool.
 		rebuildGrammar()
@@ -135,12 +160,13 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 	}
 }
 
-// NewManageSkills returns a ToolFunc for listing and deleting skills.
-func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc) ToolFunc {
+// NewManageSkills returns a ToolFunc for listing, deleting, and testing skills.
+func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
-			Action string `json:"action"`
-			Name   string `json:"name"`
+			Action   string          `json:"action"`
+			Name     string          `json:"name"`
+			TestArgs json.RawMessage `json:"test_args"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
 			return fmt.Sprintf("Invalid arguments: %v", err), nil
@@ -159,6 +185,9 @@ func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar Gramma
 			fmt.Fprintf(&b, "Installed skills (%d):\n", len(skills))
 			for _, s := range skills {
 				fmt.Fprintf(&b, "- %s: %s", s.Manifest.Name, s.Manifest.Description)
+				if s.Manifest.Language == "typescript" {
+					b.WriteString(" [ts]")
+				}
 				if len(s.Params) > 0 {
 					var pNames []string
 					for _, p := range s.Params {
@@ -183,11 +212,62 @@ func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar Gramma
 			}
 			registry.Unregister(a.Name)
 			rebuildGrammar()
+			// Clean up orphaned KV data for the deleted skill.
+			if deps.Pool != nil {
+				kvCtx, kvCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if _, err := deps.Pool.Exec(kvCtx, "DELETE FROM skill_kv WHERE skill_name=$1", a.Name); err != nil {
+					logger.Log.Warnf("[skills] failed to clean KV for deleted skill %s: %v", a.Name, err)
+				}
+				kvCancel()
+			}
 			logger.Log.Infof("[skills] deleted skill: %s", a.Name)
 			return fmt.Sprintf("Skill %q deleted and unregistered.", a.Name), nil
 
+		case "test":
+			if strings.TrimSpace(a.Name) == "" {
+				return "Name is required for test action", nil
+			}
+			skillDir := filepath.Join(skillsDir, a.Name)
+			if _, err := os.Stat(skillDir); os.IsNotExist(err) {
+				return fmt.Sprintf("Skill %q not found on disk", a.Name), nil
+			}
+
+			// Load the skill fresh from disk (transpiles TS if needed).
+			skills, err := LoadSkills(skillsDir)
+			if err != nil {
+				return fmt.Sprintf("Failed to load skills: %v", err), nil
+			}
+			var skill *Skill
+			for i := range skills {
+				if skills[i].Manifest.Name == a.Name {
+					skill = &skills[i]
+					break
+				}
+			}
+			if skill == nil {
+				return fmt.Sprintf("Skill %q found on disk but failed to load (check logs)", a.Name), nil
+			}
+
+			// Normalize test_args.
+			var testArgsRaw json.RawMessage
+			if len(a.TestArgs) == 0 {
+				testArgsRaw = json.RawMessage(`{}`)
+			} else {
+				testArgsRaw = a.TestArgs
+			}
+
+			result, execErr := ExecuteSkill(ctx, a.Name, skill.Source, skill.Dir, testArgsRaw, deps)
+			if execErr != nil {
+				return fmt.Sprintf("Skill %q test error: %v", a.Name, execErr), nil
+			}
+			lang := ""
+			if skill.Manifest.Language == "typescript" {
+				lang = " [ts]"
+			}
+			return fmt.Sprintf("Skill %q%s test result:\n%s", a.Name, lang, result), nil
+
 		default:
-			return fmt.Sprintf("Unknown action %q — use 'list' or 'delete'", a.Action), nil
+			return fmt.Sprintf("Unknown action %q — use 'list', 'delete', or 'test'", a.Action), nil
 		}
 	}
 }

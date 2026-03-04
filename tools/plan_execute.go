@@ -126,11 +126,9 @@ func decomposePlan(ctx context.Context, dtc *clients.DeepThinkerClient, directiv
 		return nil, fmt.Errorf("plan decomposition: %w", err)
 	}
 
-	raw = textutil.CleanLLMJSON(raw)
-
-	var plan taskPlan
-	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
-		return nil, fmt.Errorf("parse plan: %w (raw: %s)", err, raw)
+	plan, err := textutil.ParseLLMJSON[taskPlan](raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse plan: %w", err)
 	}
 
 	if len(plan.Steps) == 0 {
@@ -316,11 +314,9 @@ func replanRemaining(ctx context.Context, dtc *clients.DeepThinkerClient, direct
 		return nil, fmt.Errorf("replan call: %w", err)
 	}
 
-	raw = textutil.CleanLLMJSON(raw)
-
-	var plan taskPlan
-	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
-		return nil, fmt.Errorf("parse replan: %w (raw: %s)", err, raw)
+	plan, err := textutil.ParseLLMJSON[taskPlan](raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse replan: %w", err)
 	}
 
 	if len(plan.Steps) == 0 {

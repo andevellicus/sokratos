@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,7 +132,7 @@ func TestValidateSkillSource(t *testing.T) {
 func TestExecuteSkill_ReturnStatement(t *testing.T) {
 	source := `var result = args.a * args.b; return "product=" + result;`
 	args := json.RawMessage(`{"a": 5, "b": 6}`)
-	result, err := ExecuteSkill(context.Background(), "test_return", source, "", args, nil)
+	result, err := ExecuteSkill(context.Background(), "test_return", source, "", args, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -152,7 +153,7 @@ func TestNeedsIIFEWrap(t *testing.T) {
 func TestExecuteSkill_BasicArithmetic(t *testing.T) {
 	source := `var result = args.a + args.b; "sum=" + result;`
 	args := json.RawMessage(`{"a": 3, "b": 4}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, "", args, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -164,7 +165,7 @@ func TestExecuteSkill_BasicArithmetic(t *testing.T) {
 func TestExecuteSkill_DefaultArgs(t *testing.T) {
 	source := `var c = args.currency || "usd"; c;`
 	args := json.RawMessage(`{}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, "", args, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", args, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -176,12 +177,16 @@ func TestExecuteSkill_DefaultArgs(t *testing.T) {
 func TestExecuteSkill_RuntimeError(t *testing.T) {
 	source := `null.foo;`
 	args := json.RawMessage(`{}`)
-	result, err := ExecuteSkill(context.Background(), "test", source, "", args, nil)
-	if err != nil {
-		t.Fatalf("expected soft error, got hard error: %v", err)
+	_, err := ExecuteSkill(context.Background(), "test", source, "", args, SkillDeps{})
+	if err == nil {
+		t.Fatal("expected ToolError for runtime error")
 	}
-	if result == "" {
-		t.Error("expected non-empty soft error message")
+	var te *ToolError
+	if !errors.As(err, &te) {
+		t.Fatalf("expected *ToolError, got %T: %v", err, err)
+	}
+	if te.Message == "" {
+		t.Error("expected non-empty error message")
 	}
 }
 
@@ -265,7 +270,7 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 		},
 		Source: `"result=" + (args.a + args.b);`,
 	}
-	RegisterSkill(registry, skill, nil)
+	RegisterSkill(registry, skill, SkillDeps{})
 
 	if !registry.Has("add_nums") {
 		t.Fatal("expected add_nums to be registered")
@@ -282,7 +287,7 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 }
 
 func TestGenerateSkillMD(t *testing.T) {
-	md := GenerateSkillMD("my_skill", "Does something useful.", []ParamSchema{
+	md := GenerateSkillMD("my_skill", "Does something useful.", "", []ParamSchema{
 		{Name: "query", Type: "string", Required: true},
 	})
 	if md == "" {
@@ -312,7 +317,8 @@ func TestLoadSkills_BuiltinSkills(t *testing.T) {
 	}
 
 	expected := map[string]struct{}{
-		"get_server_time": {},
+		"get_weather": {},
+		"scan_feeds":  {},
 	}
 
 	loaded := make(map[string]struct{})
@@ -341,7 +347,8 @@ func TestLoadSkills_BuiltinSkillParams(t *testing.T) {
 	}
 
 	paramCounts := map[string]int{
-		"get_server_time": 0,
+		"get_weather": 1,
+		"scan_feeds":  3,
 	}
 
 	for _, s := range skills {
@@ -362,7 +369,7 @@ func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	scriptsDir := filepath.Join(skillDir, "scripts")
 	os.MkdirAll(scriptsDir, 0755)
 
-	md := GenerateSkillMD("test_generated", "A tool-created skill for testing.", []ParamSchema{
+	md := GenerateSkillMD("test_generated", "A tool-created skill for testing.", "", []ParamSchema{
 		{Name: "city", Type: "string", Required: true},
 		{Name: "units", Type: "string", Required: false},
 	})
@@ -395,7 +402,7 @@ func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	}
 
 	// Execute the loaded skill.
-	result, err := ExecuteSkill(context.Background(), s.Manifest.Name, s.Source, "", json.RawMessage(`{"city":"Tokyo"}`), nil)
+	result, err := ExecuteSkill(context.Background(), s.Manifest.Name, s.Source, "", json.RawMessage(`{"city":"Tokyo"}`), SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -427,7 +434,7 @@ func TestNewCreateSkill_Validation(t *testing.T) {
 	var grammarRebuilt bool
 	rebuildGrammar := func() { grammarRebuilt = true }
 
-	createSkill := NewCreateSkill(registry, skillsDir, rebuildGrammar, nil)
+	createSkill := NewCreateSkill(registry, skillsDir, rebuildGrammar, SkillDeps{})
 
 	// Test case: failed test execution
 	args := json.RawMessage(`{"name":"bad_skill","description":"fails","code":"throw new Error('fail');","test_args":"{}"}`)
@@ -474,7 +481,7 @@ func TestNewCreateSkill_Validation(t *testing.T) {
 
 func TestExecuteSkill_ConsoleLog(t *testing.T) {
 	source := `console.log("hello", "world"); console.warn("caution"); console.error("oops"); "done";`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -494,7 +501,7 @@ func TestExecuteSkill_ConsoleLog(t *testing.T) {
 
 func TestExecuteSkill_BtoaAtob(t *testing.T) {
 	source := `var encoded = btoa("hello world"); var decoded = atob(encoded); decoded;`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -505,7 +512,7 @@ func TestExecuteSkill_BtoaAtob(t *testing.T) {
 
 func TestExecuteSkill_BtoaAtob_Value(t *testing.T) {
 	source := `btoa("hello world");`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -517,7 +524,7 @@ func TestExecuteSkill_BtoaAtob_Value(t *testing.T) {
 func TestExecuteSkill_Sleep(t *testing.T) {
 	start := time.Now()
 	source := `sleep(100); "done";`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -537,7 +544,7 @@ func TestExecuteSkill_SleepCapped(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	source := `sleep(999999); "done";`
-	_, _ = ExecuteSkill(ctx, "test", source, "", nil, nil)
+	_, _ = ExecuteSkill(ctx, "test", source, "", nil, SkillDeps{})
 	elapsed := time.Since(start)
 	if elapsed > 1*time.Second {
 		t.Errorf("sleep should have been capped by context, took %v", elapsed)
@@ -549,7 +556,7 @@ func TestExecuteSkill_Env(t *testing.T) {
 	defer os.Unsetenv("SKILL_TEST_KEY")
 
 	source := `env("TEST_KEY");`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -561,7 +568,7 @@ func TestExecuteSkill_Env(t *testing.T) {
 func TestExecuteSkill_EnvBlocked(t *testing.T) {
 	// Non-SKILL_ prefixed env vars should not be accessible.
 	source := `var v = env("PATH"); typeof v === "undefined" ? "blocked" : "leaked";`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -572,7 +579,7 @@ func TestExecuteSkill_EnvBlocked(t *testing.T) {
 
 func TestExecuteSkill_HashSha256(t *testing.T) {
 	source := `hash_sha256("hello");`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -585,7 +592,7 @@ func TestExecuteSkill_HashSha256(t *testing.T) {
 
 func TestExecuteSkill_HashHmacSha256(t *testing.T) {
 	source := `hash_hmac_sha256("key", "message");`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
+	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
 	if err != nil {
 		t.Fatalf("ExecuteSkill error: %v", err)
 	}
@@ -598,11 +605,279 @@ func TestExecuteSkill_HashHmacSha256(t *testing.T) {
 
 func TestExecuteSkill_KV_NilPool(t *testing.T) {
 	source := `kv_set("k", "v");`
-	result, err := ExecuteSkill(context.Background(), "test", source, "", nil, nil)
-	if err != nil {
-		t.Fatalf("expected soft error, got hard error: %v", err)
+	_, err := ExecuteSkill(context.Background(), "test", source, "", nil, SkillDeps{})
+	if err == nil {
+		t.Fatal("expected ToolError for nil pool")
 	}
-	if !strings.Contains(result, "kv store unavailable") {
-		t.Errorf("expected 'kv store unavailable' error, got %q", result)
+	var te *ToolError
+	if !errors.As(err, &te) {
+		t.Fatalf("expected *ToolError, got %T: %v", err, err)
+	}
+	if !strings.Contains(te.Message, "kv store unavailable") {
+		t.Errorf("expected 'kv store unavailable' error, got %q", te.Message)
+	}
+}
+
+// --- TypeScript transpilation tests ---
+
+func TestTranspileTS(t *testing.T) {
+	ts := `const greet = (name: string): string => "hello " + name; greet("world");`
+	js, err := transpileTS(ts)
+	if err != nil {
+		t.Fatalf("transpileTS error: %v", err)
+	}
+	if !strings.Contains(js, "greet") {
+		t.Errorf("expected transpiled JS to contain 'greet', got %q", js)
+	}
+	// Type annotations should be stripped.
+	if strings.Contains(js, ": string") {
+		t.Errorf("expected type annotations to be stripped, got %q", js)
+	}
+}
+
+func TestTranspileTS_InvalidTS(t *testing.T) {
+	ts := `const x: = ;`
+	_, err := transpileTS(ts)
+	if err == nil {
+		t.Error("expected error for invalid TypeScript")
+	}
+}
+
+func TestValidateTypeScriptSource(t *testing.T) {
+	ts := `const add = (a: number, b: number): number => a + b; add(1, 2);`
+	js, err := ValidateTypeScriptSource(ts)
+	if err != nil {
+		t.Fatalf("ValidateTypeScriptSource error: %v", err)
+	}
+	if js == "" {
+		t.Error("expected non-empty transpiled JS")
+	}
+}
+
+func TestLoadSkills_TypeScript(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "ts_skill")
+	scriptsDir := filepath.Join(skillDir, "scripts")
+	os.MkdirAll(scriptsDir, 0755)
+
+	md := `---
+name: ts_skill
+language: typescript
+description: A TypeScript test skill.
+---
+
+## Parameters
+
+| Name | Type | Required |
+|------|------|----------|
+| name | string | yes |
+`
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(md), 0644)
+	os.WriteFile(filepath.Join(scriptsDir, "handler.ts"),
+		[]byte(`const greet = (name: string): string => "hello " + name; greet(args.name);`), 0644)
+
+	skills, err := LoadSkills(dir)
+	if err != nil {
+		t.Fatalf("LoadSkills error: %v", err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(skills))
+	}
+	s := skills[0]
+	if s.Manifest.Name != "ts_skill" {
+		t.Errorf("expected ts_skill, got %q", s.Manifest.Name)
+	}
+	if s.Manifest.Language != "typescript" {
+		t.Errorf("expected language=typescript, got %q", s.Manifest.Language)
+	}
+	// Source should be transpiled JS (no type annotations).
+	if strings.Contains(s.Source, ": string") {
+		t.Errorf("expected transpiled JS without type annotations, got %q", s.Source)
+	}
+}
+
+func TestExecuteSkill_TypeScript(t *testing.T) {
+	// Simulate a TypeScript skill that's already been transpiled.
+	ts := `const multiply = (a: number, b: number): number => a * b; multiply(args.a, args.b);`
+	js, err := transpileTS(ts)
+	if err != nil {
+		t.Fatalf("transpileTS error: %v", err)
+	}
+	args := json.RawMessage(`{"a": 7, "b": 6}`)
+	result, err := ExecuteSkill(context.Background(), "test_ts", js, "", args, SkillDeps{})
+	if err != nil {
+		t.Fatalf("ExecuteSkill error: %v", err)
+	}
+	if result != "42" {
+		t.Errorf("expected 42, got %q", result)
+	}
+}
+
+func TestGenerateSkillMD_WithLanguage(t *testing.T) {
+	md := GenerateSkillMD("ts_skill", "A TypeScript skill.", "typescript", []ParamSchema{
+		{Name: "input", Type: "string", Required: true},
+	})
+	if !strings.Contains(md, "language: typescript") {
+		t.Errorf("expected 'language: typescript' in frontmatter, got:\n%s", md)
+	}
+
+	// Round-trip: parse it back.
+	manifest, params, err := parseSkillMD([]byte(md))
+	if err != nil {
+		t.Fatalf("round-trip parse error: %v", err)
+	}
+	if manifest.Language != "typescript" {
+		t.Errorf("expected language=typescript, got %q", manifest.Language)
+	}
+	if manifest.Name != "ts_skill" {
+		t.Errorf("expected name=ts_skill, got %q", manifest.Name)
+	}
+	if len(params) != 1 {
+		t.Fatalf("expected 1 param, got %d", len(params))
+	}
+}
+
+func TestGenerateSkillMD_JavaScriptDefault(t *testing.T) {
+	// Empty language should not emit a language line.
+	md := GenerateSkillMD("js_skill", "A JS skill.", "", nil)
+	if strings.Contains(md, "language:") {
+		t.Errorf("expected no language line for default JS, got:\n%s", md)
+	}
+}
+
+func TestParseSkillMD_LanguageField(t *testing.T) {
+	md := `---
+name: typed_skill
+language: typescript
+description: A typed skill.
+---
+`
+	manifest, _, err := parseSkillMD([]byte(md))
+	if err != nil {
+		t.Fatalf("parseSkillMD error: %v", err)
+	}
+	if manifest.Language != "typescript" {
+		t.Errorf("expected language=typescript, got %q", manifest.Language)
+	}
+}
+
+func TestManageSkills_TestAction(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "add_nums")
+	scriptsDir := filepath.Join(skillDir, "scripts")
+	os.MkdirAll(scriptsDir, 0755)
+
+	md := `---
+name: add_nums
+description: Adds two numbers.
+---
+
+## Parameters
+
+| Name | Type | Required |
+|------|------|----------|
+| a | number | yes |
+| b | number | yes |
+`
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(md), 0644)
+	os.WriteFile(filepath.Join(scriptsDir, "handler.js"), []byte(`"sum=" + (args.a + args.b);`), 0644)
+
+	registry := NewRegistry()
+	rebuildGrammar := func() {}
+	manage := NewManageSkills(registry, dir, rebuildGrammar, SkillDeps{})
+
+	// Test with args.
+	args := json.RawMessage(`{"action":"test","name":"add_nums","test_args":{"a":3,"b":4}}`)
+	result, err := manage(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "sum=7") {
+		t.Errorf("expected 'sum=7' in result, got %q", result)
+	}
+
+	// Test with no args (defaults to {}).
+	args = json.RawMessage(`{"action":"test","name":"add_nums"}`)
+	result, err = manage(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "test result") {
+		t.Errorf("expected 'test result' in result, got %q", result)
+	}
+}
+
+func TestManageSkills_TestAction_TypeScript(t *testing.T) {
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "ts_adder")
+	scriptsDir := filepath.Join(skillDir, "scripts")
+	os.MkdirAll(scriptsDir, 0755)
+
+	md := `---
+name: ts_adder
+language: typescript
+description: Adds two numbers (TypeScript).
+---
+`
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(md), 0644)
+	os.WriteFile(filepath.Join(scriptsDir, "handler.ts"),
+		[]byte(`const add = (a: number, b: number): number => a + b; "result=" + add(args.a, args.b);`), 0644)
+
+	registry := NewRegistry()
+	manage := NewManageSkills(registry, dir, func() {}, SkillDeps{})
+
+	args := json.RawMessage(`{"action":"test","name":"ts_adder","test_args":{"a":10,"b":20}}`)
+	result, err := manage(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "result=30") {
+		t.Errorf("expected 'result=30', got %q", result)
+	}
+	if !strings.Contains(result, "[ts]") {
+		t.Errorf("expected '[ts]' tag in output, got %q", result)
+	}
+}
+
+func TestManageSkills_TestAction_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	registry := NewRegistry()
+	manage := NewManageSkills(registry, dir, func() {}, SkillDeps{})
+
+	args := json.RawMessage(`{"action":"test","name":"nonexistent"}`)
+	result, err := manage(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "not found") {
+		t.Errorf("expected 'not found' message, got %q", result)
+	}
+}
+
+func TestLoadSkills_TypeScript_AutoDetect(t *testing.T) {
+	// handler.ts on disk without explicit language in frontmatter — should auto-detect.
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "auto_ts")
+	scriptsDir := filepath.Join(skillDir, "scripts")
+	os.MkdirAll(scriptsDir, 0755)
+
+	md := `---
+name: auto_ts
+description: Auto-detected TypeScript skill.
+---
+`
+	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(md), 0644)
+	os.WriteFile(filepath.Join(scriptsDir, "handler.ts"),
+		[]byte(`const x: number = 42; x;`), 0644)
+
+	skills, err := LoadSkills(dir)
+	if err != nil {
+		t.Fatalf("LoadSkills error: %v", err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(skills))
+	}
+	if skills[0].Manifest.Language != "typescript" {
+		t.Errorf("expected auto-detected language=typescript, got %q", skills[0].Manifest.Language)
 	}
 }

@@ -1,4 +1,4 @@
-package googleauth
+package google
 
 import (
 	"context"
@@ -12,8 +12,27 @@ import (
 	"sokratos/logger"
 
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
+	goauth "golang.org/x/oauth2/google"
 )
+
+// AuthErrorMessage is the user-facing message returned when a Google API call
+// fails due to an expired or revoked OAuth2 token.
+const AuthErrorMessage = "⚠️ Google authorization has expired. Use /google to re-authenticate."
+
+// IsAuthError returns true when err looks like an OAuth2 token-expiry or
+// revocation error (invalid_grant, token expired/revoked). The oauth2 library
+// wraps these inside HTTP transport errors, so string matching is the
+// pragmatic detection approach.
+func IsAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid_grant") ||
+		strings.Contains(msg, "Token has been expired or revoked") ||
+		strings.Contains(msg, "token expired") ||
+		strings.Contains(msg, "oauth2: cannot fetch token")
+}
 
 // AuthIO provides callbacks for the OAuth2 flow so it can happen over
 // Telegram (or any other channel) instead of stdin.
@@ -22,7 +41,35 @@ type AuthIO struct {
 	Receive func() (string, error) // wait for user input (blocks)
 }
 
-// GetClient sets up an OAuth2-authenticated HTTP client.
+// GetClientFromToken sets up an OAuth2-authenticated HTTP client using only
+// a previously saved token. No interactive flow — if the token file doesn't
+// exist, returns (nil, nil) so features are silently disabled. Used at startup
+// for non-blocking initialization.
+func GetClientFromToken(ctx context.Context, serviceName, credentialsPath, tokenPath string, scopes []string) (*http.Client, error) {
+	creds, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			logger.Log.Warnf("%s credentials file %q not found — %s features disabled", serviceName, credentialsPath, serviceName)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read credentials: %w", err)
+	}
+
+	config, err := goauth.ConfigFromJSON(creds, scopes...)
+	if err != nil {
+		return nil, fmt.Errorf("parse credentials: %w", err)
+	}
+
+	tok, err := loadToken(tokenPath)
+	if err != nil {
+		logger.Log.Warnf("%s token not found — use /google to authenticate", serviceName)
+		return nil, nil
+	}
+
+	return config.Client(ctx, tok), nil
+}
+
+// GetClient sets up an OAuth2-authenticated HTTP client with interactive flow.
 // If credentialsPath does not exist, it logs a warning and returns nil, nil
 // so features can be silently skipped. When a token doesn't exist yet,
 // the OAuth2 flow sends the auth URL via authIO and waits for the user
@@ -32,12 +79,12 @@ func GetClient(ctx context.Context, serviceName, credentialsPath, tokenPath stri
 	if err != nil {
 		if os.IsNotExist(err) {
 			logger.Log.Warnf("%s credentials file %q not found — %s features disabled", serviceName, credentialsPath, serviceName)
-			return nil, nil // Return nil client to indicate disabled, not an error
+			return nil, nil
 		}
 		return nil, fmt.Errorf("read credentials: %w", err)
 	}
 
-	config, err := google.ConfigFromJSON(creds, scopes...)
+	config, err := goauth.ConfigFromJSON(creds, scopes...)
 	if err != nil {
 		return nil, fmt.Errorf("parse credentials: %w", err)
 	}

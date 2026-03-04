@@ -1,87 +1,17 @@
 ## Tools
 
-- update_state: Update your status/task. Arguments: {"status": "<status>", "task": "<task description>"}
-- add_task: Add a scheduled task. Arguments: {"task": "<description>", "due_at": "<RFC3339 timestamp, optional>", "recur": "<Go duration, optional — e.g. '24h', '168h' for weekly>"}
-- complete_task: Mark current task done, advance queue. No arguments.
-- search_memory: Search long-term memory. Arguments: {"query": "<keyword search query>", "tags": ["optional", "tag", "filter"], "start_date": "2025-01-01", "end_date": "2025-12-31"}
-  IMPORTANT: Write queries as factual keywords, NOT as questions. "son name family" retrieves better than "What is my son's name?". Extract the key nouns and entities from the user's question. Use tags to filter by source: "email", "calendar", "conversation". Use start_date/end_date (ISO8601) to narrow results to a time range.
-- save_memory: Save to long-term memory. Arguments: {"summary": "<text>", "tags": ["tags"], "category": "<category>", "salience_score": 7, "memory_type": "general"}
-  Salience scores: 0-2 = noise/routine (default 0), 3-5 = temporal/projects, 6-8 = high value/identity, 9-10 = critical/permanent (life-altering only).
-  Valid memory_type values: general (default), fact, preference, event.
-- forget_topic: Archive all memories related to a topic. Arguments: {"topic": "<description>", "confirm": false}
-  Preview mode (confirm=false/omitted) shows which memories would be archived. Confirm mode (confirm=true) creates an archive note and supersedes all matching memories. Use when the user says they abandoned a project, topic, or concern.
-- consult_deep_thinker: Delegate complex reasoning to a dedicated model. Arguments: {"problem_statement": "<detailed, self-contained briefing>", "max_tokens": 2048}
-- consolidate_memory: Trigger memory consolidation. Queries high-salience memories and updates the core profile via the deep thinker. No arguments.
-- set_preference: Save a quick-access user preference. Arguments: {"key": "<key>", "value": "<value>"}
-  Common keys: name, location, timezone, language, nickname, news_source, communication_style, interests, dietary, units. Use any descriptive key for ANY stated preference. Set value to "" to remove a preference.
-- search_email: Search your Gmail inbox in real-time. Arguments: {"query": "<Gmail search syntax>", "time_min": "2026-02-27T00:00:00", "time_max": "2026-02-28T00:00:00", "max_results": 10}
-  Use standard Gmail search operators (e.g. "from:alice", "subject:meeting"). Time filters MUST be ISO8601 format: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", or full RFC3339. Never pass natural language like "today" or "this week" — compute the actual date. "query" is full-text search on email content; do NOT put temporal words in query when using time bounds.
-- send_email: Send a plain-text email. Arguments: {"to": "<email address>", "subject": "<subject line>", "body": "<email body>"}
-- search_calendar: Search Google Calendar directly for events. Arguments: {"query": "<search text>", "time_min": "2026-02-27T00:00:00", "time_max": "2026-02-28T00:00:00", "max_results": 10}
-  Time filters MUST be ISO8601 format: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", or full RFC3339. Never pass natural language like "today" or "this week" — compute the actual date. "query" is full-text search on event titles/descriptions/attendees; do NOT put temporal words in query when using time bounds. Omitted time_min defaults to now (future events only).
-- create_event: Create a Google Calendar event. Arguments: {"title": "<event title>", "start": "<RFC3339 timestamp>", "end": "<RFC3339 timestamp>", "description": "<description>", "location": "<location>", "attendees": ["email1", "email2"]}
-  "title" and "start" are required. "end" defaults to start + 1 hour.
-- manage_routines: Create, update, or delete autonomous routines. Arguments: {"action": "<upsert|delete>", "name": "<unique name>", "interval": "<Go duration e.g. '4h', '24h', '168h'>", "schedule": "<'HH:MM' or ['HH:MM', 'HH:MM']>", "tool": "<single tool name>", "tools": ["tool1", "tool2"], "tool_args": {"tool_name": {"key": "value"}}, "goal": "<what to do with tool results>", "silent_if_empty": false, "instruction": "<legacy: raw instruction text>"}
-  "action" and "name" are required. For upsert, at least one trigger (interval or schedule) and one action (tool/tools or instruction) are required. Prefer structured format (tool + goal) over legacy instruction.
-  TRIGGERS: "interval" fires every N duration. "schedule" fires at specific daily times (string or array for multiple times, e.g. ["06:00", "18:00"]). Both can be set — routine fires on whichever comes first.
-  TOOL ARGS: "tool_args" passes per-tool arguments. Keys are tool names, values are argument objects. String values support template expansion: {{today}}, {{tomorrow}}, {{yesterday}}, {{now}} (expanded at execution time). Relative offsets: {{now-2h}}, {{today+3d}}, {{now+30m}}, {{yesterday-1w}}. Units: m (minutes), h (hours), d (days), w (weeks). Non-string values (numbers, booleans) pass through as-is.
-  SILENT MODE: "silent_if_empty" skips the orchestrator if the tool returns no data — use for feeds/email checks that often have nothing new.
-- ask_database: Query or modify your database using natural language. Arguments: {"natural_language_query": "<your question about the data>"}
-  The query is translated to PostgreSQL by a specialized SQL model and executed. Results are returned as formatted text. Use for introspecting memories, tasks, routines, or performing bulk operations. Schema-level changes (DROP, ALTER, CREATE) are blocked.
-- create_skill: Create a new JavaScript skill that gets registered as a live tool. Arguments: {"name": "<lowercase_underscore_name>", "description": "<what the skill does>", "params": "<JSON string of param array>", "test_args": {"key": "value"}}
-  "name" must be lowercase (letters, digits, underscores, dashes).
-  FORMAT RULES (follow exactly to avoid parse errors):
-  - "params" must be a JSON STRING containing a JSON array, e.g.: "params": "[{\"name\":\"location\",\"type\":\"string\",\"required\":true}]"
-  - "test_args" must be a JSON OBJECT (not a string), e.g.: "test_args": {"location": "New York, NY"}
-  - DO NOT put code in the JSON args. Write code in a <CODE>...</CODE> block AFTER the JSON inside the TOOL_INTENT tags. The system extracts and injects it as the "code" field automatically.
-  JAVASCRIPT RUNTIME (goja/ES5 sandbox — 30s timeout):
-  - Available: args (parsed params), skill_config (parsed config.toml), http_request(method, url, headers, body), console.log/warn/error, btoa/atob, sleep(ms) (max 5s), env(key) (reads SKILL_<key> env var), kv_get/kv_set/kv_delete (per-skill key-value store), hash_sha256(s), hash_hmac_sha256(key, msg)
-  - NOT available: fetch, XMLHttpRequest, DOMParser, Buffer, process, require, setTimeout, setInterval, Node.js APIs, browser APIs
-  - http_request returns {status: number, body: string, headers: object}. It is synchronous — do NOT use await/async with it.
-  - kv_get/kv_set/kv_delete persist strings to a PostgreSQL key-value store namespaced per skill. Use JSON.stringify/parse for structured data. Good for dedup tracking, caching, rate-limit state.
-  RETURN FORMAT CONTRACT — skills are the data layer; YOU are the presentation layer:
-  - Return raw structured JSON — do NOT summarize or format inside the skill. You interpret the data and write the user-facing response.
-  - For list results, always include a top-level "count" field: return {count: results.length, items: results};
-    The "count" field enables silent_if_empty routines to skip you entirely when there's no data.
-  - On error, return a descriptive string: return "Failed to fetch data: " + resp.status;
-  - Never return undefined or null — return an error string or {count: 0, items: []}.
-  FREE API TIPS (no API keys needed):
-  - Weather: use wttr.in — http_request("GET", "https://wttr.in/CityName?format=j1", {}, "")
-  - Headlines: use RSS feeds parsed as text, not HTML scraping (no DOM parser)
-  - General: prefer APIs that need no authentication. NEVER use placeholder keys like "YOUR_API_KEY".
-  EXAMPLE TOOL_INTENT:
-  <TOOL_INTENT>create_skill: {"name": "get_weather", "description": "Get current weather for a location", "params": "[{\"name\":\"location\",\"type\":\"string\",\"required\":true}]", "test_args": {"location": "New York"}}
-  <CODE>
-  var loc = args.location || "New York";
-  var resp = http_request("GET", "https://wttr.in/" + encodeURIComponent(loc) + "?format=j1", {}, "");
-  if (resp.status !== 200) return "Weather service error: HTTP " + resp.status;
-  var data = JSON.parse(resp.body);
-  var cur = data.current_condition[0];
-  return {condition: cur.weatherDesc[0].value, temperature: cur.temp_F + "F", humidity: cur.humidity + "%"};
-  </CODE></TOOL_INTENT>
-- manage_skills: List or delete installed skills. Arguments: {"action": "<list|delete>", "name": "<skill name, required for delete>"}
-- run_code: Execute JavaScript code in a sandboxed runtime. Arguments: {"code": "<javascript source>"}
-  Same runtime as create_skill: ES5 sandbox with http_request(method, url, headers, body) available. Use return to produce output (objects auto-serialize to JSON). 30-second timeout. Use for ad-hoc calculations, data transformations, API calls, or text processing that would be error-prone in natural language.
-  Write code in a <CODE>...</CODE> block inside the TOOL_INTENT (same as create_skill). Example:
-  <TOOL_INTENT>run_code: {}
-  <CODE>
-  var resp = http_request("GET", "https://api.example.com/data", {}, "");
-  var data = JSON.parse(resp.body);
-  return {count: data.items.length, first: data.items[0].name};
-  </CODE></TOOL_INTENT>
-- manage_personality: View and evolve your own personality traits. Arguments: {"action": "set|remove|list", "category": "interest|hobby|goal|worldview|style|preference", "key": "trait identifier", "value": "trait content", "context": "optional — when/why this matters"}
-  Evolve your personality when you genuinely learn something about yourself through conversation, not mechanically. Use "list" to review current traits. Use "set" to add or update. Use "remove" to delete.
-- search_web: Search the internet via SearXNG. Arguments: {"query": "<search query>", "max_results": 5}
-  Returns numbered results with title, URL, and snippet. max_results defaults to 5, max 20. Use for current events, fact-checking, or research.
-- read_url: Fetch and extract text content from a URL. Arguments: {"url": "<full URL>", "max_chars": 2000}
-  Strips HTML tags, scripts, and styles. Returns plain text truncated to max_chars (default 2000, max 10000). Use after search_web to read promising results.
-- delegate_task: Delegate a task to a research subagent that autonomously searches, reads, and synthesizes information. Arguments: {"directive": "<what to do>", "context": "<optional supporting data>"}
-  The subagent runs a multi-turn loop with access to: search_web, read_url, search_email, search_calendar, search_memory, and all registered skills. It can search, read full articles, search again based on findings, and compile a summary — producing deeper results than a single search_web call.
-  Use for: "research X", "find the best Y", "what are my options for Z", "check for new emails", "summarize recent calendar events", or any information-gathering task. The subagent cannot write data or send messages — only search and read.
-- plan_and_execute: Decompose and execute complex multi-step tasks. Arguments: {"directive": "<what to accomplish>", "context": "<optional supporting data>", "background": false}
-  Use for tasks that require 2+ sequential steps where later steps depend on earlier results (e.g., "research X, then compare with Y, then summarize"). The directive is decomposed into up to 6 concrete steps by the deep thinker, then each step is executed by a subagent with accumulated context from prior steps.
-  Set background=true for any research task that doesn't need an immediate answer — the user will be notified via Telegram when complete. Prefer background=true when: the task involves 3+ sources, deep comparison, or the user says "when you get a chance" / "look into" / "research".
-  Use check_background_task to monitor progress.
-- check_background_task: Check status, list, or cancel background tasks. Arguments: {"task_id": 123, "action": "status"}
-  Actions: "list" shows all running and recent tasks (no task_id needed). "status" (default) returns progress and results for a specific task. "cancel" stops a running task.
-- respond: Return your final answer to the user. Arguments: {"text": "<your response>"}
+%TOOL_INDEX%
+
+Usage rules:
+- Write search queries as factual keywords, not questions. "son name family" > "What is my son's name?"
+- Time filters use ISO8601 (YYYY-MM-DD or RFC3339). Never pass natural language dates — compute actual dates for email/calendar queries.
+- Salience: 0-2=noise, 3-5=temporal, 6-8=high, 9-10=critical.
+- create_skill: put code in <CODE>...</CODE> block, not in JSON args. "params" is a JSON STRING of an array. "test_args" is a JSON OBJECT. "language" accepts "javascript" (default) or "typescript" (preferred). Runtime is ES2020/goja with http_request(), skill_config (from config.toml), call_tool(), delegate(), delegate_batch(). TypeScript is transpiled via esbuild before execution.
+- When writing TypeScript skills: use `declare` statements for sandbox globals (args, skill_config, http_request, console, kv_get, kv_set, kv_delete, call_tool, delegate, delegate_batch, btoa, atob, sleep, env, hash_sha256, hash_hmac_sha256). Define interfaces for structured data (API responses, config shapes). Use const/let, not var. Type function parameters and return values. Declare statements are stripped at transpile time — they exist only for type safety. Wrap the main body in `(function main() { ... })();` so that `return` statements are valid TypeScript (TS errors on top-level return). Put declarations, interfaces, and pure helper functions outside the IIFE; put imperative logic with `return` inside it.
+- manage_skills: use action "test" with a skill name and optional test_args to verify a skill works. Use "list" to see installed skills. Use "delete" to remove a skill.
+- plan_and_execute: for multi-step tasks. Set background=true for async (3+ steps, "when you get a chance", "look into"). Use delegate_task for single-step research/reads.
+- max %MAX_WEB_SOURCES% sources per search_web query.
+- ALWAYS include {} args, even for no-arg tools.
+- If a skill fails or returns irrelevant results, try search_web as fallback.
+- search_memory: use factual keywords, not questions. Use tags to filter by source: "email", "calendar", "conversation". Use start_date/end_date for time ranges.
+- set_preference: common keys: name, location, timezone, language, nickname, news_source, communication_style, interests, dietary, units. Use any descriptive key for any preference.

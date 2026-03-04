@@ -3,13 +3,30 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"sokratos/clients"
+	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/textutil"
 )
+
+// ToolError is a structured error for tool failures that should be forwarded
+// to the LLM as a result string, not treated as a fatal internal error.
+// Execute catches these via errors.As, logs at WARN, and converts to
+// (message, nil) so the LLM sees the failure context and can respond.
+type ToolError struct {
+	Message string
+}
+
+func (e *ToolError) Error() string { return e.Message }
+
+// Errorf constructs a ToolError with fmt.Sprintf-style formatting.
+func Errorf(format string, args ...any) *ToolError {
+	return &ToolError{Message: fmt.Sprintf(format, args...)}
+}
 
 // ToolCall represents a tool invocation from the LLM.
 type ToolCall struct {
@@ -39,8 +56,9 @@ type ToolSchema struct {
 
 // Registry maps tool names to their implementations and optional schemas.
 type Registry struct {
-	tools   map[string]ToolFunc
-	schemas map[string]ToolSchema
+	tools       map[string]ToolFunc
+	schemas     map[string]ToolSchema
+	OnAuthError func(toolName string) // called once when a ToolError contains an auth failure
 }
 
 // NewRegistry returns an empty tool registry.
@@ -101,13 +119,19 @@ func (r *Registry) SchemasForTools(names []string) []ToolSchema {
 	return schemas
 }
 
+// SchemaFor returns the schema for a named tool, if registered.
+func (r *Registry) SchemaFor(name string) (ToolSchema, bool) {
+	s, ok := r.schemas[name]
+	return s, ok
+}
+
 // CompactIndex returns a compact one-line-per-tool index for the system prompt.
-// Required params are starred. The "respond" meta-tool is excluded (handled
-// separately by the supervisor prompt).
+// Required params are starred. Skills (IsSkill=true) and the "respond" meta-tool
+// are excluded — skills get their own section via DynamicSkillDescriptions.
 func (r *Registry) CompactIndex() string {
 	var b strings.Builder
 	for _, s := range r.schemas {
-		if s.Name == "respond" {
+		if s.Name == "respond" || s.IsSkill {
 			continue
 		}
 		b.WriteString("- ")
@@ -134,11 +158,10 @@ func (r *Registry) CompactIndex() string {
 	return b.String()
 }
 
-// DynamicToolDescriptions returns formatted descriptions for skill tools
-// (IsSkill=true with a non-empty Description). These provide detailed argument
-// info for runtime-registered skills that the orchestrator hasn't seen in
-// training data. Appended after the compact tool index in the system prompt.
-func (r *Registry) DynamicToolDescriptions() string {
+// DynamicSkillDescriptions returns a formatted "## Skills" section for
+// runtime-registered skills (IsSkill=true). Separate from the tool index so the
+// orchestrator sees skills as a distinct concept.
+func (r *Registry) DynamicSkillDescriptions() string {
 	var b strings.Builder
 	for _, s := range r.schemas {
 		if !s.IsSkill || s.Description == "" {
@@ -162,7 +185,10 @@ func (r *Registry) DynamicToolDescriptions() string {
 		}
 		b.WriteString("\n")
 	}
-	return b.String()
+	if b.Len() == 0 {
+		return ""
+	}
+	return "## Skills\n\n" + b.String()
 }
 
 // Call is a convenience method that marshals args into JSON and invokes the
@@ -180,6 +206,17 @@ func (r *Registry) Call(ctx context.Context, name string, args any) (string, err
 	return r.Execute(ctx, raw)
 }
 
+// looksLikeError is a transitional fallback for tools that still return
+// errors as (errorString, nil) instead of using ToolError. Prefer returning
+// a *ToolError from new/updated tools.
+func looksLikeError(result string) bool {
+	lower := strings.ToLower(result)
+	return strings.HasPrefix(lower, "failed to") ||
+		strings.HasPrefix(lower, "error:") ||
+		strings.HasPrefix(lower, "invalid") ||
+		strings.HasPrefix(result, "⚠")
+}
+
 // Execute parses raw JSON into a ToolCall, looks up the tool, and invokes it.
 func (r *Registry) Execute(ctx context.Context, raw json.RawMessage) (string, error) {
 	var tc ToolCall
@@ -193,8 +230,35 @@ func (r *Registry) Execute(ctx context.Context, raw json.RawMessage) (string, er
 
 	logger.Log.Infof("[tool] calling %s(%s)", tc.Name, strings.TrimSpace(string(tc.Arguments)))
 	result, err := fn(ctx, tc.Arguments)
+
+	// Structured tool errors: catch ToolError, log at WARN, forward message
+	// to the LLM as a normal string result.
+	var te *ToolError
+	if errors.As(err, &te) {
+		logger.Log.Warnf("[tool] %s failed: %s", tc.Name, te.Message)
+		// Fire auth error callback for proactive notification.
+		if r.OnAuthError != nil && strings.Contains(te.Message, "authorization") {
+			r.OnAuthError(tc.Name)
+		}
+		return te.Message, nil
+	}
+
+	// Centralized Google auth error detection. If any tool's underlying
+	// API call fails due to an expired/revoked token, convert it to a ToolError
+	// and fire the callback so the orchestrator knows to stop trying and notify the user.
+	if err != nil && google.IsAuthError(err) {
+		logger.Log.Warnf("[tool] %s failed with auth error: %v", tc.Name, err)
+		if r.OnAuthError != nil {
+			r.OnAuthError(tc.Name)
+		}
+		return google.AuthErrorMessage, nil
+	}
+
 	if err != nil {
 		logger.Log.Errorf("[tool] %s error: %v", tc.Name, err)
+	} else if looksLikeError(result) {
+		// Fallback for tools still returning errors as (string, nil).
+		logger.Log.Warnf("[tool] %s result: %s", tc.Name, textutil.Truncate(result, 200))
 	} else {
 		logger.Log.Infof("[tool] %s result: %s", tc.Name, textutil.Truncate(result, 200))
 	}

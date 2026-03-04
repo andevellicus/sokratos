@@ -15,6 +15,10 @@ import (
 	"sokratos/timefmt"
 )
 
+// supervisorMaxTokens is the max_tokens value sent with every supervisor
+// ChatRequest. Prevents llama-server from truncating responses silently.
+const supervisorMaxTokens = 4096
+
 // softErrorPatterns are substrings that indicate a tool returned a soft error
 // (user-facing failure message returned as result string, not a Go error).
 var softErrorPatterns = []string{
@@ -22,12 +26,12 @@ var softErrorPatterns = []string{
 	"not found", "no results", "could not",
 }
 
-// isToolSoftError returns true when a tool result string indicates a
+// IsToolSoftError returns true when a tool result string indicates a
 // user-facing failure (soft error convention: return "error message", nil).
 // Structured data (JSON objects/arrays, count-prefixed results) is never
 // treated as a soft error, even if the content happens to contain words
 // like "error" or "failed" in news headlines or article summaries.
-func isToolSoftError(result string) bool {
+func IsToolSoftError(result string) bool {
 	trimmed := strings.TrimSpace(result)
 	if len(trimmed) == 0 {
 		return false
@@ -107,18 +111,17 @@ func toolHint(toolName string) string {
 // toolIntentCodeRe matches <TOOL_INTENT>...<CODE>...</CODE> with an optional
 // </TOOL_INTENT> after it. The captured group INCLUDES the </CODE> tag so
 // parseToolIntent can extract the code block properly.
-var toolIntentCodeRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?</CODE>)\s*(?:<[/\\]?TOOL_INT[A-Z]*>)?`)
+var toolIntentCodeRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?</CODE>)\s*(?:</TOOL_INTENT>)?`)
 
-// closingToolIntentRe matches closing TOOL_INTENT tags (including common
-// model mistakes). Used to strip stray closing tags from the intent after
-// CODE block removal — when the model places </TOOL_INTENT> before <CODE>,
-// the code-block regex captures the inner closing tag as part of the content.
-var closingToolIntentRe = regexp.MustCompile(`<[/\\]TOOL_INT[A-Z]*>`)
+// closingToolIntentRe matches closing </TOOL_INTENT> tags. Used to strip
+// stray closing tags from the intent after CODE block removal — when the
+// model places </TOOL_INTENT> before <CODE>, the code-block regex captures
+// the inner closing tag as part of the content.
+var closingToolIntentRe = regexp.MustCompile(`</TOOL_INTENT>`)
 
 // toolIntentRe matches <TOOL_INTENT>...</TOOL_INTENT> for intents without
-// a <CODE> block, including common model mistakes (backslash closer,
-// truncated tags, etc.).
-var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)<[/\\]?TOOL_INT[A-Z]*>`)
+// a <CODE> block.
+var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)</TOOL_INTENT>`)
 
 // extractToolIntent extracts the content of the first <TOOL_INTENT> tag.
 // It tries the CODE-block pattern first, then falls back to the simple one.
@@ -138,26 +141,34 @@ func extractToolIntent(s string) (string, bool) {
 // supervisor pattern: replaces JSON tool-call instructions with TOOL_INTENT
 // tag instructions, injects dynamic tool descriptions, and removes the
 // respond meta-tool requirement.
-func buildSupervisorSystemPrompt(toolDescs string) string {
-	// Start with the base system prompt + dynamic tool descriptions.
-	sp := systemPromptBase + "\n\n" + strings.TrimSpace(toolDescs)
+// Identity card and personality are injected between the core rules and tool
+// descriptions so the model sees them early in the prompt.
+func buildSupervisorSystemPrompt(toolDescs, profileContent, personalityContent string) string {
+	// Start with the base system prompt.
+	sp := systemPromptBase
 
-	// Replace tool-call JSON format instructions with TOOL_INTENT tag instructions.
+	// Identity card goes right after the core rules — before tools and
+	// everything else — so even small models pay attention to it.
+	if profileContent != "" {
+		sp += "\n\n## Identity Card\n" + profileContent
+	}
+	if personalityContent != "" {
+		sp += "\n\n" + personalityContent
+	}
+
+	// Tool descriptions follow after identity/personality.
+	sp += "\n\n" + strings.TrimSpace(toolDescs)
+
+	// Replace tool-call format placeholder with TOOL_INTENT tag instructions.
 	sp = strings.Replace(sp,
-		"- Call ONE tool per turn. Output ONLY the JSON object, nothing else:\n  {\"name\":\"<tool_name>\",\"arguments\":{}}\n- No markdown code fences around tool calls.",
-		"- When you need to use a tool, wrap your intent in XML tags. You MUST use the closing tag </TOOL_INTENT> (with a forward slash):\n  <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>\n  A dedicated tool agent will translate your intent into a structured call.\n- ALWAYS include the arguments JSON object, even if empty: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>\n- Call ONE tool per turn. You may include reasoning and context outside the tags.\n- IMPORTANT: Any text you write alongside a TOOL_INTENT tag IS shown to the user. After the tool executes, do NOT repeat or rephrase what you already said — only add genuinely new information from the tool result.",
+		"- Call ONE tool per turn. You may include reasoning and context alongside your tool call.",
+		"- When you need to use a tool, wrap your intent in XML tags. You MUST use the closing tag </TOOL_INTENT> (with a forward slash):\n  <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>\n- ALWAYS include the arguments JSON object, even if empty: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>\n- Call ONE tool per turn. You may include brief context outside the tags.\n- CRITICAL: Any text alongside a TOOL_INTENT IS sent to the user immediately. After the tool executes you get a follow-up turn. In that turn, do NOT repeat or rephrase what you already said. Keep the follow-up to ONE short sentence confirming the result. If your pre-tool text already covered everything, just confirm with a brief acknowledgment like \"Done.\" or the key fact from the result.",
 		1)
 
-	// Replace respond tool instruction with plain text response instruction.
+	// Replace idle instruction with plain text idle.
 	sp = strings.Replace(sp,
-		"use the respond tool to deliver your answer in clear prose. Do not keep calling tools.",
-		"respond directly in plain text. Do not wrap your final answer in any tags. Do not keep calling tools.",
-		1)
-
-	// Replace idle respond call with plain text idle.
-	sp = strings.Replace(sp,
-		"respond with {\"name\":\"respond\",\"arguments\":{\"text\":\"idle\"}}.",
-		"just respond with: idle",
+		"Otherwise output: <NO_ACTION_REQUIRED>",
+		"Otherwise just respond with: idle",
 		1)
 
 	return sp
@@ -255,7 +266,6 @@ func parseToolIntent(intent string) (string, bool) {
 	return string(result), true
 }
 
-
 // querySupervisor implements the multi-agent supervisor pattern. The
 // orchestrator (e.g. Qwen3-VL) runs without grammar and produces free-form
 // text. When it wants a tool, it wraps intent in <TOOL_INTENT> tags. A
@@ -266,7 +276,12 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	if opts != nil && opts.ToolAgent != nil && opts.ToolAgent.ToolDescriptions != "" {
 		toolDescs = opts.ToolAgent.ToolDescriptions
 	}
-	sysContent := buildSupervisorSystemPrompt(toolDescs)
+	var profileContent, personalityContent string
+	if opts != nil {
+		profileContent = opts.ProfileContent
+		personalityContent = opts.PersonalityContent
+	}
+	sysContent := buildSupervisorSystemPrompt(toolDescs, profileContent, personalityContent)
 
 	// Replace the %MAX_WEB_SOURCES% placeholder.
 	maxWeb := "2"
@@ -274,14 +289,6 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		maxWeb = strconv.Itoa(opts.MaxWebSources)
 	}
 	sysContent = strings.Replace(sysContent, "%MAX_WEB_SOURCES%", maxWeb, 1)
-
-	// Personality first (defines who Sokratos is), then user knowledge.
-	if opts != nil && opts.PersonalityContent != "" {
-		sysContent += "\n\n" + opts.PersonalityContent
-	}
-	if opts != nil && opts.ProfileContent != "" {
-		sysContent += "\n\n## Identity Card\n" + opts.ProfileContent
-	}
 	if opts != nil && opts.TemporalContext != "" {
 		sysContent += "\n\n" + opts.TemporalContext
 	}
@@ -303,11 +310,19 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	historyLen := len(messages)
 	messages = append(messages, userMsg)
 
-	// Accumulate substantive prose from intermediate rounds that also contain
-	// a tool intent. Without this, text like "Ah, my apologies — Clair Obscur
-	// is a turn-based RPG..." gets swallowed when it accompanies a save_memory
-	// intent, and only the final round's text (often filler) is returned.
-	var intermediateText []string
+	// callTool wraps toolExec with slot release/reacquire callbacks.
+	callTool := func(ctx context.Context, raw []byte) (string, error) {
+		if opts != nil && opts.OnToolStart != nil {
+			opts.OnToolStart()
+		}
+		result, err := toolExec(ctx, raw)
+		if opts != nil && opts.OnToolEnd != nil {
+			if reErr := opts.OnToolEnd(ctx); reErr != nil {
+				logger.Log.Warnf("[llm:supervisor] slot reacquire failed: %v", reErr)
+			}
+		}
+		return result, err
+	}
 
 	for range maxToolRounds {
 		sent := messages
@@ -323,8 +338,10 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		}
 
 		chatReq := ChatRequest{
-			Model:    model,
-			Messages: sent,
+			Model:              model,
+			Messages:           sent,
+			MaxTokens:          supervisorMaxTokens,
+			ChatTemplateKwargs: map[string]any{"enable_thinking": false},
 		}
 		resp, cErr := client.Chat(ctx, chatReq)
 		if cErr != nil {
@@ -344,11 +361,6 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 
 		// Check for tool intent.
 		if intent, ok := extractToolIntent(content); ok {
-			// Preserve any substantive prose that accompanies the tool intent.
-			if prose := textutil.StripToolIntentTags(content); prose != "" {
-				intermediateText = append(intermediateText, prose)
-			}
-
 			// If the intent is just a bare tool name without arguments,
 			// push back to the orchestrator so it retries with proper args.
 			if !strings.Contains(intent, ":") && !strings.Contains(intent, "{") {
@@ -374,8 +386,9 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 
 			// Execute the tool.
 			if toolExec != nil {
-				result, execErr := toolExec(ctx, []byte(toolJSON))
 				toolName, originalArgs := extractToolNameAndArgs(toolJSON)
+
+				result, execErr := callTool(ctx, []byte(toolJSON))
 
 				// Determine failure and build the failure message.
 				var failureMsg string
@@ -383,7 +396,7 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 				if execErr != nil {
 					failureMsg = execErr.Error()
 					isFailed = true
-				} else if isToolSoftError(result) {
+				} else if IsToolSoftError(result) {
 					failureMsg = result
 					isFailed = true
 				}
@@ -399,22 +412,13 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 						fbArgs := fb.ArgsTransform(toolName, originalArgs, failureMsg)
 						fbJSON := buildToolJSON(fb.FallbackTool, fbArgs)
 						logger.Log.Infof("[llm:supervisor] auto-fallback: %s failed, trying %s", toolName, fb.FallbackTool)
-						fbResult, fbErr := toolExec(ctx, []byte(fbJSON))
+						fbResult, fbErr := callTool(ctx, []byte(fbJSON))
 						if fbErr != nil {
 							messages = append(messages, Message{Role: "user", Content: fmt.Sprintf(
 								"Tool result [auto-fallback]: %s failed (%s). Fallback to %s also failed: %s",
 								toolName, failureMsg, fb.FallbackTool, fbErr.Error())})
 						} else {
-							truncLen := defaultMaxToolResultLen
-							if opts != nil && opts.MaxToolResultLen > 0 {
-								truncLen = opts.MaxToolResultLen
-							}
-							if len(fbResult) > truncLen {
-								origLen := len(fbResult)
-								fbResult = fbResult[:truncLen] + fmt.Sprintf(
-									"\n... (truncated: showing %d of %d chars)",
-									truncLen, origLen)
-							}
+							fbResult = textutil.TruncateToolResult(fbResult, resolveToolResultLen(opts), "")
 							messages = append(messages, Message{Role: "user", Content: fmt.Sprintf(
 								"Tool result [auto-fallback]: %s failed (%s). Fallback to %s:\n%s",
 								toolName, failureMsg, fb.FallbackTool, fbResult)})
@@ -427,48 +431,26 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 					if execErr != nil {
 						messages = append(messages, Message{Role: "user", Content: "Tool error: " + execErr.Error() + hint})
 					} else {
-						truncLen := defaultMaxToolResultLen
-						if opts != nil && opts.MaxToolResultLen > 0 {
-							truncLen = opts.MaxToolResultLen
-						}
-						if len(result) > truncLen {
-							origLen := len(result)
-							result = result[:truncLen] + fmt.Sprintf(
-								"\n... (truncated: showing %d of %d chars)",
-								truncLen, origLen)
-						}
+						result = textutil.TruncateToolResult(result, resolveToolResultLen(opts), "")
 						messages = append(messages, Message{Role: "user", Content: "Tool result: " + result + hint})
 					}
 					continue
 				}
 
 				// Success path.
-				truncLen := defaultMaxToolResultLen
-				if opts != nil && opts.MaxToolResultLen > 0 {
-					truncLen = opts.MaxToolResultLen
-				}
-				if len(result) > truncLen {
-					origLen := len(result)
-					result = result[:truncLen] + fmt.Sprintf(
-						"\n... (truncated: showing %d of %d chars. Use specific queries or filters to narrow results.)",
-						truncLen, origLen)
-				}
+				result = textutil.TruncateToolResult(result, resolveToolResultLen(opts), "Use specific queries or filters to narrow results")
 				messages = append(messages, Message{Role: "user", Content: "Tool result: " + result})
 				continue
 			}
+		} else if resp.FinishReason == "length" && strings.Contains(content, "<TOOL_INTENT>") {
+			// Response was truncated mid-tag — retry with a nudge.
+			logger.Log.Warnf("[llm:supervisor] response truncated mid-TOOL_INTENT, requesting retry")
+			messages = append(messages, Message{Role: "assistant", Content: raw})
+			messages = append(messages, Message{Role: "user", Content: "Your response was cut off mid-tag. Rewrite your TOOL_INTENT — keep any reasoning shorter."})
+			continue
 		}
 
 		// No tool intent — this is the final response.
-		// Prepend any substantive text from intermediate tool-call rounds
-		// so the user sees the full response, not just the final round.
-		if len(intermediateText) > 0 {
-			accumulated := strings.Join(intermediateText, "\n\n")
-			if content != "" {
-				content = accumulated + "\n\n" + content
-			} else {
-				content = accumulated
-			}
-		}
 		messages = append(messages, Message{Role: "assistant", Content: raw})
 		return content, messages[historyLen:], nil
 	}

@@ -57,9 +57,9 @@ func (e *Engine) executeDueRoutines() {
 }
 
 // executeSingleRoutine advances the routine's timer and runs it through
-// the orchestrator. If the routine has a `tool` field, the tool is called
+// the orchestrator. If the routine has an `action` field, the action is called
 // directly first and the result is passed to the orchestrator with the goal.
-// If silent_if_empty is set and the tool returns no data, the orchestrator
+// If silent_if_empty is set and the action returns no data, the orchestrator
 // is skipped entirely. Execution is tracked via WorkMonitor and bounded by
 // RoutineTimeout.
 func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
@@ -101,42 +101,42 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 
 	var prompt string
 
-	// Resolve tool list with precedence: Tools (multi) > Tool (single) > legacy instruction.
-	var toolList []string
-	if len(d.Tools) > 0 {
-		toolList = d.Tools
-	} else if d.Tool != nil && *d.Tool != "" {
-		toolList = []string{*d.Tool}
+	// Resolve action list with precedence: Actions (multi) > Action (single) > legacy instruction.
+	var actionList []string
+	if len(d.Actions) > 0 {
+		actionList = d.Actions
+	} else if d.Action != nil && *d.Action != "" {
+		actionList = []string{*d.Action}
 	}
 
-	if len(toolList) > 0 {
-		// Structured routine: call tool(s) directly, then hand results to the orchestrator.
+	if len(actionList) > 0 {
+		// Structured routine: call action(s) directly, then hand results to the orchestrator.
 		var results strings.Builder
 		anyNonEmpty := false
 
-		for _, toolName := range toolList {
+		for _, actionName := range actionList {
 			argsJSON := json.RawMessage("{}")
-			if d.ToolArgs != nil {
-				if ta, ok := d.ToolArgs[toolName]; ok {
+			if d.ActionArgs != nil {
+				if ta, ok := d.ActionArgs[actionName]; ok {
 					argsJSON = routines.ExpandAndMarshal(ta)
 				}
 			}
-			toolResult, err := e.ToolExec(ctx, json.RawMessage(
-				fmt.Sprintf(`{"name":%q,"arguments":%s}`, toolName, argsJSON),
+			actionResult, err := e.ToolExec(ctx, json.RawMessage(
+				fmt.Sprintf(`{"name":%q,"arguments":%s}`, actionName, argsJSON),
 			))
 			if err != nil {
-				logger.Log.Warnf("routine-scheduler: tool call failed, name=%s, tool=%s, err=%v", d.Name, toolName, err)
+				logger.Log.Warnf("routine-scheduler: action call failed, name=%s, action=%s, err=%v", d.Name, actionName, err)
 				continue
 			}
-			if !routines.IsEmptyResult(toolResult) {
+			if !routines.IsEmptyResult(actionResult) {
 				anyNonEmpty = true
 			}
-			fmt.Fprintf(&results, "## %s\n%s\n\n", toolName, toolResult)
+			fmt.Fprintf(&results, "## %s\n%s\n\n", actionName, actionResult)
 		}
 
-		// If silent_if_empty and ALL tools returned empty, skip orchestrator.
+		// If silent_if_empty and ALL actions returned empty, skip orchestrator.
 		if d.SilentIfEmpty && !anyNonEmpty {
-			logger.Log.Infof("routine-scheduler: %s: all tools returned empty, skipping (silent)", d.Name)
+			logger.Log.Infof("routine-scheduler: %s: all actions returned empty, skipping (silent)", d.Name)
 			return
 		}
 
@@ -145,10 +145,10 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 			goal = *d.Goal
 		}
 
-		toolLabel := strings.Join(toolList, ", ")
+		actionLabel := strings.Join(actionList, ", ")
 		prompt = fmt.Sprintf(
-			"ROUTINE: %s\nThe following tools were called: %s\n\nResults:\n%s\nYour task: %s",
-			d.Name, toolLabel, results.String(), goal,
+			"ROUTINE: %s\nThe following actions were called: %s\n\nResults:\n%s\nYour task: %s",
+			d.Name, actionLabel, results.String(), goal,
 		)
 	} else {
 		// Legacy routine: pass instruction to orchestrator and let it figure things out.
@@ -162,14 +162,7 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 	// Prepend routine mode preamble for focused execution context.
 	prompt = strings.TrimSpace(prompts.RoutineMode) + "\n\n" + prompt
 
-	var reply string
-	var err error
-	e.withOrchestratorLock(func() {
-		reply, _, err = llm.QueryOrchestrator(
-			ctx, e.LLM.Client, e.LLM.Model, prompt,
-			e.ToolExec, DefaultTrimFn, e.baseOrchestratorOpts(),
-		)
-	})
+	reply, _, err := e.runOrchestrator(ctx, false, prompt, nil)
 
 	if err != nil {
 		logger.Log.Warnf("routine-scheduler: routine failed, name=%s, err=%v", d.Name, err)
@@ -180,6 +173,12 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 	if reply != "" && !strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
 		if e.sendDeduped(reply, fmt.Sprintf("routine %q", d.Name)) {
 			e.recordAction("routine", fmt.Sprintf("Sent %q output: %s", d.Name, textutil.Truncate(reply, 80)))
+			// Persist condensed output in conversation state so the interactive
+			// orchestrator can reference what was just sent to the user.
+			e.SM.AppendMessage(llm.Message{
+				Role:    "assistant",
+				Content: fmt.Sprintf("[ROUTINE: %s]\n%s", d.Name, textutil.Truncate(reply, 500)),
+			})
 			logger.Log.Infof("routine-scheduler: %q delivered", d.Name)
 		}
 	} else {

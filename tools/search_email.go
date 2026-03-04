@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	gm "google.golang.org/api/gmail/v1"
 
-	"sokratos/gmail"
+	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/pipelines"
 	"sokratos/timefmt"
@@ -39,7 +39,7 @@ func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *pipelines.Tr
 		var a searchEmailArgs
 		if len(args) > 2 {
 			if err := json.Unmarshal(args, &a); err != nil {
-				return fmt.Sprintf("invalid arguments: %v", err), nil
+				return "", Errorf("invalid arguments: %v", err)
 			}
 		}
 
@@ -101,9 +101,12 @@ func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool, tr
 	checkStart := time.Now()
 	query, _ := buildCheckQuery(since, checkStart)
 
-	emails, err := gmail.FetchEmails(svc, query, 20)
+	emails, err := google.FetchEmails(svc, query, 20)
 	if err != nil {
-		return fmt.Sprintf("Failed to fetch emails: %v", err), nil
+		if google.IsAuthError(err) {
+			return "", Errorf("%s", google.AuthErrorMessage)
+		}
+		return "", Errorf("Failed to fetch emails: %v", err)
 	}
 
 	// Persist the check timestamp regardless of results — prevents the window
@@ -124,7 +127,7 @@ func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool, tr
 	for _, id := range newIDs {
 		newIDSet[id] = true
 	}
-	var newEmails []gmail.Email
+	var newEmails []google.Email
 	for _, e := range emails {
 		if newIDSet[e.ID] {
 			newEmails = append(newEmails, e)
@@ -193,10 +196,13 @@ func searchGmail(svc *gm.Service, a searchEmailArgs) (string, error) {
 
 	finalQuery := strings.Join(queryParts, " ")
 
-	emails, err := gmail.FetchEmails(svc, finalQuery, maxResults)
+	emails, err := google.FetchEmails(svc, finalQuery, maxResults)
 	if err != nil {
+		if google.IsAuthError(err) {
+			return "", Errorf("%s", google.AuthErrorMessage)
+		}
 		logger.Log.Errorf("[search_email] failed: %v", err)
-		return fmt.Sprintf("Failed to search email: %v", err), nil
+		return "", Errorf("Failed to search email: %v", err)
 	}
 	if len(emails) == 0 {
 		return "No emails found matching your query.", nil
@@ -206,11 +212,11 @@ func searchGmail(svc *gm.Service, a searchEmailArgs) (string, error) {
 	return formatEmails(emails, fmt.Sprintf("Found %d email(s):", len(emails))), nil
 }
 
-func formatEmails(emails []gmail.Email, header string) string {
+func formatEmails(emails []google.Email, header string) string {
 	var b strings.Builder
 	b.WriteString(header)
 	for i, e := range emails {
-		fmt.Fprintf(&b, "\n\n--- Email %d ---\n%s", i+1, gmail.FormatEmailSummary(e))
+		fmt.Fprintf(&b, "\n\n--- Email %d ---\n%s", i+1, google.FormatEmailSummary(e))
 	}
 	return b.String()
 }

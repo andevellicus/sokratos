@@ -14,6 +14,28 @@ root ::= "{" ws "\"salience_score\"" ws ":" ws number ws "," ws "\"summary\"" ws
 `
 }
 
+// BuildDispatchGrammar generates a GBNF grammar that constrains subagent triage
+// output to either an escalation (dispatch:false) or a dispatch decision with
+// tool name and arguments (dispatch:true). Static grammar — tool name validation
+// happens after parse.
+func BuildDispatchGrammar() string {
+	return `# Dispatch triage grammar
+ws ::= [ \t\n\r]*
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+number ::= [0-9]+ ("." [0-9]+)?
+boolean ::= "true" | "false"
+null ::= "null"
+value ::= string | number | boolean | null | object | array
+array ::= "[" ws "]" | "[" ws value (ws "," ws value)* ws "]"
+object ::= "{" ws "}" | "{" ws string ws ":" ws value (ws "," ws string ws ":" ws value)* ws "}"
+
+root ::= escalate | dispatch | multi
+escalate ::= "{" ws "\"dispatch\"" ws ":" ws "false" ws "," ws "\"ack\"" ws ":" ws string ws "}"
+dispatch ::= "{" ws "\"dispatch\"" ws ":" ws "true" ws "," ws "\"tool\"" ws ":" ws string ws "," ws "\"args\"" ws ":" ws object ws "," ws "\"ack\"" ws ":" ws string ws "}"
+multi ::= "{" ws "\"dispatch\"" ws ":" ws "true" ws "," ws "\"multi\"" ws ":" ws "true" ws "," ws "\"directive\"" ws ":" ws string ws "," ws "\"ack\"" ws ":" ws string ws "}"
+`
+}
+
 // paramTypeToRule maps a schema type string to the corresponding GBNF rule name.
 func paramTypeToRule(t string) string {
 	switch t {

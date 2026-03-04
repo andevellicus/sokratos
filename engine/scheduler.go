@@ -112,12 +112,8 @@ func (e *Engine) executeTask(task Task) {
 		task.Directive, timefmt.Now(),
 	)
 
-	var reply string
-	var msgs []llm.Message
-	e.withOrchestratorLock(func() {
-		opts := e.baseOrchestratorOpts()
+	reply, msgs, err := e.runOrchestrator(context.Background(), false, prompt, func(opts *llm.QueryOrchestratorOpts) {
 		opts.History = e.SM.ReadMessages()
-		reply, msgs, err = llm.QueryOrchestrator(context.Background(), e.LLM.Client, e.LLM.Model, prompt, e.ToolExec, DefaultTrimFn, opts)
 	})
 
 	for _, m := range msgs {

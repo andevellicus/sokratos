@@ -80,24 +80,37 @@ CREATE TABLE IF NOT EXISTS routines (
     name VARCHAR(255) UNIQUE NOT NULL,
     interval_duration INTERVAL,          -- nullable: schedule-only routines have no interval
     last_executed TIMESTAMPTZ DEFAULT now(),
-    instruction TEXT,                     -- nullable: structured routines use tool+goal instead
-    tool VARCHAR(255),                    -- single tool to call directly
-    tools TEXT[],                         -- multi-tool list (takes precedence over tool)
-    tool_args JSONB,                      -- per-tool arguments with template expansion
-    goal TEXT,                            -- what to do with tool results
-    silent_if_empty BOOLEAN DEFAULT false,-- skip orchestrator if tool returns empty
+    instruction TEXT,                     -- nullable: structured routines use action+goal instead
+    action VARCHAR(255),                  -- single action (tool or skill) to call directly
+    actions TEXT[],                       -- multi-action list (takes precedence over action)
+    action_args JSONB,                    -- per-action arguments with template expansion
+    goal TEXT,                            -- what to do with action results
+    silent_if_empty BOOLEAN DEFAULT false,-- skip orchestrator if action returns empty
     schedule TEXT                         -- "HH:MM" or comma-separated "HH:MM,HH:MM" daily schedule
 );
 
 -- Migrations for existing databases (safe to re-run).
-ALTER TABLE routines ADD COLUMN IF NOT EXISTS tool VARCHAR(255);
+-- Rename tool → action columns (idempotent: succeeds on first run, no-ops after).
+DO $$ BEGIN
+    ALTER TABLE routines RENAME COLUMN tool TO action;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+DO $$ BEGIN
+    ALTER TABLE routines RENAME COLUMN tools TO actions;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+DO $$ BEGIN
+    ALTER TABLE routines RENAME COLUMN tool_args TO action_args;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS action VARCHAR(255);
 ALTER TABLE routines ADD COLUMN IF NOT EXISTS goal TEXT;
 ALTER TABLE routines ADD COLUMN IF NOT EXISTS silent_if_empty BOOLEAN DEFAULT false;
 ALTER TABLE routines ADD COLUMN IF NOT EXISTS schedule TEXT;
-ALTER TABLE routines ADD COLUMN IF NOT EXISTS tools TEXT[];
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS actions TEXT[];
 ALTER TABLE routines ALTER COLUMN interval_duration DROP NOT NULL;
 ALTER TABLE routines ALTER COLUMN instruction DROP NOT NULL;
-ALTER TABLE routines ADD COLUMN IF NOT EXISTS tool_args JSONB;
+ALTER TABLE routines ADD COLUMN IF NOT EXISTS action_args JSONB;
 
 CREATE TABLE IF NOT EXISTS user_preferences (
     key VARCHAR(255) PRIMARY KEY,

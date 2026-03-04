@@ -136,8 +136,8 @@ func QueryDue(pool *pgxpool.Pool) ([]DueRoutine, error) {
 	defer cancel()
 
 	rows, err := pool.Query(ctx,
-		`SELECT id, name, instruction, tool, tools, goal,
-		        COALESCE(silent_if_empty, false), schedule, last_executed, tool_args,
+		`SELECT id, name, instruction, action, actions, goal,
+		        COALESCE(silent_if_empty, false), schedule, last_executed, action_args,
 		        (interval_duration IS NOT NULL AND last_executed + interval_duration <= NOW()) AS interval_due
 		 FROM routines
 		 WHERE (interval_duration IS NOT NULL AND last_executed + interval_duration <= NOW())
@@ -152,11 +152,11 @@ func QueryDue(pool *pgxpool.Pool) ([]DueRoutine, error) {
 	for rows.Next() {
 		var d DueRoutine
 		var schedule *string
-		var toolArgsJSON []byte
+		var actionArgsJSON []byte
 		var intervalDue bool
 
-		if err := rows.Scan(&d.ID, &d.Name, &d.Instruction, &d.Tool, &d.Tools, &d.Goal,
-			&d.SilentIfEmpty, &schedule, &d.LastExecuted, &toolArgsJSON, &intervalDue); err != nil {
+		if err := rows.Scan(&d.ID, &d.Name, &d.Instruction, &d.Action, &d.Actions, &d.Goal,
+			&d.SilentIfEmpty, &schedule, &d.LastExecuted, &actionArgsJSON, &intervalDue); err != nil {
 			logger.Log.Warnf("[routines] failed to scan routine row: %v", err)
 			continue
 		}
@@ -166,11 +166,11 @@ func QueryDue(pool *pgxpool.Pool) ([]DueRoutine, error) {
 			d.Schedules = ParseSchedules(*schedule)
 		}
 
-		// Parse tool_args JSONB column.
-		if len(toolArgsJSON) > 0 {
+		// Parse action_args JSONB column.
+		if len(actionArgsJSON) > 0 {
 			var raw map[string]json.RawMessage
-			if err := json.Unmarshal(toolArgsJSON, &raw); err == nil {
-				d.ToolArgs = raw
+			if err := json.Unmarshal(actionArgsJSON, &raw); err == nil {
+				d.ActionArgs = raw
 			}
 		}
 
@@ -214,8 +214,8 @@ func validateEntry(name string, r Entry) error {
 	}
 
 	// At least one action required.
-	if r.Tool == "" && len(r.Tools) == 0 && r.Instruction == "" {
-		return fmt.Errorf("%q: missing tool, tools, or instruction, skipping", name)
+	if r.Action == "" && len(r.Actions) == 0 && r.Instruction == "" {
+		return fmt.Errorf("%q: missing action, actions, or instruction, skipping", name)
 	}
 
 	return nil
@@ -224,7 +224,7 @@ func validateEntry(name string, r Entry) error {
 // upsertEntry performs the DB upsert for a single routine. Returns rows affected.
 func upsertEntry(ctx context.Context, pool *pgxpool.Pool, name string, r Entry) (int64, error) {
 	instruction := r.Instruction
-	if (r.Tool != "" || len(r.Tools) > 0) && instruction == "" {
+	if (r.Action != "" || len(r.Actions) > 0) && instruction == "" {
 		instruction = r.Goal
 	}
 
@@ -233,36 +233,36 @@ func upsertEntry(ctx context.Context, pool *pgxpool.Pool, name string, r Entry) 
 		intervalArg = r.Interval
 	}
 
-	var toolsArg interface{}
-	if len(r.Tools) > 0 {
-		toolsArg = r.Tools
+	var actionsArg interface{}
+	if len(r.Actions) > 0 {
+		actionsArg = r.Actions
 	}
 
 	schedStr := NormalizeSchedule(r.Schedule)
 
-	// Marshal tool_args to JSONB.
-	var toolArgsArg interface{}
-	if len(r.ToolArgs) > 0 {
-		b, err := json.Marshal(r.ToolArgs)
+	// Marshal action_args to JSONB.
+	var actionArgsArg interface{}
+	if len(r.ActionArgs) > 0 {
+		b, err := json.Marshal(r.ActionArgs)
 		if err == nil {
-			toolArgsArg = b
+			actionArgsArg = b
 		}
 	}
 
 	tag, err := pool.Exec(ctx,
-		`INSERT INTO routines (name, interval_duration, instruction, tool, goal, silent_if_empty, schedule, tools, tool_args)
+		`INSERT INTO routines (name, interval_duration, instruction, action, goal, silent_if_empty, schedule, actions, action_args)
 		 VALUES ($1, $2::interval, $3, $4, $5, $6, $7, $8, $9)
 		 ON CONFLICT (name) DO UPDATE SET
 		   interval_duration = EXCLUDED.interval_duration,
 		   instruction = EXCLUDED.instruction,
-		   tool = EXCLUDED.tool,
+		   action = EXCLUDED.action,
 		   goal = EXCLUDED.goal,
 		   silent_if_empty = EXCLUDED.silent_if_empty,
 		   schedule = EXCLUDED.schedule,
-		   tools = EXCLUDED.tools,
-		   tool_args = EXCLUDED.tool_args`,
-		name, intervalArg, instruction, NilIfEmpty(r.Tool), NilIfEmpty(r.Goal), r.SilentIfEmpty,
-		NilIfEmpty(schedStr), toolsArg, toolArgsArg)
+		   actions = EXCLUDED.actions,
+		   action_args = EXCLUDED.action_args`,
+		name, intervalArg, instruction, NilIfEmpty(r.Action), NilIfEmpty(r.Goal), r.SilentIfEmpty,
+		NilIfEmpty(schedStr), actionsArg, actionArgsArg)
 	if err != nil {
 		return 0, err
 	}

@@ -101,18 +101,10 @@ func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, con
 			contextXML, decision.Intent,
 		)
 
-		var reply string
-		var msgs []llm.Message
-		var orchestratorErr error
-		e.withOrchestratorLock(func() {
-			opts := e.baseOrchestratorOpts()
+		reply, msgs, orchestratorErr := e.runOrchestrator(context.Background(), false, toolPrompt, func(opts *llm.QueryOrchestratorOpts) {
 			if !conversationStale {
 				opts.History = e.SM.ReadMessages()
 			}
-			reply, msgs, orchestratorErr = llm.QueryOrchestrator(
-				context.Background(), e.LLM.Client, e.LLM.Model, toolPrompt,
-				e.ToolExec, DefaultTrimFn, opts,
-			)
 		})
 
 		if !conversationStale {
@@ -148,10 +140,7 @@ func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, con
 func (e *Engine) heartbeatPhase2Orchestrator(contextXML, stalenessNote string, conversationStale bool) {
 	executivePrompt := fmt.Sprintf(executivePromptBase, stalenessNote)
 
-	var reply string
-	var msgs []llm.Message
-	var err error
-	e.withOrchestratorLock(func() {
+	reply, msgs, err := e.runOrchestrator(context.Background(), false, contextXML, func(opts *llm.QueryOrchestratorOpts) {
 		var history []llm.Message
 		if !conversationStale {
 			convHistory := e.SM.ReadMessages()
@@ -164,13 +153,7 @@ func (e *Engine) heartbeatPhase2Orchestrator(contextXML, stalenessNote string, c
 			Role:    "user",
 			Content: "[EXECUTIVE ROUTINE]\n" + executivePrompt,
 		})
-
-		opts := e.baseOrchestratorOpts()
 		opts.History = history
-		reply, msgs, err = llm.QueryOrchestrator(
-			context.Background(), e.LLM.Client, e.LLM.Model, contextXML,
-			e.ToolExec, DefaultTrimFn, opts,
-		)
 	})
 
 	// Only persist Phase 2 messages when the conversation is active.

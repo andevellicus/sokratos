@@ -1,17 +1,57 @@
-package gmail
+package google
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	gm "google.golang.org/api/gmail/v1"
+	"google.golang.org/api/option"
 
+	"sokratos/logger"
 	"sokratos/textutil"
-
 	"sokratos/timefmt"
 )
+
+// GmailService is the application-wide Gmail API client.
+var GmailService *gm.Service
+
+// InitGmailFromToken sets up the Gmail API client using only a previously saved
+// token. No interactive flow — returns nil if no token exists. Used at startup
+// for non-blocking initialization.
+func InitGmailFromToken(ctx context.Context, credentialsPath, tokenPath string) error {
+	client, err := GetClientFromToken(ctx, "Gmail", credentialsPath, tokenPath, []string{gm.GmailReadonlyScope, gm.GmailSendScope})
+	if err != nil {
+		return err
+	}
+	if client == nil {
+		return nil
+	}
+
+	svc, err := gm.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return fmt.Errorf("create gmail service: %w", err)
+	}
+
+	GmailService = svc
+	logger.Log.Info("Gmail API initialized (from token)")
+	return nil
+}
+
+// InitGmailFromClient sets up the Gmail API client from an already-authenticated
+// HTTP client. Used when a single OAuth token covers both Gmail and Calendar.
+func InitGmailFromClient(ctx context.Context, client *http.Client) error {
+	svc, err := gm.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return fmt.Errorf("create gmail service: %w", err)
+	}
+	GmailService = svc
+	logger.Log.Info("Gmail API initialized")
+	return nil
+}
 
 // Email holds parsed fields from a Gmail message.
 type Email struct {

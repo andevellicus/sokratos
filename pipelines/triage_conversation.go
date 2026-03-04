@@ -11,7 +11,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/clients"
-	"sokratos/gmail"
+	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
@@ -28,8 +28,9 @@ type triageResult struct {
 	ParadigmShift bool     `json:"paradigm_shift,omitempty"`
 }
 
-// triageViaDTC sends content to the deep thinker (Qwen3.5-27B, no thinking)
+// triageViaDTC sends content to the deep thinker (thinking disabled)
 // with a GBNF grammar constraint and parses the result into a triageResult.
+// In two-model mode, the DTC client points at the Brain (122B).
 // Falls back to safe defaults on parse failure.
 func triageViaDTC(ctx context.Context, dtc *clients.DeepThinkerClient, triageGrammar, systemPrompt, content string, maxLen int) (*triageResult, error) {
 	if len(content) > maxLen {
@@ -38,12 +39,12 @@ func triageViaDTC(ctx context.Context, dtc *clients.DeepThinkerClient, triageGra
 
 	raw, err := dtc.CompleteNoThinkWithGrammar(ctx, systemPrompt, content, triageGrammar, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("dtc triage request: %w", err)
+		return nil, fmt.Errorf("triage request: %w", err)
 	}
 
 	var result triageResult
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		logger.Log.Warnf("[conversation_triage] dtc parse failure, using fallback: %v (raw: %s)", err, raw)
+		logger.Log.Warnf("[triage] parse failure, using fallback: %v (raw: %s)", err, raw)
 		summary := textutil.Truncate(content, 200)
 		return &triageResult{
 			SalienceScore: 5,
@@ -105,7 +106,7 @@ type TriageConfig struct {
 	Pool               *pgxpool.Pool
 	EmbedEndpoint      string
 	EmbedModel         string
-	DTC                *clients.DeepThinkerClient
+	DTC                *clients.DeepThinkerClient // Brain (122B) in two-model mode; used for triage + paradigm shift
 	QueueFn            memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
 	BgGrammarFn        memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
 	TriageGrammar      string
@@ -134,7 +135,7 @@ type TriageSaveRequest struct {
 // builds and saves the memory, and optionally triggers paradigm shift detection.
 func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest) error {
 	if cfg.DTC == nil || cfg.TriageGrammar == "" {
-		return fmt.Errorf("DTC not configured for triage")
+		return fmt.Errorf("triage not configured")
 	}
 
 	// Context-aware triage: check if similar memories already exist.
@@ -205,13 +206,19 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		go func() {
 			psCtx, psCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer psCancel()
+			// Build PipelineDeps from TriageConfig.
+			psDeps := PipelineDeps{
+				Pool: cfg.Pool, DTC: cfg.DTC,
+				EmbedEndpoint: cfg.EmbedEndpoint, EmbedModel: cfg.EmbedModel,
+				GrammarFn: cfg.BgGrammarFn,
+			}
 			// 1. Synchronous transition memory generation.
-			if _, err := generateTransitionMemory(psCtx, cfg.Pool, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.DTC, result.Summary, tags); err != nil {
+			if _, err := generateTransitionMemory(psCtx, psDeps, result.Summary, tags); err != nil {
 				logger.Log.Warnf("[triage:%s] paradigm shift transition failed: %v", req.DomainTag, err)
 				return
 			}
 			// 2. Immediate mini-consolidation to update profile.
-			ConsolidateImmediate(psCtx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, cfg.BgGrammarFn)
+			ConsolidateImmediate(psCtx, psDeps)
 			// 3. Refresh engine state so updated profile is used immediately.
 			if cfg.ProfileRefreshFunc != nil {
 				cfg.ProfileRefreshFunc()
@@ -278,12 +285,12 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 
 // TriageAndSaveEmailAsync sends an email for triage scoring, then saves it to
 // memory if it meets the salience threshold. Runs as a fire-and-forget goroutine.
-func TriageAndSaveEmailAsync(cfg TriageConfig, email gmail.Email) {
+func TriageAndSaveEmailAsync(cfg TriageConfig, email google.Email) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
 		defer cancel()
 
-		formatted := gmail.FormatEmailSummary(email)
+		formatted := google.FormatEmailSummary(email)
 		sourceDate := email.Date
 
 		err := triageAndSave(ctx, cfg, TriageSaveRequest{

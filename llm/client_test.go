@@ -100,6 +100,58 @@ func TestParseToolIntent_NoColon(t *testing.T) {
 	}
 }
 
+func TestExtractToolIntent(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantOK  bool
+	}{
+		{
+			name:   "clean intent",
+			input:  `Some prose <TOOL_INTENT>search_web: {"query": "test"}</TOOL_INTENT> more text`,
+			want:   `search_web: {"query": "test"}`,
+			wantOK: true,
+		},
+		{
+			name:   "CODE block intent",
+			input:  `<TOOL_INTENT>create_skill: {"name":"s"}<CODE>console.log('hi')</CODE></TOOL_INTENT>`,
+			want:   `create_skill: {"name":"s"}<CODE>console.log('hi')</CODE>`,
+			wantOK: true,
+		},
+		{
+			name:   "unclosed tag returns false",
+			input:  `<TOOL_INTENT>search_web: {"query": "test"}`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "opening tag only no content",
+			input:  `Just mentioning <TOOL_INTENT> in prose`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "intent with surrounding prose",
+			input:  `Let me save this. <TOOL_INTENT>save_memory: {"summary":"x"}</TOOL_INTENT> Done.`,
+			want:   `save_memory: {"summary":"x"}`,
+			wantOK: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := extractToolIntent(tt.input)
+			if ok != tt.wantOK {
+				t.Fatalf("extractToolIntent() ok = %v, wantOK %v (got %q)", ok, tt.wantOK, got)
+			}
+			if got != tt.want {
+				t.Errorf("extractToolIntent() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseToolIntent_PreservesArgumentTypes(t *testing.T) {
 	// The key property: parseToolIntent uses json.RawMessage so it
 	// never deserializes/re-serializes the args. Whatever JSON the

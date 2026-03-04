@@ -269,13 +269,8 @@ func TestStripToolIntentTags(t *testing.T) {
 			want:  "Prose before  and after",
 		},
 		{
-			name:  "backslash closer",
-			input: `text <TOOL_INTENT>tool: {}<\TOOL_INTENT> more`,
-			want:  "text  more",
-		},
-		{
-			name:  "truncated closing tag",
-			input: "text <TOOL_INTENT>tool: {}</TOOL_INTEN> more",
+			name:  "proper closing tag",
+			input: "text <TOOL_INTENT>tool: {}</TOOL_INTENT> more",
 			want:  "text  more",
 		},
 		{

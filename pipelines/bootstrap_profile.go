@@ -19,15 +19,8 @@ import (
 
 // bootstrapOutput is the expected dual structure from the bootstrap prompt.
 type bootstrapOutput struct {
-	Personality []bootstrapTrait `json:"personality"`
-	UserProfile json.RawMessage  `json:"user_profile"`
-}
-
-type bootstrapTrait struct {
-	Category string `json:"category"`
-	Key      string `json:"key"`
-	Value    string `json:"value"`
-	Context  string `json:"context,omitempty"`
+	Personality []memory.PersonalityUpdate `json:"personality"`
+	UserProfile json.RawMessage            `json:"user_profile"`
 }
 
 // BootstrapConfig holds dependencies for the /bootstrap command.
@@ -236,17 +229,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.Deep
 // and writes a compact identity card (name + important_people only).
 func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, bgGrammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc, dual bootstrapOutput) (string, error) {
 	// Write personality traits.
-	traitCount := 0
-	for _, t := range dual.Personality {
-		if t.Category == "" || t.Key == "" || t.Value == "" {
-			continue
-		}
-		if _, err := memory.UpsertPersonalityTrait(ctx, pool, t.Category, t.Key, t.Value, t.Context); err != nil {
-			logger.Log.Warnf("[bootstrap] failed to upsert trait %s/%s: %v", t.Category, t.Key, err)
-			continue
-		}
-		traitCount++
-	}
+	traitCount := memory.ApplyPersonalityUpdates(ctx, pool, dual.Personality, "bootstrap")
 
 	// Parse the DT output to extract fields and build compact card.
 	var up struct {
@@ -334,7 +317,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 	defaultRoutines := []struct {
 		Name          string
 		Interval      string
-		Tool          *string
+		Action        *string
 		Goal          *string
 		SilentIfEmpty bool
 	}{
@@ -342,10 +325,10 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 	}
 	for _, r := range defaultRoutines {
 		_, err := pool.Exec(ctx,
-			`INSERT INTO routines (name, interval_duration, tool, goal, silent_if_empty)
+			`INSERT INTO routines (name, interval_duration, action, goal, silent_if_empty)
 			 VALUES ($1, $2::interval, $3, $4, $5)
 			 ON CONFLICT (name) DO NOTHING`,
-			r.Name, r.Interval, r.Tool, r.Goal, r.SilentIfEmpty)
+			r.Name, r.Interval, r.Action, r.Goal, r.SilentIfEmpty)
 		if err != nil {
 			logger.Log.Warnf("[bootstrap] failed to seed routine %s: %v", r.Name, err)
 		} else {

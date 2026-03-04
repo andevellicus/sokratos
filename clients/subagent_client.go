@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"sokratos/httputil"
-	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/timeouts"
 )
@@ -20,8 +18,8 @@ import (
 // into inference time.
 type SubagentClient struct {
 	baseClient
-	sem    chan struct{}
-	workCh chan memory.WorkRequest
+	sem chan struct{}
+	wq  *WorkQueue
 }
 
 // NewSubagentClientNamed returns a ready-to-use client with a custom name for
@@ -40,13 +38,14 @@ func NewSubagentClientNamed(name, url, model string, slots int) *SubagentClient 
 			cb:     newCircuitBreaker(name),
 			logTag: "[" + name + "]",
 		},
-		sem:    make(chan struct{}, slots),
-		workCh: make(chan memory.WorkRequest, 64),
+		sem: make(chan struct{}, slots),
 	}
-	// Start one worker per slot so idle capacity gets used for background work.
-	for i := 0; i < slots; i++ {
-		go sc.processWorkQueue()
-	}
+	sc.wq = NewWorkQueue(64, slots, sc.logTag, func(ctx context.Context, req memory.WorkRequest) (string, error) {
+		return sc.exec(ctx, requestOpts{
+			system: req.SystemPrompt, user: req.UserPrompt,
+			grammar: req.Grammar, maxTokens: req.MaxTokens,
+		})
+	})
 	return sc
 }
 
@@ -74,6 +73,29 @@ func (sc *SubagentClient) tryAcquire() bool {
 	default:
 		return false
 	}
+}
+
+// SlotsInUse returns the number of currently occupied semaphore slots and the
+// total capacity. Useful for logging and diagnostics.
+func (sc *SubagentClient) SlotsInUse() (used, total int) {
+	return len(sc.sem), cap(sc.sem)
+}
+
+// Acquire blocks until a semaphore slot is available or ctx is cancelled.
+// Exported for the slot router to reserve a slot for orchestrator fallback.
+func (sc *SubagentClient) Acquire(ctx context.Context) error {
+	return sc.acquire(ctx)
+}
+
+// TryAcquire attempts to acquire a semaphore slot without blocking.
+// Exported for the slot router.
+func (sc *SubagentClient) TryAcquire() bool {
+	return sc.tryAcquire()
+}
+
+// Release frees a semaphore slot. Exported for the slot router.
+func (sc *SubagentClient) Release() {
+	sc.release()
 }
 
 // requestOpts captures the variation axes for exec(): blocking vs non-blocking
@@ -178,53 +200,27 @@ func (sc *SubagentClient) CompleteMultiTurnWithGrammar(ctx context.Context, mess
 	return sc.exec(ctx, requestOpts{messages: messages, grammar: grammar, maxTokens: maxTokens})
 }
 
-// QueueWork submits a background LLM task. Items are processed sequentially
-// as server slots become available. Each item gets a fresh context with
-// item.Timeout, so queue wait time doesn't eat into inference time.
-func (sc *SubagentClient) QueueWork(item memory.WorkRequest) {
-	select {
-	case sc.workCh <- item:
-		logger.Log.Debugf("%s queued: %s (depth=%d/%d)", sc.logTag, item.Label, len(sc.workCh), cap(sc.workCh))
-	default:
-		logger.Log.Warnf("%s work queue full (cap=%d), dropping: %s", sc.logTag, cap(sc.workCh), item.Label)
-		if item.OnComplete != nil {
-			item.OnComplete("", fmt.Errorf("work queue full"))
-		}
-	}
+// CaptionImage sends a multimodal (text + image) message to the subagent and
+// returns a free-form text caption. Uses tryOnly (non-blocking semaphore) so
+// it returns immediately if all slots are busy.
+func (sc *SubagentClient) CaptionImage(ctx context.Context, systemPrompt, imageDataURI string, maxTokens int) (string, error) {
+	return sc.exec(ctx, requestOpts{
+		messages: []chatMessage{
+			{Role: "system", Content: systemPrompt},
+			{
+				Role: "user",
+				Parts: []contentPart{
+					{Type: "text", Text: "Describe this image concisely."},
+					{Type: "image_url", ImageURL: &imageURL{URL: imageDataURI}},
+				},
+			},
+		},
+		maxTokens: maxTokens,
+		tryOnly:   true,
+	})
 }
 
-// processWorkQueue drains the work channel, executing items through the normal
-// semaphore-gated exec() path. Multiple goroutines run this concurrently
-// (one per slot). Each item gets its own fresh context so queue wait time
-// doesn't count against the inference timeout. On transient failure, items
-// with Retries > 0 are requeued after a brief backoff.
-func (sc *SubagentClient) processWorkQueue() {
-	for item := range sc.workCh {
-		ctx, cancel := context.WithTimeout(context.Background(), item.Timeout)
-		result, err := sc.exec(ctx, requestOpts{
-			system: item.SystemPrompt, user: item.UserPrompt,
-			grammar: item.Grammar, maxTokens: item.MaxTokens,
-		})
-		cancel()
-
-		if err != nil && item.Retries > 0 {
-			item.Retries--
-			backoff := 2 * time.Second
-			logger.Log.Warnf("%s %s failed (%v), retrying in %v (%d left)",
-				sc.logTag, item.Label, err, backoff, item.Retries)
-			time.Sleep(backoff)
-			// Non-blocking requeue — if the channel is full, fall through
-			// to OnComplete with the error rather than blocking the worker.
-			select {
-			case sc.workCh <- item:
-				continue
-			default:
-				logger.Log.Warnf("%s %s retry failed: queue full, delivering error", sc.logTag, item.Label)
-			}
-		}
-
-		if item.OnComplete != nil {
-			item.OnComplete(result, err)
-		}
-	}
+// QueueWork submits a background LLM task to the shared work queue.
+func (sc *SubagentClient) QueueWork(item memory.WorkRequest) {
+	sc.wq.QueueWork(item)
 }

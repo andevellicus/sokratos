@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"sokratos/calendar"
+	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/timefmt"
 
@@ -54,7 +54,7 @@ func NewCreateEvent(svc *cal.Service) ToolFunc {
 			}
 		}
 
-		event, err := calendar.CreateEvent(svc, a.Title, a.Description, a.Location, startTime, endTime, a.Attendees)
+		event, err := google.CreateEvent(svc, a.Title, a.Description, a.Location, startTime, endTime, a.Attendees)
 		if err != nil {
 			logger.Log.Errorf("[create_event] failed: %v", err)
 			return fmt.Sprintf("Failed to create event: %v", err), nil

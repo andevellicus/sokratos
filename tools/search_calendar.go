@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	cal "google.golang.org/api/calendar/v3"
 
-	"sokratos/calendar"
+	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/pipelines"
 	"sokratos/timefmt"
@@ -72,7 +72,7 @@ func temporalOnlyQuery(q string) bool {
 
 // eventUID returns a stable identifier for dedup. Prefers ICalUID (RFC5545),
 // falls back to the Google event ID.
-func eventUID(e calendar.Event) string {
+func eventUID(e google.Event) string {
 	if e.ICalUID != "" {
 		return e.ICalUID
 	}
@@ -80,7 +80,7 @@ func eventUID(e calendar.Event) string {
 }
 
 // filterNewEvents removes events whose UID is already in processed_events.
-func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []calendar.Event) []calendar.Event {
+func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []google.Event) []google.Event {
 	tracker := &pipelines.ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
 	uids := make([]string, len(events))
 	for i, e := range events {
@@ -91,7 +91,7 @@ func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []calendar.
 	for _, uid := range newUIDs {
 		newUIDSet[uid] = true
 	}
-	var newEvents []calendar.Event
+	var newEvents []google.Event
 	for _, e := range events {
 		if newUIDSet[eventUID(e)] {
 			newEvents = append(newEvents, e)
@@ -101,7 +101,7 @@ func filterNewEvents(ctx context.Context, pool *pgxpool.Pool, events []calendar.
 }
 
 // markEventsProcessed inserts event UIDs into processed_events.
-func markEventsProcessed(ctx context.Context, pool *pgxpool.Pool, events []calendar.Event) {
+func markEventsProcessed(ctx context.Context, pool *pgxpool.Pool, events []google.Event) {
 	tracker := &pipelines.ProcessedTracker{Pool: pool, Table: "processed_events", IDColumn: "event_uid"}
 	uids := make([]string, len(events))
 	for i, e := range events {
@@ -117,7 +117,7 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a searchCalendarArgs
 		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+			return "", Errorf("invalid arguments: %v", err)
 		}
 
 		// Detect routine mode: no explicit arguments provided.
@@ -130,9 +130,9 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 
 		var timeMin, timeMax *time.Time
 		if a.TimeMin != "" {
-			t, err := parseISO8601(a.TimeMin)
+			t, err := timefmt.ParseISO8601(a.TimeMin)
 			if err != nil {
-				return fmt.Sprintf("invalid time_min %q: %v", a.TimeMin, err), nil
+				return "", Errorf("invalid time_min %q: %v", a.TimeMin, err)
 			}
 			t = timefmt.ReinterpretAsLocal(t)
 			timeMin = &t
@@ -144,9 +144,9 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 		}
 
 		if a.TimeMax != "" {
-			t, err := parseISO8601(a.TimeMax)
+			t, err := timefmt.ParseISO8601(a.TimeMax)
 			if err != nil {
-				return fmt.Sprintf("invalid time_max %q: %v", a.TimeMax, err), nil
+				return "", Errorf("invalid time_max %q: %v", a.TimeMax, err)
 			}
 			t = timefmt.ReinterpretAsLocal(t)
 			timeMax = &t
@@ -160,10 +160,10 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 			query = ""
 		}
 
-		events, err := calendar.SearchEvents(svc, query, timeMin, timeMax, maxResults)
+		events, err := google.SearchEvents(svc, query, timeMin, timeMax, maxResults)
 		if err != nil {
-			logger.Log.Errorf("[search_calendar] failed: %v", err)
-			return fmt.Sprintf("Failed to search calendar: %v", err), nil
+			logger.Log.Warnf("[search_calendar] partial failure: %v", err)
+			return "", err
 		}
 
 		// When Q + time bounds returns nothing, fall back to time-bounds-only
@@ -173,10 +173,10 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 		droppedQuery := false
 		if len(events) == 0 && query != "" && (timeMin != nil || timeMax != nil) {
 			logger.Log.Infof("[search_calendar] Q=%q with time bounds returned 0 results, retrying without Q", query)
-			events, err = calendar.SearchEvents(svc, "", timeMin, timeMax, maxResults)
+			events, err = google.SearchEvents(svc, "", timeMin, timeMax, maxResults)
 			if err != nil {
-				logger.Log.Errorf("[search_calendar] fallback failed: %v", err)
-				return fmt.Sprintf("Failed to search calendar: %v", err), nil
+				logger.Log.Warnf("[search_calendar] fallback partial failure: %v", err)
+				return "", err
 			}
 			droppedQuery = true
 		}
@@ -200,11 +200,11 @@ func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 			fmt.Fprintf(&b, "Found %d event(s):\n\n", len(events))
 		}
 		for i, e := range events {
-			fmt.Fprintf(&b, "--- Event %d ---\n%s\n\n", i+1, calendar.FormatEventSummary(e))
+			fmt.Fprintf(&b, "--- Event %d ---\n%s\n\n", i+1, google.FormatEventSummary(e))
 		}
 
-		// In routine mode, mark events as processed after formatting.
-		if routineMode {
+		// Mark events as processed so routines don't re-report them.
+		if pool != nil {
 			markEventsProcessed(ctx, pool, events)
 		}
 

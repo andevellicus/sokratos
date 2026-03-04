@@ -24,8 +24,11 @@ const (
 	TimeoutForgetTopic       = 15 * time.Second
 
 	// --- Tasks & Skills ---
-	TimeoutSkillExec = 30 * time.Second
-	TimeoutSkillKV   = 5 * time.Second
+	TimeoutSkillExec           = 30 * time.Second
+	TimeoutSkillExecDelegation = 5 * time.Minute
+	TimeoutSkillKV             = 5 * time.Second
+	TimeoutDelegateCall        = 60 * time.Second
+	TimeoutDelegateBatch       = 3 * time.Minute
 
 	// --- Plan Execution ---
 	TimeoutPlanDecomposition = 60 * time.Second

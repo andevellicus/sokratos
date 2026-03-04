@@ -4,16 +4,15 @@ An autonomous AI assistant with long-term memory, powered by a multi-model archi
 
 ## Architecture
 
-Sokratos uses a **single-model supervisor pattern** where a vision-capable orchestrator produces free-form text with tool intent tags parsed via regex. Four llama-server instances run on a separate Mac (M3 Ultra):
+Sokratos uses a **supervisor pattern with regex-based tool parsing**. Three llama-server instances run on a separate Mac (M3 Ultra):
 
 | Service | Port | Model | Purpose |
 |---------|------|-------|---------|
-| Orchestrator | 11434 | Qwen3.5-VL-35B-A3B (UD-Q4_K_XL) | Vision-capable MoE reasoning, free-form text + `<TOOL_INTENT>` tags |
-| Deep thinker | 11435 | Qwen3.5-27B (UD-Q6_K_XL) | Always-on heavy reasoning, consolidation, plan decomposition |
-| Subagent | 11436 | Gemma3-4B-IT (UD-Q8_K_XL) | Always-on structured tasks: triage, rewriting, re-ranking, SQL generation |
+| Brain | 11434 | Qwen3.5-122B-A10B (UD-Q4_K_XL) | Deep thinking, consolidation, triage, synthesis; orchestrator fallback |
+| 9B | 11436 | Qwen3.5-9B (UD-Q4_K_XL) | Primary orchestrator (supervisor), subagent structured tasks, 3 slots |
 | Embedding | 8081 | BGE-large-en-v1.5 (q8_0) | 1024-dim vectors for pgvector |
 
-The orchestrator runs without grammar constraints. When it wants a tool, it emits `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds).
+The 9B serves as the primary orchestrator and the 122B Brain handles deep thinking + acts as orchestrator fallback via slot routing. The orchestrator runs without grammar constraints, emitting `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds).
 
 ## Prerequisites
 
@@ -41,7 +40,7 @@ On your inference machine (e.g., Mac with M3 Ultra):
 cd models && ./start.sh
 ```
 
-This launches all four llama-server instances.
+This launches the llama-server instances.
 
 ### 3. Configure environment
 
@@ -52,14 +51,11 @@ TELEGRAM_BOT_TOKEN=your_token
 ALLOWED_TELEGRAM_IDS=your_telegram_id
 DATABASE_URL=postgres://sokratos:sokratos@localhost:5435/sokratos
 
-LLM_URL=http://your-mac:11434
-LLM_MODEL=Qwen3.5-VL-35B-A3B-Instruct-UD-Q4_K_XL
-
-DEEP_THINKER_URL=http://your-mac:11435
-DEEP_THINKER_MODEL=Qwen3.5-27B-UD-Q6_K_XL
+BRAIN_URL=http://your-mac:11434
+BRAIN_MODEL=Qwen3.5-122B-A10B-UD-Q4_K_XL
 
 SUBAGENT_URL=http://your-mac:11436
-SUBAGENT_MODEL=gemma-3-4b-it-UD-Q8_K_XL
+SUBAGENT_MODEL=Qwen3.5-9B-UD-Q4_K_XL
 SUBAGENT_SLOTS=3
 
 EMBEDDING_URL=http://your-mac:8081
@@ -82,13 +78,11 @@ go build -o sokratos ./...
 | `TELEGRAM_BOT_TOKEN` | (required) | Telegram Bot API token |
 | `ALLOWED_TELEGRAM_IDS` | (empty = allow all) | Comma-separated Telegram user IDs |
 | `DATABASE_URL` | (empty) | PostgreSQL connection string |
-| `LLM_URL` | `http://localhost:11434` | Orchestrator endpoint |
-| `LLM_MODEL` | (required) | Orchestrator model name |
-| `DEEP_THINKER_URL` | (empty) | Deep thinker endpoint |
-| `DEEP_THINKER_MODEL` | (empty) | Deep thinker model (no .gguf suffix) |
-| `SUBAGENT_URL` | (empty) | Subagent endpoint |
-| `SUBAGENT_MODEL` | (empty) | Subagent model name |
-| `SUBAGENT_SLOTS` | `3` | Concurrent slots for Gemma3 subagent |
+| `BRAIN_URL` | (required) | Brain (122B) endpoint |
+| `BRAIN_MODEL` | (required) | Brain model name (no .gguf suffix) |
+| `SUBAGENT_URL` | (required) | 9B subagent/orchestrator endpoint |
+| `SUBAGENT_MODEL` | (required) | 9B model name |
+| `SUBAGENT_SLOTS` | `3` | Concurrent 9B slots (1 supervisor + 2 subagent) |
 | `EMBEDDING_URL` | (empty) | Embedding endpoint |
 | `EMBEDDING_MODEL` | (empty) | Embedding model name |
 | `SEARXNG_URL` | (empty) | SearXNG instance URL |
@@ -101,7 +95,7 @@ go build -o sokratos ./...
 | `MEMORY_SEARCH_LIMIT` | `10` | Max results from search_memory |
 | `MEMORY_STALENESS_DAYS` | `90` | Prune decayed memories older than this |
 | `CONSOLIDATION_MEMORY_LIMIT` | `50` | Max memories per consolidation pass |
-| `MAX_TOOL_RESULT_LEN` | `2000` | Truncate tool results beyond this |
+| `MAX_TOOL_RESULT_LEN` | `8000` | Truncate tool results beyond this |
 | `MAX_WEB_SOURCES` | `2` | Max web pages to read per query |
 | `DB_MAX_CONNS` | `20` | Max database pool connections |
 | `DB_MIN_CONNS` | `2` | Min idle database connections |
@@ -134,7 +128,7 @@ The orchestrator has access to the following built-in tools:
 | `save_memory` | Persist a fact or preference to long-term memory |
 | `forget_topic` | Delete memories related to a topic by semantic similarity |
 | `consolidate_memory` | Synthesize high-salience memories into the core profile |
-| `consult_deep_thinker` | Route complex reasoning to Qwen3.5-27B with full chain-of-thought |
+| `consult_deep_thinker` | Route complex reasoning to the Brain model with full chain-of-thought |
 | `delegate_task` | Delegate structured tasks to subagent with scoped tool access |
 | `plan_and_execute` | Decompose a directive into steps via DTC, execute via subagent (supports background mode) |
 | `check_background_task` | List, check status, or cancel background tasks |
@@ -147,7 +141,7 @@ The orchestrator has access to the following built-in tools:
 | `read_url` | Fetch and extract content from a web page |
 | `run_code` | Execute JavaScript code in a sandboxed goja runtime |
 | `add_task` / `complete_task` | Manage scheduled tasks with recurrence |
-| `manage_routines` | Create persistent background habits with tool args and templates — syncs to `routines.toml` |
+| `manage_routines` | Create persistent background habits with action args and templates — syncs to `routines.toml` |
 | `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
@@ -178,8 +172,8 @@ Skills execute in a goja ES5 sandbox (30s timeout) with:
 
 | Skill | Config | Output |
 |-------|--------|--------|
-| `get-weather` | `location` | `{location, current: {condition, temp_f, humidity, ...}, forecast: [{date, high_f, low_f, condition}]}` |
-| `get-feeds` | `feeds` | RSS/Atom aggregator supporting Twitter (via RSSHub), Reddit (native RSS), and any RSSHub route (news sites, HN, YouTube, etc.) |
+| `get_weather` | `location` | `{location, current: {condition, temp_f, humidity, ...}, forecast: [{date, high_f, low_f, condition}]}` |
+| `scan_feeds` | `feeds` | RSS/Atom aggregator with parallel article summarization. Supports Twitter (via RSSHub), Reddit (native RSS), direct RSS/Atom, and any RSSHub route. |
 
 ### Creating Skills
 
@@ -200,27 +194,27 @@ Routines are persistent background habits defined in `routines.toml` and synced 
 ```toml
 [feed-digest]
 interval = "4 hours"
-tool = "get-feeds"
+action = "scan_feeds"
 goal = "Select 3-5 most interesting items. Send a digest with title, summary, and link."
 silent_if_empty = true
 ```
 
-When `tool` is set, the engine calls it directly, then passes the result + `goal` to the orchestrator for interpretation. If `silent_if_empty = true` and the tool returns no data, the orchestrator is skipped entirely (no message sent).
+When `action` is set, the engine calls it directly, then passes the result + `goal` to the orchestrator for interpretation. If `silent_if_empty = true` and the action returns no data, the orchestrator is skipped entirely (no message sent).
 
-### Multi-Tool with Tool Args
+### Multi-Action with Action Args
 
 ```toml
 [morning-briefing]
 schedule = "06:00"
-tools = ["search_email", "get-weather", "search_calendar"]
+actions = ["search_email", "get_weather", "search_calendar"]
 goal = "Synthesize everything into a concise daily orientation."
 
-[morning-briefing.tool_args.search_calendar]
+[morning-briefing.action_args.search_calendar]
 time_min = "{{today}}"
 time_max = "{{tomorrow}}"
 ```
 
-`tool_args` provides per-tool arguments with template expansion at execution time. Non-string values (numbers, booleans) pass through as-is — you can pass any argument a tool or skill accepts.
+`action_args` provides per-action arguments with template expansion at execution time. Non-string values (numbers, booleans) pass through as-is — you can pass any argument a tool or skill accepts.
 
 | Template | Expands to | Example |
 |----------|-----------|---------|
@@ -248,7 +242,7 @@ interval = "2 hours"
 instruction = "Check for new emails and alert about urgent ones."
 ```
 
-Without a `tool` field, the full instruction is passed to the orchestrator which handles everything.
+Without an `action` field, the full instruction is passed to the orchestrator which handles everything.
 
 ### Source of Truth
 

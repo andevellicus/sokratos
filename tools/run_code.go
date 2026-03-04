@@ -24,6 +24,6 @@ func NewRunCode() ToolFunc {
 			return fmt.Sprintf("syntax error: %v", err), nil
 		}
 
-		return ExecuteSkill(ctx, "run_code", a.Code, "", nil, nil)
+		return ExecuteSkill(ctx, "run_code", a.Code, "", nil, SkillDeps{})
 	}
 }

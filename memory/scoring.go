@@ -141,6 +141,7 @@ func submitEnrichment(queueFn WorkQueueFunc, db *pgxpool.Pool, ids []int64, summ
 		MaxTokens:    512,
 		Timeout:      TimeoutQualityEnrich,
 		Retries:      2,
+		Priority:     PriorityNormal,
 		OnComplete: func(raw string, err error) {
 			if err != nil {
 				logger.Log.Warnf("[memory] quality enrichment failed: %v", err)

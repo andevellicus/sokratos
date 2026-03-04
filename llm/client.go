@@ -98,9 +98,11 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 // ChatRequest is the payload sent to the /v1/chat/completions endpoint.
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Grammar  string    `json:"grammar,omitempty"`
+	Model              string         `json:"model"`
+	Messages           []Message      `json:"messages"`
+	MaxTokens          int            `json:"max_tokens,omitempty"`
+	Grammar            string         `json:"grammar,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 // chatResponse is the OpenAI-compatible response from /v1/chat/completions.
@@ -117,7 +119,8 @@ type choice struct {
 
 // ChatResult is the value returned by Chat to callers.
 type ChatResult struct {
-	Message Message
+	Message      Message
+	FinishReason string
 }
 
 // NewClient returns a Client configured to talk to the given LLM server base URL.
@@ -160,12 +163,24 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (ChatResult, error) 
 		return ChatResult{}, fmt.Errorf("llm server returned no choices")
 	}
 
-	return ChatResult{Message: raw.Choices[0].Message}, nil
+	return ChatResult{
+		Message:      raw.Choices[0].Message,
+		FinishReason: raw.Choices[0].FinishReason,
+	}, nil
 }
 
 
 const maxToolRounds = 15
-const defaultMaxToolResultLen = 2000 // truncate individual tool results to stay within context
+const defaultMaxToolResultLen = 8000 // truncate individual tool results to stay within context
+
+// resolveToolResultLen returns the effective max tool result length, respecting
+// the per-session override in opts when set.
+func resolveToolResultLen(opts *QueryOrchestratorOpts) int {
+	if opts != nil && opts.MaxToolResultLen > 0 {
+		return opts.MaxToolResultLen
+	}
+	return defaultMaxToolResultLen
+}
 
 // FallbackDef describes a deterministic fallback tool to invoke when a primary
 // tool fails. ArgsTransform builds new args from the original call context.
@@ -201,6 +216,8 @@ type QueryOrchestratorOpts struct {
 	MaxWebSources      int              // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
 	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
+	OnToolStart func()                          // release slot before tool execution (nil = no-op)
+	OnToolEnd   func(ctx context.Context) error // reacquire slot after tool execution (nil = no-op)
 }
 
 // QueryOrchestrator sends a prompt to the given model, executing tool calls as

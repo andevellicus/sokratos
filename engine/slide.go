@@ -71,9 +71,12 @@ func SlideAndArchiveContext(
 		}
 	}
 
+	// Forced truncation: if neither direction found a safe boundary (every
+	// message is part of a tool-call/result pair), use the naive cutoff
+	// anyway. Splitting a tool pair is better than unbounded context growth.
 	if safeIndex <= 1 {
-		logger.Log.Warnf("[slide] no safe cutoff found (naive=%d, msgs=%d); skipping", naiveCutoff, len(msgs))
-		return
+		logger.Log.Warnf("[slide] no safe cutoff found (naive=%d, msgs=%d); forcing truncation at naive cutoff", naiveCutoff, len(msgs))
+		safeIndex = naiveCutoff
 	}
 
 	// Step 3 — Format archive text from msgs[1:safeIndex].
@@ -214,6 +217,7 @@ func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
 			MaxTokens:    2048,
 			Timeout:      timeouts.Distillation,
 			Retries:      2,
+			Priority:     memory.PriorityHigh,
 			OnComplete: func(raw string, err error) {
 				if err != nil {
 					logger.Log.Warnf("[slide] DTC distillation failed: %v; falling back to subagent", err)
@@ -242,6 +246,7 @@ func distillViaSubagent(deps ArchiveDeps, prompt, archiveText string) {
 			MaxTokens:    2048,
 			Timeout:      timeouts.Distillation,
 			Retries:      2,
+			Priority:     memory.PriorityHigh,
 			OnComplete: func(raw string, err error) {
 				if err != nil {
 					logger.Log.Warnf("[slide] conversation distillation failed: %v; discarding archive", err)
