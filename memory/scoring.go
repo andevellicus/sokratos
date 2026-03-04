@@ -82,12 +82,16 @@ func ScoreAndWrite(ctx context.Context, db *pgxpool.Pool, req MemoryWriteRequest
 
 		for _, ec := range embedded {
 			var id int64
+			var pipelineID interface{}
+			if req.PipelineID != 0 {
+				pipelineID = req.PipelineID
+			}
 			err = db.QueryRow(ctx,
-				`INSERT INTO memories (summary, embedding, salience, tags, memory_type, entities, confidence, source, source_date)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				`INSERT INTO memories (summary, embedding, salience, tags, memory_type, entities, confidence, source, source_date, pipeline_id)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 				 RETURNING id`,
 				ec.Text, pgvector.NewVector(ec.Embedding), req.Salience, req.Tags,
-				memType, []string{}, 1.0, req.Source, req.SourceDate,
+				memType, []string{}, 1.0, req.Source, req.SourceDate, pipelineID,
 			).Scan(&id)
 			if err != nil {
 				return firstID, fmt.Errorf("insert chunk %d failed: %w", i, err)

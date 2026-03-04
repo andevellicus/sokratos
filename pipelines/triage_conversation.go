@@ -125,6 +125,7 @@ type TriageSaveRequest struct {
 	MemoryType    string     // "general" or "email"
 	Source        string     // "conversation" or "email"
 	SourceDate    *time.Time // optional: for email source dates
+	PipelineID    int64      // Telegram message ID of the originating pipeline; 0 = no tracking
 	MaxTriageLen  int        // max chars for triage input (typically 8000)
 	ShouldSave    func(result *triageResult) bool
 }
@@ -187,6 +188,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		MemoryType:    req.MemoryType,
 		Source:        req.Source,
 		SourceDate:    req.SourceDate,
+		PipelineID:    req.PipelineID,
 		EmbedEndpoint: cfg.EmbedEndpoint,
 		EmbedModel:    cfg.EmbedModel,
 	}
@@ -201,6 +203,10 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 
 	logger.Log.Infof("[triage:%s] saved (score=%.0f, category=%s, tags=%v): %s",
 		req.DomainTag, result.SalienceScore, result.Category, tags, result.Summary)
+
+	if hasPreferenceTags(tags) && cfg.DTC != nil && cfg.Pool != nil {
+		go applyPreferenceFastPath(cfg, result.Summary, req.DomainTag)
+	}
 
 	if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {
 		go func() {
@@ -233,8 +239,9 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 // When toolsUsed is true (exchange was grounded by tool results), the threshold
 // is 3. When false (pure parametric knowledge), the threshold is raised to 5
 // to prevent hallucinated facts from entering memory and creating feedback loops.
-// Runs as a fire-and-forget goroutine.
-func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed bool) {
+// pipelineID tags saved memories with the originating Telegram message ID for
+// prefetch isolation. Runs as a fire-and-forget goroutine.
+func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed bool, pipelineID int64) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
 		defer cancel()
@@ -260,6 +267,7 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 			DomainTag:     "conversation",
 			MemoryType:    "general",
 			Source:        "conversation",
+			PipelineID:    pipelineID,
 			MaxTriageLen:  8000,
 			ShouldSave: func(r *triageResult) bool {
 				if r.Save != nil {
@@ -317,4 +325,81 @@ func TriageAndSaveEmailAsync(cfg TriageConfig, email google.Email) {
 			}
 		}
 	}()
+}
+
+// preferenceTagSet is the set of triage tags that indicate user preference/behavior feedback.
+var preferenceTagSet = map[string]struct{}{
+	"preferences":         {},
+	"communication_style": {},
+	"behavior":            {},
+	"response_style":      {},
+}
+
+// hasPreferenceTags returns true if any of the tags match a known preference indicator.
+func hasPreferenceTags(tags []string) bool {
+	for _, t := range tags {
+		if _, ok := preferenceTagSet[t]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// preferenceExtractionGrammar constrains the DTC output to a valid preference trait.
+const preferenceExtractionGrammar = `root ::= "{" ws "\"category\":" ws cat "," ws "\"key\":" ws string "," ws "\"value\":" ws string "," ws "\"context\":" ws string ws "}"
+cat ::= "\"style\"" | "\"preference\""
+string ::= "\"" [^"\\]* "\""
+ws ::= [ \t\n\r]*`
+
+// applyPreferenceFastPath extracts a personality trait from a preference-tagged
+// triage summary and upserts it into personality_traits. Mirrors the paradigm
+// shift fast-path pattern.
+func applyPreferenceFastPath(cfg TriageConfig, summary, domainTag string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	prompt := `Extract one personality trait from this user preference. Return JSON:
+{"category": "style" or "preference", "key": "snake_case_id", "value": "the preference", "context": "original statement"}
+
+- "style" for communication preferences (verbosity, tone, formality, content filtering)
+- "preference" for general preferences (naming, scheduling, workflow)
+- key: brief snake_case identifier (e.g. "hobby_references", "verbosity", "emoji_usage")
+- value: concise description of what the user wants`
+
+	raw, err := cfg.DTC.CompleteNoThinkWithGrammar(ctx, prompt, summary, preferenceExtractionGrammar, 512)
+	if err != nil {
+		logger.Log.Warnf("[triage:%s] preference extraction failed: %v", domainTag, err)
+		return
+	}
+
+	var trait struct {
+		Category string `json:"category"`
+		Key      string `json:"key"`
+		Value    string `json:"value"`
+		Context  string `json:"context"`
+	}
+	if err := json.Unmarshal([]byte(raw), &trait); err != nil {
+		logger.Log.Warnf("[triage:%s] preference parse failed: %v (raw: %s)", domainTag, err, textutil.Truncate(raw, 200))
+		return
+	}
+
+	// Only accept style/preference categories — reject hallucinated ones.
+	if trait.Category != "style" && trait.Category != "preference" {
+		logger.Log.Warnf("[triage:%s] preference extraction returned invalid category %q, skipping", domainTag, trait.Category)
+		return
+	}
+	if trait.Key == "" || trait.Value == "" {
+		logger.Log.Warnf("[triage:%s] preference extraction returned empty key/value, skipping", domainTag)
+		return
+	}
+
+	if _, err := memory.UpsertPersonalityTrait(ctx, cfg.Pool, trait.Category, trait.Key, trait.Value, trait.Context); err != nil {
+		logger.Log.Warnf("[triage:%s] preference upsert failed: %v", domainTag, err)
+		return
+	}
+
+	if cfg.ProfileRefreshFunc != nil {
+		cfg.ProfileRefreshFunc()
+	}
+	logger.Log.Infof("[triage:%s] preference fast-path applied %s/%s: %s", domainTag, trait.Category, trait.Key, trait.Value)
 }

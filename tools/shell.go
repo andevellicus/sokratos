@@ -1,0 +1,274 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"sokratos/logger"
+)
+
+// ShellExec manages shell command execution with an allowlist, workspace
+// constraints, and audit logging.
+type ShellExec struct {
+	mu           sync.RWMutex
+	config       *ShellConfig
+	pool         *pgxpool.Pool
+	workspaceDir string // absolute path
+	configPath   string
+	lastMtime    time.Time
+}
+
+// NewShellExec creates a ShellExec with the given config path and workspace
+// directory. The workspace dir is resolved to an absolute path.
+func NewShellExec(pool *pgxpool.Pool, workspaceDir, configPath string) (*ShellExec, error) {
+	absWorkspace, err := filepath.Abs(workspaceDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace dir: %w", err)
+	}
+
+	cfg, err := LoadShellConfig(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("load shell config: %w", err)
+	}
+
+	se := &ShellExec{
+		config:       cfg,
+		pool:         pool,
+		workspaceDir: absWorkspace,
+		configPath:   configPath,
+	}
+
+	// Record initial mtime.
+	if info, err := os.Stat(configPath); err == nil {
+		se.lastMtime = info.ModTime()
+	}
+
+	logger.Log.Infof("[shell] loaded %d commands from %s (workspace: %s)", len(cfg.Commands), configPath, absWorkspace)
+	return se, nil
+}
+
+// ToolFunc returns the closure for registry registration.
+func (se *ShellExec) ToolFunc() ToolFunc {
+	return func(ctx context.Context, args json.RawMessage) (string, error) {
+		var req struct {
+			Command    string `json:"command"`
+			WorkingDir string `json:"working_dir"`
+		}
+		if err := json.Unmarshal(args, &req); err != nil {
+			return "", Errorf("invalid arguments: %v", err)
+		}
+		if strings.TrimSpace(req.Command) == "" {
+			return "", Errorf("command is required")
+		}
+		return se.execute(ctx, req.Command, req.WorkingDir)
+	}
+}
+
+// SyncIfChanged reloads the config if the file's mtime has changed.
+func (se *ShellExec) SyncIfChanged() {
+	info, err := os.Stat(se.configPath)
+	if err != nil {
+		return
+	}
+	if !info.ModTime().After(se.lastMtime) {
+		return
+	}
+
+	cfg, err := LoadShellConfig(se.configPath)
+	if err != nil {
+		logger.Log.Warnf("[shell] failed to reload config: %v", err)
+		return
+	}
+
+	se.mu.Lock()
+	se.config = cfg
+	se.lastMtime = info.ModTime()
+	se.mu.Unlock()
+
+	logger.Log.Infof("[shell] reloaded config: %d commands", len(cfg.Commands))
+}
+
+// CommandDescriptions returns a summary of available commands for prompt injection.
+func (se *ShellExec) CommandDescriptions() string {
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+	return se.config.CommandDescriptions()
+}
+
+// execute runs a shell command with allowlist checks, workspace constraints,
+// timeout enforcement, and audit logging.
+func (se *ShellExec) execute(ctx context.Context, command, workingDir string) (string, error) {
+	se.mu.RLock()
+	cfg := se.config
+	se.mu.RUnlock()
+
+	// Extract the binary name from the command.
+	binary := extractBinary(command)
+	if binary == "" {
+		return "", Errorf("could not parse command binary")
+	}
+
+	// Allowlist check.
+	if !cfg.IsAllowed(binary) {
+		return fmt.Sprintf("Command %q is not in the allowlist.\n%s", binary, cfg.CommandDescriptions()), nil
+	}
+
+	// Resolve working directory.
+	resolvedDir, err := se.resolveWorkDir(binary, workingDir, cfg)
+	if err != nil {
+		return err.Error(), nil // soft error
+	}
+
+	// Timeout from config.
+	timeout := cfg.ResolvedTimeout(binary)
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// Build command.
+	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command)
+	cmd.Dir = resolvedDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	start := time.Now()
+	runErr := cmd.Run()
+	duration := time.Since(start)
+
+	// Kill process group on context cancellation.
+	if cmdCtx.Err() != nil && cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
+	exitCode := 0
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else if cmdCtx.Err() != nil {
+			// Timeout — return soft error.
+			se.auditAsync(command, resolvedDir, -1, "", runErr.Error(), duration)
+			return fmt.Sprintf("Command timed out after %s (killed).\n\n--- stderr ---\n%s",
+				timeout, truncateOutput(stderr.String(), 500)), nil
+		} else {
+			// exec.Command creation failure — hard error.
+			return "", fmt.Errorf("exec failed: %w", runErr)
+		}
+	}
+
+	// Truncate output.
+	maxOutput := cfg.ResolvedMaxOutput()
+	stdoutStr := truncateOutput(stdout.String(), maxOutput)
+	stderrStr := truncateOutput(stderr.String(), maxOutput)
+
+	// Audit (fire-and-forget).
+	se.auditAsync(command, resolvedDir, exitCode,
+		truncateOutput(stdout.String(), 500),
+		truncateOutput(stderr.String(), 500),
+		duration)
+
+	// Format result.
+	var result strings.Builder
+	fmt.Fprintf(&result, "Exit code: %d | Duration: %s\n", exitCode, duration.Truncate(time.Millisecond))
+
+	if stdoutStr != "" {
+		result.WriteString("\n--- stdout ---\n")
+		result.WriteString(stdoutStr)
+	}
+	if stderrStr != "" {
+		result.WriteString("\n--- stderr ---\n")
+		result.WriteString(stderrStr)
+	}
+
+	if stdoutStr == "" && stderrStr == "" {
+		result.WriteString("\n(no output)")
+	}
+
+	return result.String(), nil
+}
+
+// resolveWorkDir determines the effective working directory for a command.
+func (se *ShellExec) resolveWorkDir(binary, workingDir string, cfg *ShellConfig) (string, error) {
+	wsOnly := cfg.ResolvedWorkspaceOnly(binary)
+
+	if wsOnly {
+		// Workspace-constrained: resolve relative to workspace dir.
+		resolved := se.workspaceDir
+		if workingDir != "" {
+			resolved = filepath.Join(se.workspaceDir, filepath.Clean(workingDir))
+		}
+		// Ensure it stays within workspace (prevent ../ escape).
+		absResolved, err := filepath.Abs(resolved)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve working directory: %v", err)
+		}
+		if !strings.HasPrefix(absResolved, se.workspaceDir) {
+			return "", fmt.Errorf("working directory %q escapes workspace (must be within %s)", workingDir, se.workspaceDir)
+		}
+		return absResolved, nil
+	}
+
+	// Not workspace-constrained.
+	if workingDir == "" {
+		return se.workspaceDir, nil
+	}
+	if filepath.IsAbs(workingDir) {
+		return workingDir, nil
+	}
+	// Relative to CWD.
+	return filepath.Abs(workingDir)
+}
+
+// auditAsync inserts a record into shell_history in a fire-and-forget goroutine.
+func (se *ShellExec) auditAsync(command, workDir string, exitCode int, stdoutPreview, stderrPreview string, duration time.Duration) {
+	if se.pool == nil {
+		return
+	}
+	pool := se.pool
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), TimeoutShellAudit)
+		defer cancel()
+		_, err := pool.Exec(ctx,
+			`INSERT INTO shell_history (command, working_dir, exit_code, stdout_preview, stderr_preview, duration_ms)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			command, workDir, exitCode, stdoutPreview, stderrPreview, duration.Milliseconds())
+		if err != nil {
+			logger.Log.Warnf("[shell] audit insert failed: %v", err)
+		}
+	}()
+}
+
+// extractBinary returns the base name of the first token in a command string.
+// Uses filepath.Base to prevent path traversal (/usr/bin/rm → rm).
+func extractBinary(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return ""
+	}
+	// Split on first whitespace.
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return ""
+	}
+	return filepath.Base(fields[0])
+}
+
+// truncateOutput truncates a string to maxLen characters, appending "..." if truncated.
+func truncateOutput(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "\n... (truncated)"
+}

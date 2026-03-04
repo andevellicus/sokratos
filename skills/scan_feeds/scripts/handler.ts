@@ -69,6 +69,8 @@ interface FeedResult {
 const cfg = skill_config || {};
 const rsshubBase: string = env("RSSHUB_URL") || "http://localhost:1200";
 const FETCH_MULTIPLIER = 4;
+const settings = (cfg as any).settings || {};
+const MAX_AGE_MS = ((settings.max_age_hours as number) || 48) * 60 * 60 * 1000;
 
 // ========================================================================
 // Helpers
@@ -87,6 +89,15 @@ function decodeXmlEntities(s: string): string {
 function extractDomain(url: string): string {
   const m = url.match(/^https?:\/\/(?:www\.)?([^\/]+)/);
   return m ? m[1] : "";
+}
+
+// --- Recency filter ---
+
+function isTooOld(dateStr: string): boolean {
+  if (!dateStr) return false; // no date → fail-open, include it
+  const ts = new Date(dateStr).getTime();
+  if (isNaN(ts)) return false; // unparseable → fail-open
+  return (Date.now() - ts) > MAX_AGE_MS;
 }
 
 // --- Dedup helpers (per-feed, persisted via kv_store) ---
@@ -309,6 +320,9 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
   // ========================================================================
 
   const allItems: FeedItem[] = [];
+  // Track new URLs per feed — deferred until after delegation so items
+  // the LLM never surfaces don't get permanently marked seen.
+  const pendingSeen: Record<string, { seenList: string[]; newUrls: string[] }> = {};
 
   for (const feed of feeds) {
     const count = globalCount || feed.count || 5;
@@ -316,9 +330,11 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
     const seenMap: Record<string, boolean> = {};
     for (const s of seenList) seenMap[s] = true;
     const newUrls: string[] = [];
+    pendingSeen[feed.name] = { seenList, newUrls };
 
     function addItem(url: string, title: string, summary: string, source: string, date: string): boolean {
       if (!url || seenMap[url]) return false;
+      if (isTooOld(date)) return false;
       seenMap[url] = true;
       newUrls.push(url);
       allItems.push({
@@ -388,9 +404,6 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
       }
     }
 
-    if (newUrls.length > 0) {
-      saveSeen(feed.name, seenList.concat(newUrls));
-    }
   }
 
   if (allItems.length === 0) return JSON.stringify({ count: 0, sources: [] });
@@ -454,8 +467,14 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
       );
       entry.summary = fallback.join("\n");
       entry.error = r.error;
+      // Don't mark seen — delegate failed, items can be retried next run.
     } else {
       entry.summary = r.result;
+      // Delegate succeeded — mark all items from this feed as seen.
+      const ps = pendingSeen[feedName];
+      if (ps && ps.newUrls.length > 0) {
+        saveSeen(feedName, ps.seenList.concat(ps.newUrls));
+      }
     }
     feedResults.push(entry);
   }

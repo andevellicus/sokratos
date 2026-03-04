@@ -159,8 +159,17 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 		)
 	}
 
-	// Prepend routine mode preamble for focused execution context.
-	prompt = strings.TrimSpace(prompts.RoutineMode) + "\n\n" + prompt
+	// Prepend routine mode preamble and user preferences for focused execution context.
+	preamble := strings.TrimSpace(prompts.RoutineMode)
+	if prefs := e.SM.GetState().UserPrefs; len(prefs) > 0 {
+		var pb strings.Builder
+		pb.WriteString("\n\nUser preferences (highest priority — override general rules):\n")
+		for k, v := range prefs {
+			fmt.Fprintf(&pb, "- %s: %s\n", k, v)
+		}
+		preamble += pb.String()
+	}
+	prompt = preamble + "\n\n" + prompt
 
 	reply, _, err := e.runOrchestrator(ctx, false, prompt, nil)
 

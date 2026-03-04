@@ -64,6 +64,7 @@ type MemoryWriteRequest struct {
 	MemoryType    string     // "general", "fact", "preference", "event", "email", "calendar"
 	Source        string     // provenance: "conversation", "email", "calendar", "user", "backfill", "conversation_archive"
 	SourceDate    *time.Time // original date of the source item (email sent date, event start, etc.)
+	PipelineID    int64      // Telegram message ID of the originating pipeline; 0 = no tracking
 	EmbedEndpoint string
 	EmbedModel    string
 }

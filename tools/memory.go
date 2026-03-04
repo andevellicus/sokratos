@@ -22,12 +22,31 @@ import (
 
 // --- Search tool ---
 
+// FlexibleStringSlice accepts both a JSON string ("email") and an array
+// (["email"]) during unmarshalling. LLMs frequently emit a bare string
+// instead of a single-element array for the tags field.
+type FlexibleStringSlice []string
+
+func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*f = arr
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	*f = []string{s}
+	return nil
+}
+
 type searchMemoryArgs struct {
-	Query      string   `json:"query"`
-	Tags       []string `json:"tags,omitempty"`
-	StartDate  string   `json:"start_date,omitempty"` // ISO8601
-	EndDate    string   `json:"end_date,omitempty"`   // ISO8601
-	MemoryType string   `json:"memory_type,omitempty"`
+	Query      string              `json:"query"`
+	Tags       FlexibleStringSlice `json:"tags,omitempty"`
+	StartDate  string              `json:"start_date,omitempty"` // ISO8601
+	EndDate    string              `json:"end_date,omitempty"`   // ISO8601
+	MemoryType string              `json:"memory_type,omitempty"`
 }
 
 const rewriteSystemPrompt = `You are a search query optimizer for a personal memory database. Given the user's query, output exactly 3 alternative search queries that would help retrieve relevant memories.
@@ -159,7 +178,7 @@ func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 	}
 	var a searchMemoryArgs
 	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("invalid arguments: %w", err)
+		return fmt.Sprintf("invalid arguments: %v", err), nil
 	}
 	if strings.TrimSpace(a.Query) == "" {
 		return "", fmt.Errorf("query must not be empty")
@@ -372,11 +391,11 @@ func trackRetrieval(pool *pgxpool.Pool, ids []int64) {
 // --- Save tool (async) ---
 
 type saveMemoryArgs struct {
-	Summary       string   `json:"summary"`
-	Tags          []string `json:"tags"`
-	Category      string   `json:"category"`              // prepended to tags
-	SalienceScore *int     `json:"salience_score"`        // 0-10 integer scale
-	MemoryType    string   `json:"memory_type,omitempty"` // general, fact, preference, event
+	Summary       string              `json:"summary"`
+	Tags          FlexibleStringSlice `json:"tags"`
+	Category      string              `json:"category"`              // prepended to tags
+	SalienceScore *int                `json:"salience_score"`        // 0-10 integer scale
+	MemoryType    string              `json:"memory_type,omitempty"` // general, fact, preference, event
 }
 
 // effectiveSalience returns the salience on the 0-10 scale, defaulting to 5.

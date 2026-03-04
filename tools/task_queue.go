@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,6 +39,12 @@ func NewAddTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 				return fmt.Sprintf("invalid due_at (expected RFC3339): %v", err), nil
 			}
 			dueAt = &t
+		}
+
+		// Normalize falsy recur values that LLMs commonly emit.
+		switch strings.ToLower(a.Recur) {
+		case "false", "no", "none", "0":
+			a.Recur = ""
 		}
 
 		if a.Recur != "" {

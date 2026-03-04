@@ -59,6 +59,9 @@ CREATE INDEX IF NOT EXISTS memories_source_idx ON memories (source);
 ALTER TABLE memories
 ADD COLUMN IF NOT EXISTS source_date TIMESTAMPTZ;
 
+ALTER TABLE memories
+ADD COLUMN IF NOT EXISTS pipeline_id BIGINT;
+
 CREATE INDEX IF NOT EXISTS memories_source_date_idx ON memories (source_date);
 
 -- Stored generated column + GIN index for full-text search on summary.
@@ -146,7 +149,7 @@ CREATE TABLE IF NOT EXISTS processed_events (
     seen_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Routine seed data removed: routines.toml is the source of truth.
+-- Routine seed data removed: .config/routines.toml is the source of truth.
 -- SyncFromFile() on startup upserts all TOML entries and deletes any DB
 -- routines not present in the file.
 
@@ -210,3 +213,15 @@ CREATE TABLE IF NOT EXISTS skill_kv (
     updated_at TIMESTAMPTZ DEFAULT now(),
     PRIMARY KEY (skill_name, key)
 );
+
+CREATE TABLE IF NOT EXISTS shell_history (
+    id BIGSERIAL PRIMARY KEY,
+    command TEXT NOT NULL,
+    working_dir TEXT NOT NULL,
+    exit_code INT,
+    stdout_preview TEXT,
+    stderr_preview TEXT,
+    duration_ms INT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS shell_history_created_idx ON shell_history (created_at DESC);

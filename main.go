@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -273,6 +274,7 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		ProcessedEventsTTLDays: cfg.ProcessedEventsTTLDays,
 		FailedOpsTTLDays:       cfg.FailedOpsTTLDays,
 		SkillKVTTLDays:         cfg.SkillKVTTLDays,
+		ShellHistoryTTLDays:    cfg.ShellHistoryTTLDays,
 		SendFunc: func(text string) {
 			for id := range cfg.AllowedIDs {
 				msg := tgbotapi.NewMessage(id, mdToTelegramHTML(text))
@@ -325,7 +327,7 @@ func runStartupTasks() {
 	migrateTasksTable()
 
 	// Sync routines from TOML file → DB (TOML is source of truth).
-	routines.SyncFromFile(db.Pool, "routines.toml")
+	routines.SyncFromFile(db.Pool, ".config/routines.toml")
 
 	// Cleanup and initial consolidation are now deferred to OnFirstTick in
 	// the engine, so Qwen3.5-27B is free for interactive requests during startup.
@@ -399,6 +401,14 @@ func main() {
 
 	memory.MaxSupersededProfiles = cfg.MaxSupersededProfiles
 
+	// Ensure workspace directory exists.
+	if err := os.MkdirAll(cfg.WorkspaceDir, 0755); err != nil {
+		logger.Log.Fatalf("Failed to create workspace directory %q: %v", cfg.WorkspaceDir, err)
+	}
+	if absWs, err := filepath.Abs(cfg.WorkspaceDir); err == nil {
+		logger.Log.Infof("[startup] workspace directory: %s", absWs)
+	}
+
 	svc := initServices(cfg)
 	defer db.Close()
 
@@ -410,7 +420,7 @@ func main() {
 		logger.Log.Warnf("Calendar init failed: %v — Calendar features disabled", err)
 	}
 
-	registry, emailTriageCfg, delegateConfig := registerTools(cfg, svc)
+	registry, emailTriageCfg, delegateConfig, shellExec := registerTools(cfg, svc)
 
 	// Wire proactive auth-error notification: when any Google API call fails
 	// due to an expired/revoked token, notify the user once via Telegram.
@@ -543,7 +553,7 @@ func main() {
 
 		// Update delegate_task's grammar and allowed-tools to include skills.
 		if delegateConfig != nil {
-			delegatable := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url"}
+			delegatable := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url", "run_command"}
 			for _, s := range registry.Schemas() {
 				if s.IsSkill {
 					delegatable = append(delegatable, s.Name)
@@ -562,14 +572,17 @@ func main() {
 	rebuildGrammar() // include disk-loaded skills + plan tools in grammar
 
 	// Wire hot-reload: skills sync on heartbeat tick, routines sync on
-	// the independent routine scheduler tick.
+	// the independent routine scheduler tick. Shell config also syncs on heartbeat.
 	skillMtimes := map[string]time.Time{}
 	eng.SyncFunc = func() {
 		tools.SyncSkills(registry, "skills", rebuildGrammar, skillMtimes, skillDeps)
+		if shellExec != nil {
+			shellExec.SyncIfChanged()
+		}
 	}
 	var routineMtime time.Time
 	eng.RoutineSyncFunc = func() {
-		routines.SyncIfChanged(db.Pool, "routines.toml", &routineMtime)
+		routines.SyncIfChanged(db.Pool, ".config/routines.toml", &routineMtime)
 	}
 
 	// Wire reflection routing: inject reflection insights into conversation context.

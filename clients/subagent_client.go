@@ -107,6 +107,7 @@ type requestOpts struct {
 	grammar   string
 	maxTokens int
 	tryOnly   bool // non-blocking acquire
+	thinking  bool // enable_thinking + reasoning_format="deepseek"
 }
 
 // exec is the single internal method that all public methods delegate to.
@@ -141,16 +142,20 @@ func (sc *SubagentClient) exec(ctx context.Context, opts requestOpts) (string, e
 		}
 	}
 
-	body, err := json.Marshal(chatRequest{
+	req := chatRequest{
 		Model:       sc.Model,
 		Messages:    msgs,
 		Temperature: 0.1,
 		MaxTokens:   opts.maxTokens,
 		Grammar:     opts.grammar,
 		ChatTemplateKwargs: map[string]any{
-			"enable_thinking": false,
+			"enable_thinking": opts.thinking,
 		},
-	})
+	}
+	if opts.thinking {
+		req.ReasoningFormat = "deepseek"
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
@@ -191,6 +196,18 @@ func (sc *SubagentClient) CompleteWithGrammar(ctx context.Context, systemPrompt,
 // constraint. Returns immediately with an error if all slots are occupied.
 func (sc *SubagentClient) TryCompleteWithGrammar(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error) {
 	return sc.exec(ctx, requestOpts{system: systemPrompt, user: userContent, grammar: grammar, maxTokens: maxTokens, tryOnly: true})
+}
+
+// TryCompleteWithGrammarThinking is like TryCompleteWithGrammar but enables
+// chain-of-thought reasoning (thinking tokens go into reasoning_content,
+// grammar applies only to content tokens). Returns immediately if all slots
+// are occupied.
+func (sc *SubagentClient) TryCompleteWithGrammarThinking(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error) {
+	return sc.exec(ctx, requestOpts{
+		system: systemPrompt, user: userContent,
+		grammar: grammar, maxTokens: maxTokens,
+		tryOnly: true, thinking: true,
+	})
 }
 
 // CompleteMultiTurnWithGrammar sends a full message array (for multi-turn tool

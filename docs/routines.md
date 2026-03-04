@@ -1,6 +1,6 @@
 # Routine System
 
-Routines are persistent background habits that execute autonomously during the heartbeat loop. They are defined in `routines.toml` (source of truth), synced to PostgreSQL (runtime cache), and managed by the `routines/` package.
+Routines are persistent background habits that execute autonomously during the heartbeat loop. They are defined in `.config/routines.toml` (source of truth), synced to PostgreSQL (runtime cache), and managed by the `routines/` package.
 
 ---
 
@@ -123,7 +123,7 @@ Both triggers are allowed on the same routine. `QueryDue()` returns the routine 
 Routines run on their own independent scheduler (`runRoutineScheduler`), decoupled from the heartbeat loop. The routine scheduler polls at `ROUTINE_INTERVAL` (default 30s), giving routines much better time precision than the heartbeat interval (default 5m).
 
 1. **`runRoutineScheduler()`** ticks at `RoutineInterval` (default 30s)
-   - Calls `RoutineSyncFunc()` to hot-reload `routines.toml` (mtime-based, very fast)
+   - Calls `RoutineSyncFunc()` to hot-reload `.config/routines.toml` (mtime-based, very fast)
    - Calls `executeDueRoutines()`
 2. **`executeDueRoutines()`** calls `routines.QueryDue(pool)` which:
    - Queries routines where interval has elapsed OR schedule is non-null
@@ -145,7 +145,7 @@ Routines run on their own independent scheduler (`runRoutineScheduler`), decoupl
 ### 1. Startup
 
 ```go
-routines.SyncFromFile(db.Pool, "routines.toml")
+routines.SyncFromFile(db.Pool, ".config/routines.toml")
 ```
 
 Full sync: reads TOML, upserts all entries, deletes DB routines not in the file. TOML is the source of truth.
@@ -153,7 +153,7 @@ Full sync: reads TOML, upserts all entries, deletes DB routines not in the file.
 ### 2. Heartbeat (mtime-based)
 
 ```go
-routines.SyncIfChanged(db.Pool, "routines.toml", &routineMtime)
+routines.SyncIfChanged(db.Pool, ".config/routines.toml", &routineMtime)
 ```
 
 Checks file mtime on each heartbeat tick. If changed, triggers a full `SyncFromFile`.
@@ -161,14 +161,14 @@ Checks file mtime on each heartbeat tick. If changed, triggers a full `SyncFromF
 ### 3. `/reload` Command
 
 ```go
-routines.SyncFromFile(db.Pool, "routines.toml")
+routines.SyncFromFile(db.Pool, ".config/routines.toml")
 ```
 
 Telegram command that forces immediate sync (plus skill hot-reload).
 
 ### 4. `manage_routines` Tool (write-back)
 
-The orchestrator can create/update/delete routines via the `manage_routines` tool. Changes are written to both the DB and `routines.toml` via `routines.FileWriter`.
+The orchestrator can create/update/delete routines via the `manage_routines` tool. Changes are written to both the DB and `.config/routines.toml` via `routines.FileWriter`.
 
 ---
 

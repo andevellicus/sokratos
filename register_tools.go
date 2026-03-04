@@ -56,7 +56,7 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 		Description: "Mark current task done, advance queue",
 		Params:      []tools.ParamSchema{{Name: "task_id", Type: "number", Required: false}},
 	})
-	registry.Register("manage_routines", tools.NewManageRoutines(pool, &routines.FileAdapter{Path: "routines.toml"}), tools.ToolSchema{
+	registry.Register("manage_routines", tools.NewManageRoutines(pool, &routines.FileAdapter{Path: ".config/routines.toml"}), tools.ToolSchema{
 		Name:        "manage_routines",
 		Description: "Create, update, or delete autonomous routines",
 		Params: []tools.ParamSchema{
@@ -96,7 +96,7 @@ func registerDelegateTask(registry *tools.Registry, subagent *clients.SubagentCl
 	if subagent == nil {
 		return nil
 	}
-	coreTools := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url"}
+	coreTools := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url", "run_command"}
 	schemas := registry.SchemasForTools(coreTools)
 	g := grammar.BuildSubagentToolGrammar(schemas)
 	dc := tools.NewDelegateConfig(coreTools, g)
@@ -193,7 +193,7 @@ func collectInternalHosts(cfg *config.AppConfig) []string {
 	return hosts
 }
 
-func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, *pipelines.TriageConfig, *tools.DelegateConfig) {
+func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, *pipelines.TriageConfig, *tools.DelegateConfig, *tools.ShellExec) {
 	registry := tools.NewRegistry()
 
 	registerCoreTools(registry, svc.StateMgr)
@@ -259,10 +259,13 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 		},
 	})
 
+	// Register shell command tool.
+	shellExec := registerShellTool(registry, db.Pool, cfg)
+
 	// Register delegate_task after all delegatable tools are available.
 	delegateConfig := registerDelegateTask(registry, svc.Subagent)
 
-	return registry, emailTriageCfg, delegateConfig
+	return registry, emailTriageCfg, delegateConfig, shellExec
 }
 
 // registerGmailTools registers tools for searching and interacting with Gmail.
@@ -318,6 +321,23 @@ func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
 			{Name: "attendees", Type: "array", Required: false},
 		},
 	})
+}
+
+func registerShellTool(registry *tools.Registry, pool *pgxpool.Pool, cfg *config.AppConfig) *tools.ShellExec {
+	se, err := tools.NewShellExec(pool, cfg.WorkspaceDir, ".config/shell.toml")
+	if err != nil {
+		logger.Log.Warnf("[startup] shell tool disabled: %v", err)
+		return nil
+	}
+	registry.Register("run_command", se.ToolFunc(), tools.ToolSchema{
+		Name:        "run_command",
+		Description: "Execute an allowlisted shell command (audited). " + se.CommandDescriptions(),
+		Params: []tools.ParamSchema{
+			{Name: "command", Type: "string", Required: true},
+			{Name: "working_dir", Type: "string", Required: false},
+		},
+	})
+	return se
 }
 
 func registerWebTools(registry *tools.Registry, searxngURL string) {

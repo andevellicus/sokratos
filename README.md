@@ -162,7 +162,7 @@ The orchestrator has access to the following built-in tools:
 | `read_url` | Fetch and extract content from a web page |
 | `run_code` | Execute JavaScript code in a sandboxed goja runtime |
 | `add_task` / `complete_task` | Manage scheduled tasks with recurrence |
-| `manage_routines` | Create persistent background habits with action args and templates — syncs to `routines.toml` |
+| `manage_routines` | Create persistent background habits with action args and templates — syncs to `.config/routines.toml` |
 | `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
@@ -215,7 +215,7 @@ In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (H
 
 ## Routines
 
-Routines are persistent background habits defined in `routines.toml` and synced to PostgreSQL. They execute during the heartbeat loop when their trigger fires. All routine logic lives in the `routines/` package.
+Routines are persistent background habits defined in `.config/routines.toml` and synced to PostgreSQL. They execute during the heartbeat loop when their trigger fires. All routine logic lives in the `routines/` package.
 
 ### Structured Format (preferred)
 
@@ -274,15 +274,15 @@ Without an `action` field, the full instruction is passed to the orchestrator wh
 
 ### Source of Truth
 
-`routines.toml` is the source of truth. The database is a runtime cache. Three sync paths keep them aligned:
+`.config/routines.toml` is the source of truth. The database is a runtime cache. Three sync paths keep them aligned:
 
 1. **Startup** — `routines.SyncFromFile()` does a full sync (upsert all TOML entries, delete DB entries not in the file)
 2. **Heartbeat** — mtime-based incremental check on each tick; re-syncs if the file was modified
 3. **`/reload`** — Telegram command that forces an immediate full sync of both routines and skills
 
-Changes made via the `manage_routines` tool are written back to `routines.toml`.
+Changes made via the `manage_routines` tool are written back to `.config/routines.toml`.
 
-See `routines.toml.example` for more examples.
+See `.config/routines.toml.example` for more examples.
 
 ## Project Structure
 
@@ -361,7 +361,7 @@ sokratos/
     <name>/SKILL.md    # Frontmatter manifest (name, description, parameters)
     <name>/scripts/handler.ts  # Skill source code (TS preferred, JS fallback)
     <name>/config.toml # Optional TOML config (injected as skill_config)
-  routines.toml        # Routine definitions (synced bidirectionally with DB)
+  .config/routines.toml  # Routine definitions (synced bidirectionally with DB)
   timeouts/            # Shared timeout constants (DB, embedding, synthesis, save)
   timefmt/             # Centralized time formatting constants and helpers
   models/              # GGUF model files and start.sh

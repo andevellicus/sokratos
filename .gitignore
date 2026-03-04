@@ -1,6 +1,7 @@
 logs/
 models/
 .claude/
+workspace/
 
 .env
 *.toml

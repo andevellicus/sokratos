@@ -67,7 +67,7 @@ func ConsultDeepThinker(ctx context.Context, args json.RawMessage, dtc *clients.
 	var initialCtx string
 	var allIDs []int64
 	if pool != nil && embedURL != "" {
-		if pf := memory.Prefetch(ctx, pool, embedURL, embedModel, a.ProblemStatement, a.ProblemStatement, 3); pf != nil {
+		if pf := memory.Prefetch(ctx, pool, embedURL, embedModel, a.ProblemStatement, a.ProblemStatement, 3, 0); pf != nil {
 			initialCtx = pf.Content
 			allIDs = pf.IDs
 		}
@@ -102,7 +102,7 @@ func ConsultDeepThinker(ctx context.Context, args json.RawMessage, dtc *clients.
 			break
 		}
 
-		pf := memory.Prefetch(ctx, pool, embedURL, embedModel, query, query, 5)
+		pf := memory.Prefetch(ctx, pool, embedURL, embedModel, query, query, 5, 0)
 		if pf == nil {
 			logger.Log.Debugf("[dtc] search round %d: query=%q returned no results", round+1, query)
 			break

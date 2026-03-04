@@ -30,6 +30,10 @@ A lasting fact is something that would still be true and useful weeks or months 
 - Questions the user asked without revealing personal information
 - Transient requests ("set a timer", "what's the weather", "summarize this")
 - The assistant's reasoning or chain of thought
+- **Inferred life events**: NEVER conclude that someone died, became ill, divorced,
+  moved, or experienced any major life event unless the user EXPLICITLY stated it
+  in their own words. Calendar event titles, assistant speculation, and contextual
+  clues are NOT evidence. If the user did not say it directly, do not produce it.
 
 ## Ruthless filter
 

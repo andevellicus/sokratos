@@ -52,6 +52,7 @@ func (e *Engine) runMaintenanceIfDue() {
 		{"processed_events", `DELETE FROM processed_events WHERE seen_at < now() - ($1 || ' days')::interval`, e.ProcessedEventsTTLDays},
 		{"failed_operations", `DELETE FROM failed_operations WHERE created_at < now() - ($1 || ' days')::interval`, e.FailedOpsTTLDays},
 		{"skill_kv", `DELETE FROM skill_kv WHERE updated_at < now() - ($1 || ' days')::interval`, e.SkillKVTTLDays},
+		{"shell_history", `DELETE FROM shell_history WHERE created_at < now() - ($1 || ' days')::interval`, e.ShellHistoryTTLDays},
 	} {
 		if pq.days <= 0 {
 			continue

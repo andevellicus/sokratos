@@ -82,6 +82,7 @@ type Engine struct {
 	ProcessedEventsTTLDays int           // prune calendar event dedup entries older than this (0 = disabled)
 	FailedOpsTTLDays       int           // prune failed operation logs older than this (0 = disabled)
 	SkillKVTTLDays         int           // prune skill KV entries older than this (0 = disabled)
+	ShellHistoryTTLDays    int           // prune shell history entries older than this (0 = disabled)
 	SendFunc            func(text string)    // sends a message to the user via Telegram
 	InterruptChan       chan struct{}        // signals the task scheduler to recalculate
 	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)

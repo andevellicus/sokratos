@@ -313,7 +313,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 		return "", fmt.Errorf("write identity profile: %w", err)
 	}
 
-	// Seed default routines (structured format matching routines.toml schema).
+	// Seed default routines (structured format matching .config/routines.toml schema).
 	defaultRoutines := []struct {
 		Name          string
 		Interval      string

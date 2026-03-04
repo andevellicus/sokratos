@@ -57,6 +57,7 @@ type StateManager struct {
 	pool             *pgxpool.Pool // nil when running without database
 	messages         []llm.Message // conversation context (persisted via snapshot)
 	lastUserActivity time.Time     // last time a user message was received
+	lastPipelineID   int64         // Telegram message ID of the last completed interactive pipeline
 }
 
 // NewStateManager creates a StateManager. If pool is non-nil, it loads user
@@ -224,6 +225,26 @@ func (sm *StateManager) LastUserActivity() time.Time {
 	defer sm.mu.RUnlock()
 
 	return sm.lastUserActivity
+}
+
+// SetLastPipelineID records the Telegram message ID of the most recently
+// completed interactive pipeline. Async work (distillation, triage) from
+// this pipeline tags saved memories with this ID so the next prefetch can
+// exclude them.
+func (sm *StateManager) SetLastPipelineID(id int64) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.lastPipelineID = id
+}
+
+// LastPipelineID returns the Telegram message ID of the last completed
+// interactive pipeline.
+func (sm *StateManager) LastPipelineID() int64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	return sm.lastPipelineID
 }
 
 // SlideMessages atomically removes messages[1:cutoff] from the conversation

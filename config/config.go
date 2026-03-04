@@ -53,6 +53,9 @@ type AppConfig struct {
 	FailedOpsTTLDays          int
 	SkillKVTTLDays            int
 	ReflectionMemoryThreshold int
+	ShellHistoryTTLDays       int
+
+	WorkspaceDir string
 
 	MaintenanceInterval   time.Duration
 	DBMaxConns            int
@@ -117,6 +120,9 @@ func Load() *AppConfig {
 		FailedOpsTTLDays:          EnvInt("FAILED_OPS_TTL_DAYS", 30),
 		SkillKVTTLDays:            EnvInt("SKILL_KV_TTL_DAYS", 90),
 		ReflectionMemoryThreshold: EnvInt("REFLECTION_MEMORY_THRESHOLD", 50),
+		ShellHistoryTTLDays:       EnvInt("SHELL_HISTORY_TTL_DAYS", 30),
+
+		WorkspaceDir: EnvString("WORKSPACE_DIR", "workspace"),
 
 		MaintenanceInterval:   EnvDuration("MAINTENANCE_INTERVAL", 30*time.Minute),
 		DBMaxConns:            EnvInt("DB_MAX_CONNS", 20),

@@ -145,6 +145,8 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 
 	// Entity-based contradiction lookup: find memories sharing entities but
 	// not already found by embedding similarity. Uses the GIN index on entities.
+	// These candidates get their own contradiction check since the embedding-based
+	// check (above) has already completed.
 	if len(entities) > 0 {
 		existingIDs := make([]int64, len(candidates))
 		for i, c := range candidates {
@@ -163,14 +165,48 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 		if entityErr != nil {
 			logger.Log.Warnf("[memory] entity-based contradiction search failed: %v", entityErr)
 		} else {
+			var entityCandidates []contradictionCandidate
 			for entityRows.Next() {
 				var c contradictionCandidate
 				if err := entityRows.Scan(&c.ID, &c.Summary); err != nil {
 					continue
 				}
-				candidates = append(candidates, c)
+				entityCandidates = append(entityCandidates, c)
 			}
 			entityRows.Close()
+
+			// Run contradiction check on entity-found candidates.
+			if bgGrammarFn != nil && len(entityCandidates) > 0 {
+				summaryForComparison := req.Summary
+				if idx := strings.Index(summaryForComparison, "\n\nSource exchange:\n"); idx >= 0 {
+					summaryForComparison = summaryForComparison[:idx]
+				}
+				var promptBuilder strings.Builder
+				fmt.Fprintf(&promptBuilder, "NEW: %s\n", summaryForComparison)
+				for i, c := range entityCandidates {
+					fmt.Fprintf(&promptBuilder, "EXISTING_%d: %s\n", i+1, c.Summary)
+				}
+				checkCtx, cancel := context.WithTimeout(context.Background(), TimeoutContradictionCheck)
+				raw, gErr := bgGrammarFn(checkCtx, contradictionSystemPrompt, promptBuilder.String(), "")
+				cancel()
+				if gErr != nil {
+					logger.Log.Warnf("[memory] entity-based contradiction check deferred (busy): %v", gErr)
+					// Queue deferred check — entityCandidates will be included via candidates below.
+				} else {
+					for i, c := range entityCandidates {
+						tag := fmt.Sprintf("EXISTING_%d:", i+1)
+						for _, line := range strings.Split(raw, "\n") {
+							line = strings.TrimSpace(strings.ToUpper(line))
+							if strings.HasPrefix(line, strings.ToUpper(tag)) && strings.Contains(line, "CONTRADICTS") {
+								logger.Log.Infof("[memory] entity-found memory contradicts id=%d, will supersede", c.ID)
+								supersededIDs = append(supersededIDs, c.ID)
+								break
+							}
+						}
+					}
+				}
+			}
+			candidates = append(candidates, entityCandidates...)
 		}
 	}
 

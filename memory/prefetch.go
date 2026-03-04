@@ -22,8 +22,10 @@ type PrefetchResult struct {
 
 // Prefetch embeds the given query, retrieves semantically similar memories
 // using the hybrid ranking function, and formats them as an XML context block.
+// When excludePipelineID is non-zero, memories tagged with that pipeline are
+// excluded to prevent context bleed from async distillation/triage.
 // Returns nil if embedding fails or no memories match.
-func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, query, fulltext string, limit int) *PrefetchResult {
+func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, query, fulltext string, limit int, excludePipelineID int64) *PrefetchResult {
 	emb, err := GetEmbedding(ctx, embedURL, embedModel, query)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -36,10 +38,11 @@ func Prefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, que
 		`SELECT id, summary, created_at
 		 FROM memories
 		 WHERE superseded_by IS NULL
-		   AND memory_type NOT IN (` + FormatSQLExclusion(ExcludeInternal) + `)
+		   AND memory_type NOT IN (`+FormatSQLExclusion(ExcludeInternal)+`)
+		   AND ($3::bigint = 0 OR pipeline_id IS NULL OR pipeline_id != $3)
 		 ORDER BY `+RankingOrderBy(1, 2)+`
 		 LIMIT `+fmt.Sprintf("%d", limit),
-		pgvector.NewVector(emb), fulltext,
+		pgvector.NewVector(emb), fulltext, excludePipelineID,
 	)
 	if err != nil {
 		logger.Log.Warnf("[prefetch] db error: %v", err)

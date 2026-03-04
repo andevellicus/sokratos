@@ -60,7 +60,7 @@ type dispatchContext struct {
 // handleReload forces a full re-sync of routines.toml and skills from disk.
 // Returns a human-readable summary of what changed.
 func handleReload(mc messageContext) string {
-	added, updated, deleted := routines.SyncFromFile(db.Pool, "routines.toml")
+	added, updated, deleted := routines.SyncFromFile(db.Pool, ".config/routines.toml")
 	skillsChanged := tools.SyncSkills(mc.registry, "skills", mc.rebuildGrammar, mc.skillMtimes, mc.skillDeps)
 	var parts []string
 	if len(added)+len(updated)+len(deleted) > 0 {
@@ -195,6 +195,10 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 	typingCtx, typingCancel := context.WithCancel(context.Background())
 	go sendTypingPeriodically(mc.svc.Bot, chatID, typingCtx)
 
+	// Phase 0: Pipeline isolation — tag this message and exclude prior pipeline's memories.
+	pipelineID := int64(msg.MessageID)
+	excludePipelineID := mc.svc.StateMgr.LastPipelineID()
+
 	// Phase 1: Snapshot history (StateManager has its own RWMutex).
 	history := mc.svc.StateMgr.ReadMessages()
 
@@ -204,7 +208,7 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 	var prefetchSummaries string
 	if db.Pool != nil && mc.cfg.EmbedURL != "" && strings.TrimSpace(msgText) != "" {
 		pfCtx, pfCancel := context.WithTimeout(context.Background(), tools.TimeoutPrefetch)
-		if pf := subconsciousPrefetch(pfCtx, db.Pool, mc.cfg.EmbedURL, mc.cfg.EmbedModel, msgText, history); pf != nil {
+		if pf := subconsciousPrefetch(pfCtx, db.Pool, mc.cfg.EmbedURL, mc.cfg.EmbedModel, msgText, history, excludePipelineID); pf != nil {
 			prefetchContent = pf.Summaries
 			prefetchIDs = pf.IDs
 			prefetchSummaries = pf.Summaries
@@ -246,9 +250,17 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		typingCancel()
 		return
 	}
-	// Send 9B ack to user immediately (latency win).
+	// Send a brief ack to the user immediately so they know the message
+	// was received while the Brain works. Use a fixed placeholder instead
+	// of the triage model's ack to avoid sending what looks like a
+	// substantive answer before the Brain's real reply arrives.
 	if dispatchAck != "" {
-		sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(dispatchAck))
+		ackText := "One moment..."
+		if _, ackErr := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(ackText)); ackErr != nil {
+			logger.Log.Warnf("[dispatch] ack send failed: %v", ackErr)
+		} else {
+			logger.Log.Debugf("[dispatch] ack sent for escalation: %q (triage wanted: %q)", ackText, textutil.Truncate(dispatchAck, 60))
+		}
 	}
 	if escalation != nil {
 		userPrompt += fmt.Sprintf("\n\n<escalation_context>\nA lightweight dispatch was attempted but failed.\nTool: %s\nPhase: %s\nError: %s\nDo NOT retry the same call with the same parameters. Try a different approach or explain the issue.\n</escalation_context>",
@@ -299,6 +311,7 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		MsgText:           msgText,
 		PrefetchIDs:       prefetchIDs,
 		PrefetchSummaries: prefetchSummaries,
+		PipelineID:        pipelineID,
 		Err:               err,
 	})
 }
@@ -317,6 +330,7 @@ type messageResult struct {
 	MsgText           string        // original user message text
 	PrefetchIDs       []int64       // memory IDs from prefetch
 	PrefetchSummaries string        // memory summaries from prefetch
+	PipelineID        int64         // Telegram message ID for memory isolation
 	Err               error         // LLM/execution error (nil on success)
 }
 
@@ -335,13 +349,19 @@ func completeMessageHandling(mc messageContext, msg *tgbotapi.Message, chatID in
 			DB: db.Pool, EmbedEndpoint: mc.cfg.EmbedURL, EmbedModel: mc.cfg.EmbedModel,
 			DTCQueueFn: mc.svc.DTCQueueFunc, SubagentFn: mc.svc.SubagentFunc,
 			GrammarFn: mc.svc.GrammarFunc, BgGrammarFn: mc.svc.BgGrammarFunc, QueueFn: mc.svc.QueueFunc,
+			PipelineID: mr.PipelineID,
 		})
 	}
 
 	// Triage and save conversation.
 	if mr.Err == nil && db.Pool != nil && mc.cfg.EmbedURL != "" && mc.svc.DTC != nil && mc.emailTriageCfg != nil {
 		exchange := mr.ToolContext + fmt.Sprintf("user: %s\nassistant: %s", mr.MsgText, mr.Reply)
-		pipelines.TriageAndSaveConversationAsync(*mc.emailTriageCfg, exchange, mr.ToolsUsed)
+		pipelines.TriageAndSaveConversationAsync(*mc.emailTriageCfg, exchange, mr.ToolsUsed, mr.PipelineID)
+	}
+
+	// Record pipeline ID so the next message's prefetch can exclude stale memories.
+	if mr.PipelineID != 0 {
+		mc.svc.StateMgr.SetLastPipelineID(mr.PipelineID)
 	}
 
 	// Memory usefulness evaluation.
@@ -394,14 +414,32 @@ type dispatchResult struct {
 }
 
 const (
-	timeoutDispatchTriage       = 5 * time.Second
+	timeoutDispatchTriage       = 10 * time.Second
 	timeoutDispatchToolExec     = 5 * time.Minute
 	timeoutDispatchSynthesis    = 30 * time.Second
 	timeoutDispatchDTCSynthesis = 45 * time.Second
-	dispatchMaxTriageTokens     = 512
+	dispatchMaxTriageTokens     = 768
 	dispatchMaxSynthTokens      = 2048
 	dispatchMaxResultLen        = 8000
 )
+
+// neverDispatchTools is the set of tools that must always be escalated to the
+// Brain, even if the triage model tries to dispatch them. Defense-in-depth
+// complement to the prompt-level rule.
+var neverDispatchTools = map[string]bool{
+	"send_email":          true,
+	"create_event":        true,
+	"create_skill":        true,
+	"manage_skills":       true,
+	"manage_routines":     true,
+	"manage_personality":  true,
+	"save_memory":         true,
+	"forget_topic":        true,
+	"consult_deep_thinker": true,
+	"plan_and_execute":    true,
+	"delegate_task":       true,
+	"ask_database":        true,
+}
 
 // dispatchEscalation captures context from a failed dispatch attempt so
 // the Brain can avoid repeating the same failing call.
@@ -435,17 +473,17 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 	triageInput := buildTriageInput(msgText, history)
 
 	triageCtx, triageCancel := context.WithTimeout(context.Background(), timeoutDispatchTriage)
-	raw, err := mc.svc.Subagent.TryCompleteWithGrammar(triageCtx, triagePrompt, triageInput, grammar.BuildDispatchGrammar(), dispatchMaxTriageTokens)
+	raw, err := mc.svc.Subagent.TryCompleteWithGrammarThinking(triageCtx, triagePrompt, triageInput, grammar.BuildDispatchGrammar(), dispatchMaxTriageTokens)
 	triageCancel()
 	if err != nil {
 		logger.Log.Debugf("[dispatch] triage skipped (subagent slots: %d/%d): %v", used, total, err)
-		return false, nil, "" // slots busy — clean escalation
+		return false, nil, "One moment..." // slots busy — clean escalation
 	}
 
 	var dr dispatchResult
 	if err := json.Unmarshal([]byte(raw), &dr); err != nil {
 		logger.Log.Warnf("[dispatch] triage parse failed: %v — raw: %s", err, textutil.Truncate(raw, 200))
-		return false, nil, ""
+		return false, nil, "One moment..."
 	}
 	if !dr.Dispatch {
 		logger.Log.Debug("[dispatch] triage decided to escalate")
@@ -459,7 +497,11 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 
 	if !mc.registry.Has(dr.Tool) {
 		logger.Log.Warnf("[dispatch] triage returned unknown tool %q, escalating", dr.Tool)
-		return false, nil, ""
+		return false, nil, dr.Ack
+	}
+	if neverDispatchTools[dr.Tool] {
+		logger.Log.Warnf("[dispatch] triage tried to dispatch never-dispatch tool %q, forcing escalation", dr.Tool)
+		return false, nil, dr.Ack
 	}
 
 	used, total = mc.svc.Subagent.SlotsInUse()
@@ -468,7 +510,11 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 	// Send LLM-generated ack if the triage model wrote one.
 	if dr.Ack != "" {
 		ackFm := formatReply(dr.Ack)
-		sendFormatted(mc.svc.Bot, chatID, msg.MessageID, ackFm)
+		if _, ackErr := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, ackFm); ackErr != nil {
+			logger.Log.Warnf("[dispatch] ack send failed: %v", ackErr)
+		} else {
+			logger.Log.Debugf("[dispatch] ack sent for %s: %q", dr.Tool, textutil.Truncate(dr.Ack, 60))
+		}
 	}
 
 	// --- Execute tool with periodic progress updates ---
@@ -558,6 +604,7 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 		MsgText:           msgText,
 		PrefetchIDs:       dctx.PrefetchIDs,
 		PrefetchSummaries: dctx.PrefetchSummaries,
+		PipelineID:        int64(msg.MessageID),
 	})
 
 	totalElapsed := time.Since(toolStart)
@@ -583,12 +630,25 @@ Output JSON matching the grammar:
 3. ESCALATE when:
    - The request needs judgment, creativity, or complex multi-step reasoning
    - The request is conversational (greetings, opinions, advice, jokes)
+   - The user gives feedback about your behavior, communication style, response format, or preferences about how you should act
    - The request involves side effects (sending emails, creating events, managing skills/routines)
    - You are unsure — escalation is always safe
 4. NEVER dispatch: send_email, create_event, create_skill, manage_skills, manage_routines, manage_personality, save_memory, forget_topic, consult_deep_thinker, plan_and_execute, delegate_task, ask_database
 5. Only include arguments the tool actually needs. Omit optional parameters when the user doesn't specify them — pass {} for default behavior. Never invent placeholder values like "all" or "any".
 6. Read the conversation history carefully. Choose the tool that best matches the user's ACTUAL intent — a follow-up question about a specific topic is different from the original broad request.
 7. The "ack" field is a brief, natural reply shown to the user while the tool runs. Keep it short and conversational (e.g. "Sure, let me check." or "One sec."). Do NOT describe the tool or its parameters.
+8. Only dispatch to tools listed in "Available Tools" or "Skills" below. If no listed tool matches, escalate.
+
+## Examples
+
+User: "What's the weather in NYC?"
+→ {"dispatch": true, "tool": "search_web", "args": {"query": "weather in NYC"}, "ack": "Checking the weather."}
+
+User: "I want you to be more concise in your responses."
+→ {"dispatch": false, "ack": "Got it, I'll keep that in mind."}
+
+User: "Check my emails and calendar for today."
+→ {"dispatch": true, "multi": true, "directive": "Search today's emails and today's calendar events, then summarize both.", "ack": "Let me check both."}
 
 Current time: `)
 	sb.WriteString(currentTime)
@@ -705,6 +765,7 @@ func tryMultiStepDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64
 		MsgText:           msgText,
 		PrefetchIDs:       dctx.PrefetchIDs,
 		PrefetchSummaries: dctx.PrefetchSummaries,
+		PipelineID:        int64(msg.MessageID),
 	})
 
 	logger.Log.Infof("[dispatch] multi-step handled %q (subagent path)", textutil.Truncate(msgText, 60))

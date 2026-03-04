@@ -23,8 +23,9 @@ type prefetchResult struct {
 }
 
 // subconsciousPrefetch embeds the user's message and retrieves semantically
-// similar memories as background context.
-func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, msgText string, recentMessages []llm.Message) *prefetchResult {
+// similar memories as background context. excludePipelineID filters out
+// memories from the immediately previous pipeline to prevent context bleed.
+func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, embedModel, msgText string, recentMessages []llm.Message, excludePipelineID int64) *prefetchResult {
 	// Build trajectory string from recent user messages for contextual vector recall.
 	var trajectoryParts []string
 	count := 0
@@ -50,7 +51,7 @@ func subconsciousPrefetch(ctx context.Context, pool *pgxpool.Pool, embedURL, emb
 	trajectoryParts = append(trajectoryParts, msgText)
 	trajectoryStr := strings.Join(trajectoryParts, " | ")
 
-	pf := memory.Prefetch(ctx, pool, embedURL, embedModel, trajectoryStr, msgText, 3)
+	pf := memory.Prefetch(ctx, pool, embedURL, embedModel, trajectoryStr, msgText, 3, excludePipelineID)
 	if pf == nil {
 		return nil
 	}
