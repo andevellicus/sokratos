@@ -2,7 +2,9 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +14,12 @@ import (
 	"sokratos/logger"
 	"sokratos/textutil"
 )
+
+// AdaptiveWriterFunc persists an adaptive parameter adjustment.
+// For the special key "curiosity_signal", the reason contains the research
+// question and the value is the priority (3-7). The writer is expected to
+// route this to a curiosity signal channel instead of the DB.
+type AdaptiveWriterFunc func(ctx context.Context, key string, value float64, reason string) error
 
 // CountMemoriesSince returns the number of substantive memories created after
 // the given timestamp. When since is zero, counts all non-superseded memories.
@@ -84,7 +92,7 @@ func TrackRetrieval(ctx context.Context, db *pgxpool.Pool, ids []int64) {
 // ReflectOnMemories performs a meta-cognitive reflection over memories created
 // since the given time, identifying patterns, evolving interests, connections,
 // and predictions. Returns the reflection memory ID, or 0 if skipped.
-func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel, reflectionPrompt string, synthesize SynthesizeFunc, grammarFn GrammarSubagentFunc, since time.Time) (int64, error) {
+func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel, reflectionPrompt string, synthesize SynthesizeFunc, grammarFn GrammarSubagentFunc, since time.Time, adaptiveWriter AdaptiveWriterFunc) (int64, error) {
 	// Query memories since the given time (excluding reflections), grouped by source/type.
 	rows, err := db.Query(ctx,
 		`SELECT source, memory_type, summary
@@ -147,6 +155,9 @@ func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, emb
 		return 0, fmt.Errorf("reflection produced empty output")
 	}
 
+	// Extract and apply adaptations if present.
+	raw = parseAndApplyAdaptations(ctx, raw, adaptiveWriter)
+
 	// Embed and insert the reflection.
 	embedded, err := embedWithFallback(ctx, embedEndpoint, embedModel, raw)
 	if err != nil {
@@ -179,4 +190,53 @@ func ReflectOnMemories(ctx context.Context, db *pgxpool.Pool, embedEndpoint, emb
 	}
 
 	return id, nil
+}
+
+// adaptationsRe matches the <ADAPTATIONS>...</ADAPTATIONS> block.
+var adaptationsRe = regexp.MustCompile(`(?s)<ADAPTATIONS>\s*(\[.*?\])\s*</ADAPTATIONS>`)
+
+// adaptationEntry represents a single adaptation from the LLM.
+type adaptationEntry struct {
+	Param  string  `json:"param"`
+	Value  float64 `json:"value"`
+	Reason string  `json:"reason"`
+}
+
+// parseAndApplyAdaptations extracts adaptations from the reflection output,
+// applies them via adaptiveWriter, and returns the narrative text without
+// the ADAPTATIONS block. Falls through gracefully if parsing fails.
+func parseAndApplyAdaptations(ctx context.Context, raw string, adaptiveWriter AdaptiveWriterFunc) string {
+	match := adaptationsRe.FindStringSubmatch(raw)
+	if len(match) < 2 {
+		return raw
+	}
+
+	// Strip the adaptations block from the narrative.
+	narrative := strings.TrimSpace(adaptationsRe.ReplaceAllString(raw, ""))
+	if narrative == "" {
+		narrative = raw // safety: don't lose content
+	}
+
+	if adaptiveWriter == nil {
+		return narrative
+	}
+
+	var entries []adaptationEntry
+	if err := json.Unmarshal([]byte(match[1]), &entries); err != nil {
+		logger.Log.Warnf("[reflection] failed to parse adaptations: %v", err)
+		return narrative
+	}
+
+	for _, e := range entries {
+		if e.Param == "" {
+			continue
+		}
+		if err := adaptiveWriter(ctx, e.Param, e.Value, e.Reason); err != nil {
+			logger.Log.Warnf("[reflection] failed to apply adaptation %s=%.2f: %v", e.Param, e.Value, err)
+		} else {
+			logger.Log.Infof("[reflection] applied adaptation %s=%.2f (%s)", e.Param, e.Value, e.Reason)
+		}
+	}
+
+	return narrative
 }

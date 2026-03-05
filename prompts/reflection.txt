@@ -11,3 +11,14 @@ Structure your reflection with exactly these four sections:
 **PREDICTIONS**: Based on observed patterns and trajectories, what is the user likely to need, ask about, or do in the coming days/weeks? What proactive support would be valuable? (3-6 bullets)
 
 For each bullet, cite at least one specific memory. If you cannot cite a specific memory, do not include the bullet. Do not speculate beyond what the evidence supports. Be concise: 1-2 sentences per bullet point.
+
+After your reflection, if you notice the system should adapt its behavior, output a JSON block:
+<ADAPTATIONS>
+[
+  {"param": "triage_conversation_threshold", "value": 4.0, "reason": "conversations are mostly routine"},
+  {"param": "curiosity_cooldown_hours", "value": 1.0, "reason": "user actively exploring new topics"}
+]
+</ADAPTATIONS>
+If no adaptations are needed, omit the block entirely.
+Valid params: triage_conversation_threshold (1-8), triage_conversation_unverified_threshold (3-8), triage_email_threshold (1-5), curiosity_cooldown_hours (0.5-6).
+Only suggest adaptations supported by clear evidence in the memories above.

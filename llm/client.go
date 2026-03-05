@@ -217,7 +217,7 @@ type QueryOrchestratorOpts struct {
 	MaxWebSources      int              // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
 	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
-	OnToolStart func()                          // release slot before tool execution (nil = no-op)
+	OnToolStart func(toolName string)            // called before tool execution with tool name (nil = no-op)
 	OnToolEnd   func(ctx context.Context) error // reacquire slot after tool execution (nil = no-op)
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"sokratos/adaptive"
 	"sokratos/logger"
 	"sokratos/memory"
 	objpkg "sokratos/objectives"
@@ -21,22 +22,21 @@ const (
 	curiosityMinMemories     = 15            // min recent memories to have enough signal
 )
 
-// CuriosityFunc is called by the curiosity engine with a research directive.
-// It should decompose and launch a background task. Returns the task ID.
-// objectiveID is non-zero when launching for a specific objective (0 = curiosity/no objective).
-type CuriosityFunc func(directive string, priority int, objectiveID int64) (int64, error)
-
 // runCuriosityIfReady checks conditions and optionally fires a proactive
 // research task. Inserted as a phase in cognitive processing.
 func (e *Engine) runCuriosityIfReady() {
-	if e.Cognitive.CuriosityFunc == nil || e.DB == nil || e.Gatekeeper == nil {
+	if e.CogServices == nil || e.DB == nil || e.Gatekeeper == nil {
 		return
 	}
 
-	// Cooldown check.
+	// Cooldown check — use adaptive parameter if DB is available.
 	cooldown := e.CuriosityCooldown
 	if cooldown == 0 {
 		cooldown = defaultCuriosityCooldown
+	}
+	if e.DB != nil {
+		hours := adaptive.Get(context.Background(), e.DB, "curiosity_cooldown_hours", cooldown.Hours())
+		cooldown = time.Duration(hours * float64(time.Hour))
 	}
 	if time.Since(e.lastCuriosityRun) < cooldown {
 		return
@@ -120,7 +120,7 @@ ws ::= [ \t\n]*`
 
 	// Launch background research task.
 	directive := fmt.Sprintf("[curiosity] %s", result.Directive)
-	taskID, err := e.Cognitive.CuriosityFunc(directive, 3, 0) // low priority, no objective
+	taskID, err := e.CogServices.LaunchCuriosity(directive, 3, 0) // low priority, no objective
 	if err != nil {
 		logger.Log.Warnf("[curiosity] failed to launch: %v", err)
 		return
@@ -128,4 +128,58 @@ ws ::= [ \t\n]*`
 
 	e.lastCuriosityRun = time.Now()
 	logger.Log.Infof("[curiosity] launched task #%d: %s (reason: %s)", taskID, result.Directive, result.Reasoning)
+}
+
+// drainCuriositySignals non-blocking drains all pending signals from the
+// CuriositySignals channel, keeps the highest priority one, and launches it.
+// Respects the same cooldown as timer-based curiosity.
+func (e *Engine) drainCuriositySignals() {
+	if e.CuriositySignals == nil || e.CogServices == nil {
+		return
+	}
+
+	// Non-blocking drain: collect all pending signals.
+	var best *CuriositySignal
+	for {
+		select {
+		case sig := <-e.CuriositySignals:
+			if best == nil || sig.Priority > best.Priority {
+				best = &sig
+			}
+		default:
+			goto done
+		}
+	}
+done:
+	if best == nil {
+		return
+	}
+
+	// Respect cooldown (same as timer-based curiosity).
+	cooldown := e.CuriosityCooldown
+	if cooldown == 0 {
+		cooldown = defaultCuriosityCooldown
+	}
+	if e.DB != nil {
+		hours := adaptive.Get(context.Background(), e.DB, "curiosity_cooldown_hours", cooldown.Hours())
+		cooldown = time.Duration(hours * float64(time.Hour))
+	}
+	// Signals use a shorter minimum gap (30 min) instead of the full cooldown.
+	minGap := 30 * time.Minute
+	if cooldown < minGap {
+		minGap = cooldown
+	}
+	if time.Since(e.lastCuriosityRun) < minGap {
+		return
+	}
+
+	directive := fmt.Sprintf("[curiosity:%s] %s", best.Source, best.Query)
+	taskID, err := e.CogServices.LaunchCuriosity(directive, best.Priority, best.ObjectiveID)
+	if err != nil {
+		logger.Log.Warnf("[curiosity-signal] failed to launch: %v", err)
+		return
+	}
+
+	e.lastCuriosityRun = time.Now()
+	logger.Log.Infof("[curiosity-signal] launched task #%d from %s: %s", taskID, best.Source, best.Query)
 }

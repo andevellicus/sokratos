@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"sokratos/adaptive"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/timeouts"
@@ -94,7 +95,7 @@ func (e *Engine) runCognitiveIfTriggered() {
 		count, bufferFull, lull, ceilingHit)
 
 	// 1. Reflection (if unreflected count meets the reflection-specific threshold).
-	if e.Cognitive.SynthesizeFunc != nil && e.Cognitive.ReflectionPrompt != "" && e.Cognitive.ReflectionMemoryThreshold > 0 {
+	if e.CogServices != nil && e.Cognitive.ReflectionPrompt != "" && e.Cognitive.ReflectionMemoryThreshold > 0 {
 		reflCount, reflErr := memory.CountMemoriesSinceLastReflection(context.Background(), e.DB)
 		if reflErr == nil && reflCount >= e.Cognitive.ReflectionMemoryThreshold {
 			logger.Log.Infof("[engine] reflection threshold reached (%d >= %d)", reflCount, e.Cognitive.ReflectionMemoryThreshold)
@@ -103,9 +104,9 @@ func (e *Engine) runCognitiveIfTriggered() {
 	}
 
 	// 2. Episode synthesis.
-	if e.Cognitive.SynthesizeFunc != nil {
+	if e.CogServices != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), timeouts.Synthesis)
-		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.SynthesizeFunc, e.Memory.GrammarFn)
+		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.CogServices.Synthesize, e.Memory.GrammarFn)
 		cancel()
 		if synthErr != nil {
 			logger.Log.Warnf("[engine] episode synthesis failed: %v", synthErr)
@@ -130,17 +131,17 @@ func (e *Engine) runCognitiveIfTriggered() {
 	e.lastCognitiveRun = time.Now()
 }
 
-// runProfileConsolidation calls the ConsolidateFunc closure if configured.
+// runProfileConsolidation calls the CogServices.Consolidate method if configured.
 // The volume + lull trigger has already decided consolidation should happen.
 func (e *Engine) runProfileConsolidation() {
-	if e.Cognitive.ConsolidateFunc == nil {
+	if e.CogServices == nil {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeouts.Synthesis)
 	defer cancel()
 
-	n, err := e.Cognitive.ConsolidateFunc(ctx)
+	n, err := e.CogServices.Consolidate(ctx)
 	if err != nil {
 		logger.Log.Warnf("[engine] profile consolidation failed: %v", err)
 		return
@@ -154,7 +155,7 @@ func (e *Engine) runProfileConsolidation() {
 // the last reflection, identifying patterns and predictions. Called when the
 // memory count threshold is reached during cognitive processing.
 func (e *Engine) triggerReflection() {
-	if e.DB == nil || e.EmbedEndpoint == "" || e.Cognitive.SynthesizeFunc == nil || e.Cognitive.ReflectionPrompt == "" {
+	if e.DB == nil || e.EmbedEndpoint == "" || e.CogServices == nil || e.Cognitive.ReflectionPrompt == "" {
 		return
 	}
 
@@ -171,20 +172,49 @@ func (e *Engine) triggerReflection() {
 		since = *lastReflection
 	}
 
-	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.ReflectionPrompt, e.Cognitive.SynthesizeFunc, e.Memory.GrammarFn, since)
+	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.ReflectionPrompt, e.CogServices.Synthesize, e.Memory.GrammarFn, since, e.adaptiveWriter())
 	if err != nil {
 		logger.Log.Warnf("[engine] reflection failed: %v", err)
 	} else if id > 0 {
 		logger.Log.Infof("[engine] reflection saved as memory id=%d", id)
 		// Inject reflection insight into conversation context for the orchestrator.
-		if e.ReflectionNotifyFunc != nil {
+		if e.ReflectionSink != nil {
 			rCtx, rCancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 			var summary string
 			qErr := e.DB.QueryRow(rCtx, `SELECT summary FROM memories WHERE id = $1`, id).Scan(&summary)
 			rCancel()
 			if qErr == nil && strings.TrimSpace(summary) != "" {
-				e.ReflectionNotifyFunc(summary)
+				e.ReflectionSink.InjectReflection(summary)
 			}
 		}
+	}
+}
+
+// adaptiveWriter returns a closure that writes adaptive parameters to the DB,
+// or nil if no DB is available.
+func (e *Engine) adaptiveWriter() memory.AdaptiveWriterFunc {
+	if e.DB == nil {
+		return nil
+	}
+	return func(ctx context.Context, key string, value float64, reason string) error {
+		// Special key: emit as a curiosity signal instead of persisting to DB.
+		if key == "curiosity_signal" && e.CuriositySignals != nil {
+			select {
+			case e.CuriositySignals <- CuriositySignal{
+				Source:   "reflection",
+				Query:    reason,
+				Priority: int(value),
+			}:
+				logger.Log.Infof("[adaptive] emitted curiosity signal from reflection: %s", reason)
+			default:
+			}
+			return nil
+		}
+		if !adaptive.IsValidKey(key) {
+			logger.Log.Warnf("[adaptive] unknown key %q from reflection, ignoring", key)
+			return nil
+		}
+		value = adaptive.Clamp(key, value)
+		return adaptive.Set(ctx, e.DB, key, value, "reflection", reason)
 	}
 }

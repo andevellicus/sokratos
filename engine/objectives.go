@@ -23,9 +23,6 @@ const (
 	objectiveInferenceMinMemories     = 10
 )
 
-// ObjectiveInferenceFunc infers implicit user objectives from recent patterns.
-type ObjectiveInferenceFunc func(ctx context.Context) error
-
 // inferredObjective is a single objective from the DTC response.
 type inferredObjective struct {
 	Objective string `json:"objective"`
@@ -39,7 +36,7 @@ type objectiveInferenceResult struct {
 
 // runObjectiveInferenceIfReady checks conditions and fires objective inference.
 func (e *Engine) runObjectiveInferenceIfReady() {
-	if e.Cognitive.ObjectiveInferenceFunc == nil {
+	if e.CogServices == nil {
 		return
 	}
 
@@ -70,7 +67,7 @@ func (e *Engine) runObjectiveInferenceIfReady() {
 	inferCtx, inferCancel := context.WithTimeout(context.Background(), timeouts.Synthesis)
 	defer inferCancel()
 
-	if err := e.Cognitive.ObjectiveInferenceFunc(inferCtx); err != nil {
+	if err := e.CogServices.InferObjectives(inferCtx); err != nil {
 		logger.Log.Warnf("[objectives] inference failed: %v", err)
 		return
 	}

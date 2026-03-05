@@ -125,8 +125,8 @@ func (e *Engine) executeTask(task Task) {
 		reply = fmt.Sprintf("(Scheduled task %q fired but LLM error occurred: %v)", task.Directive, err)
 	}
 
-	if e.SendFunc != nil && reply != "" {
-		e.SendFunc(reply)
+	if e.Notifier != nil && reply != "" {
+		e.Notifier.Send(reply)
 	}
 
 	// Mark completed (+ insert recurring) in a single transaction.

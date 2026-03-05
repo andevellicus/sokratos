@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/pipelines"
+	"sokratos/prompts"
 	"sokratos/routines"
 	"sokratos/textutil"
 	"sokratos/timefmt"
@@ -263,16 +265,14 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		typingCancel()
 		return
 	}
-	// Send a brief ack to the user immediately so they know the message
-	// was received while the Brain works. Use a fixed placeholder instead
-	// of the triage model's ack to avoid sending what looks like a
-	// substantive answer before the Brain's real reply arrives.
-	if dispatchAck != "" {
-		ackText := "One moment..."
-		if _, ackErr := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(ackText)); ackErr != nil {
+	// Only send an ack when there's a real escalation (failed dispatch that
+	// the orchestrator needs to retry). Normal triage-to-orchestrator handoffs
+	// don't need an ack — the 9B responds fast enough on its own.
+	if escalation != nil && dispatchAck != "" {
+		if _, ackErr := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(dispatchAck)); ackErr != nil {
 			logger.Log.Warnf("[dispatch] ack send failed: %v", ackErr)
 		} else {
-			logger.Log.Debugf("[dispatch] ack sent for escalation: %q (triage wanted: %q)", ackText, textutil.Truncate(dispatchAck, 60))
+			logger.Log.Debugf("[dispatch] ack sent for escalation: %q", textutil.Truncate(dispatchAck, 60))
 		}
 	}
 	if escalation != nil {
@@ -284,8 +284,10 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		}
 	}
 
-	// Phase 4: Resolve which model handles this message (Brain preferred for interactive accuracy).
-	choice := mc.router.AcquireOrFallback(context.Background(), true)
+	// Phase 4: Resolve which model handles this message. The 9B orchestrator
+	// handles simple-to-moderate tasks directly (including tool calls); Brain
+	// is the fallback when the 9B supervisor slot is busy.
+	choice := mc.router.AcquireOrFallback(context.Background(), false)
 	acquired := true
 	defer func() {
 		if acquired {
@@ -304,7 +306,13 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		MaxWebSources:      mc.cfg.MaxWebSources,
 		ToolAgent:          mc.lb.ToolAgent,
 		Fallbacks:          mc.fallbacks,
-		OnToolStart:        func() { choice.Release(); acquired = false },
+		OnToolStart: func(toolName string) {
+			choice.Release()
+			acquired = false
+			if toolName == "reason" {
+				sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply("Thinking..."))
+			}
+		},
 		OnToolEnd: func(reCtx context.Context) error {
 			if reErr := choice.Reacquire(reCtx); reErr != nil {
 				return reErr
@@ -408,6 +416,44 @@ func completeMessageHandling(mc messageContext, msg *tgbotapi.Message, chatID in
 			logger.Log.Errorf("Error sending message: %v", err)
 		}
 	}
+
+	// Emit curiosity signal when the orchestrator expressed uncertainty.
+	emitConversationGapSignal(mc.eng, reply)
+}
+
+// uncertaintyPatterns matches replies where the orchestrator expressed a knowledge gap.
+var uncertaintyPatterns = regexp.MustCompile(`(?i)(I don't have (?:enough )?information|I'm not sure|I couldn't find|I don't know|I wasn't able to find|I lack information)`)
+
+// emitConversationGapSignal checks if the orchestrator's reply indicates
+// uncertainty and emits a curiosity signal for background research.
+func emitConversationGapSignal(eng *engine.Engine, reply string) {
+	if eng.CuriositySignals == nil || len(reply) < 20 {
+		return
+	}
+	match := uncertaintyPatterns.FindString(reply)
+	if match == "" {
+		return
+	}
+	// Extract a topic hint from the reply (first 120 chars after the match).
+	idx := strings.Index(reply, match)
+	topic := reply
+	if idx >= 0 {
+		end := idx + len(match) + 120
+		if end > len(reply) {
+			end = len(reply)
+		}
+		topic = reply[idx:end]
+	}
+	select {
+	case eng.CuriositySignals <- engine.CuriositySignal{
+		Source:   "conversation",
+		Query:    topic,
+		Priority: 5,
+	}:
+		logger.Log.Debugf("[curiosity-signal] conversation gap detected: %s", textutil.Truncate(topic, 80))
+	default:
+		// Channel full, drop.
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +494,7 @@ var neverDispatchTools = map[string]bool{
 	"manage_personality":  true,
 	"save_memory":         true,
 	"forget_topic":        true,
-	"consult_deep_thinker": true,
+	"reason":              true,
 	"plan_and_execute":    true,
 	"delegate_task":       true,
 	"ask_database":        true,
@@ -633,51 +679,14 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 // It includes a compact tool index and skill descriptions so the subagent
 // knows which tools exist and can pick one.
 func buildTriageSystemPrompt(registry *tools.Registry, currentTime string) string {
-	var sb strings.Builder
-	sb.WriteString(`You are a dispatch triage agent. Decide whether the user's message can be handled by dispatching to tools directly, or whether it needs the full orchestrator (Brain).
-
-Output JSON matching the grammar:
-- Single tool: {"dispatch": true, "tool": "<name>", "args": {<arguments>}, "ack": "<brief natural reply>"}
-- Multi-step: {"dispatch": true, "multi": true, "directive": "<natural language instruction>", "ack": "<brief natural reply>"}
-- Escalate: {"dispatch": false, "ack": "<brief natural reply>"}
-
-## Rules
-1. DISPATCH (single tool) when the request is a straightforward data fetch that one tool can answer directly.
-2. DISPATCH (multi-step) when the request needs 2-3 sequential tool calls but no complex reasoning (e.g., "search for X and read the top result", "check my calendar and email"). Write the directive as a clear instruction describing what to do.
-3. ESCALATE when:
-   - The request needs judgment, creativity, or complex multi-step reasoning
-   - The request is conversational (greetings, opinions, advice, jokes)
-   - The user gives feedback about your behavior, communication style, response format, or preferences about how you should act
-   - The request involves side effects (sending emails, creating events, managing skills/routines)
-   - You are unsure — escalation is always safe
-4. NEVER dispatch: send_email, create_event, create_skill, manage_skills, manage_routines, manage_personality, save_memory, forget_topic, consult_deep_thinker, plan_and_execute, delegate_task, ask_database
-5. Only include arguments the tool actually needs. Omit optional parameters when the user doesn't specify them — pass {} for default behavior. Never invent placeholder values like "all" or "any".
-6. Read the conversation history carefully. Choose the tool that best matches the user's ACTUAL intent — a follow-up question about a specific topic is different from the original broad request.
-7. The "ack" field is a brief, natural reply shown to the user while the tool runs. Keep it short and conversational (e.g. "Sure, let me check." or "One sec."). Do NOT describe the tool or its parameters.
-8. Only dispatch to tools listed in "Available Tools" or "Skills" below. If no listed tool matches, escalate.
-
-## Examples
-
-User: "What's the weather in NYC?"
-→ {"dispatch": true, "tool": "search_web", "args": {"query": "weather in NYC"}, "ack": "Checking the weather."}
-
-User: "I want you to be more concise in your responses."
-→ {"dispatch": false, "ack": "Got it, I'll keep that in mind."}
-
-User: "Check my emails and calendar for today."
-→ {"dispatch": true, "multi": true, "directive": "Search today's emails and today's calendar events, then summarize both.", "ack": "Let me check both."}
-
-Current time: `)
-	sb.WriteString(currentTime)
-	sb.WriteString("\n\n## Available Tools\n")
-	sb.WriteString(registry.CompactIndex())
-
+	toolIndex := registry.CompactIndex()
 	if skills := registry.DynamicSkillDescriptions(); skills != "" {
-		sb.WriteString("\n")
-		sb.WriteString(skills)
+		toolIndex += "\n" + skills
 	}
 
-	return sb.String()
+	prompt := strings.Replace(prompts.DispatchTriage, "%CURRENT_TIME%", currentTime, 1)
+	prompt = strings.Replace(prompt, "%TOOL_INDEX%", toolIndex, 1)
+	return prompt
 }
 
 // buildTriageInput constructs the user message for the triage call, including

@@ -98,10 +98,17 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 	}
 }
 
-// registerAITools is a no-op placeholder. In two-model mode, the Brain IS
-// the deep thinker — consult_deep_thinker was removed to prevent deadlock
-// (orchestrator holds the DTC sem, then DTC.Complete tries to re-acquire it).
-func registerAITools(_ *tools.Registry, _ *clients.DeepThinkerClient, _ *pgxpool.Pool, _, _ string) {
+// registerAITools registers the deep reasoning tool. With the 9B as the default
+// orchestrator, there's no semaphore deadlock — the 9B doesn't hold the DTC sem.
+func registerAITools(registry *tools.Registry, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) {
+	if dtc == nil {
+		return
+	}
+	registry.Register("reason", tools.NewDeepThink(dtc, pool, embedURL, embedModel), tools.ToolSchema{
+		Name:        "reason",
+		Description: "Send a complex problem to the deep reasoning model (122B Brain) for thorough analysis",
+		Params:      []tools.ParamSchema{{Name: "problem_statement", Type: "string", Required: true}},
+	})
 }
 
 // registerDelegateTask registers delegate_task AFTER all delegatable tools

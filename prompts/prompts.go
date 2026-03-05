@@ -46,3 +46,6 @@ var RoutineMode string
 
 //go:embed objective_inference.txt
 var ObjectiveInference string
+
+//go:embed dispatch_triage.txt
+var DispatchTriage string

@@ -313,9 +313,9 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	messages = append(messages, userMsg)
 
 	// callTool wraps toolExec with slot release/reacquire callbacks.
-	callTool := func(ctx context.Context, raw []byte) (string, error) {
+	callTool := func(ctx context.Context, toolName string, raw []byte) (string, error) {
 		if opts != nil && opts.OnToolStart != nil {
-			opts.OnToolStart()
+			opts.OnToolStart(toolName)
 		}
 		result, err := toolExec(ctx, raw)
 		if opts != nil && opts.OnToolEnd != nil {
@@ -386,7 +386,7 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 			if toolExec != nil {
 				toolName, originalArgs := extractToolNameAndArgs(toolJSON)
 
-				result, execErr := callTool(ctx, []byte(toolJSON))
+				result, execErr := callTool(ctx, toolName, []byte(toolJSON))
 
 				// Determine failure and build the failure message.
 				var failureMsg string
@@ -410,7 +410,7 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 						fbArgs := fb.ArgsTransform(toolName, originalArgs, failureMsg)
 						fbJSON := buildToolJSON(fb.FallbackTool, fbArgs)
 						logger.Log.Infof("[llm:supervisor] auto-fallback: %s failed, trying %s", toolName, fb.FallbackTool)
-						fbResult, fbErr := callTool(ctx, []byte(fbJSON))
+						fbResult, fbErr := callTool(ctx, fb.FallbackTool, []byte(fbJSON))
 						if fbErr != nil {
 							messages = append(messages, Message{Role: "user", Content: fmt.Sprintf(
 								"Tool result [auto-fallback]: %s failed (%s). Fallback to %s also failed: %s",

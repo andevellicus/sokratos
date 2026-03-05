@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 
+	"sokratos/adaptive"
 	"sokratos/clients"
 	"sokratos/google"
 	"sokratos/logger"
@@ -256,9 +257,9 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 
 		triageInput := truncateAssistantReply(exchange, 800)
 
-		threshold := float64(3)
+		threshold := adaptive.Get(ctx, cfg.Pool, "triage_conversation_threshold", 3.0)
 		if !toolsUsed {
-			threshold = 5
+			threshold = adaptive.Get(ctx, cfg.Pool, "triage_conversation_unverified_threshold", 5.0)
 		}
 
 		err := triageAndSave(ctx, cfg, TriageSaveRequest{
@@ -319,7 +320,7 @@ func TriageAndSaveEmailAsync(cfg TriageConfig, email google.Email) {
 				if r.Save != nil && !*r.Save {
 					return false
 				}
-				return r.SalienceScore >= 1
+				return r.SalienceScore >= adaptive.Get(ctx, cfg.Pool, "triage_email_threshold", 1.0)
 			},
 		})
 		if err != nil {

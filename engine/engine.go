@@ -45,17 +45,14 @@ type LLMConfig struct {
 	MaxWebSources    int                  // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 }
 
-// CognitiveConfig groups event-driven cognitive processing fields.
+// CognitiveConfig groups event-driven cognitive processing data fields.
+// LLM-dependent operations live on the CognitiveServices interface.
 type CognitiveConfig struct {
-	BufferThreshold           int                                                                     // min unreflected memories to trigger cognitive processing (default 20)
-	LullDuration              time.Duration                                                           // min user idle time before cognitive processing (default 20min)
-	Ceiling                   time.Duration                                                           // max time between cognitive runs (default 4h)
-	ConsolidateFunc           func(ctx context.Context) (int, error)                                  // wraps tools.ConsolidateCore; nil = skip
-	ReflectionMemoryThreshold int                                                                     // run reflection after this many new memories (default 50, 0 = disabled)
-	ReflectionPrompt          string                                                                  // system prompt for reflection synthesis
-	SynthesizeFunc            func(ctx context.Context, systemPrompt, content string) (string, error) // LLM call for synthesis
-	CuriosityFunc             CuriosityFunc                                                           // launches background research tasks (nil = disabled)
-	ObjectiveInferenceFunc    func(ctx context.Context) error                                        // infer user objectives from recent patterns (nil = disabled)
+	BufferThreshold           int           // min unreflected memories to trigger cognitive processing (default 20)
+	LullDuration              time.Duration // min user idle time before cognitive processing (default 20min)
+	Ceiling                   time.Duration // max time between cognitive runs (default 4h)
+	ReflectionMemoryThreshold int           // run reflection after this many new memories (default 50, 0 = disabled)
+	ReflectionPrompt          string        // system prompt for reflection synthesis
 }
 
 // MemoryFuncs groups the memory-related function dependencies.
@@ -76,6 +73,14 @@ type TTLConfig struct {
 	FailedOpsTTLDays       int
 	SkillKVTTLDays         int
 	ShellHistoryTTLDays    int
+}
+
+// CuriositySignal is an event-driven trigger for proactive research.
+type CuriositySignal struct {
+	Source      string // "conversation", "reflection", "objective"
+	Query       string // information gap or research question
+	Priority    int    // 3=low, 5=normal, 7=high
+	ObjectiveID int64  // non-zero if tied to an objective
 }
 
 // Engine holds all dependencies for the heartbeat loop.
@@ -99,16 +104,17 @@ type Engine struct {
 	TTL                 TTLConfig     // periodic table pruning thresholds
 	Memory              MemoryFuncs   // memory-related function dependencies
 
-	SendFunc      func(text string) // sends a message to the user via Telegram
-	InterruptChan chan struct{}      // signals the task scheduler to recalculate
-	Gatekeeper    GatekeeperClient  // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
-	WorkMonitor          WorkMonitor           // tracks running work items; nil = no tracking
-	RoutineTimeout       time.Duration         // max duration for a single routine execution (default 5m)
-	Router               SlotRouter            // routes orchestrator calls to Brain or subagent fallback; nil = use LLM.Client
-	SyncFunc             func()               // hot-reload skills from disk (called each heartbeat tick)
-	RoutineSyncFunc      func()               // hot-reload routines from disk (called each routine scheduler tick)
-	ReflectionNotifyFunc func(summary string) // inject reflection insights into conversation context (nil = skip)
-	OnFirstTick          func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
+	Notifier       Notifier           // sends proactive messages to the user (nil = silent)
+	InterruptChan  chan struct{}       // signals the task scheduler to recalculate
+	Gatekeeper     GatekeeperClient   // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
+	WorkMonitor    WorkMonitor        // tracks running work items; nil = no tracking
+	RoutineTimeout time.Duration      // max duration for a single routine execution (default 5m)
+	Router         SlotRouter         // routes orchestrator calls to Brain or subagent fallback; nil = use LLM.Client
+	Reloader       HotReloader        // hot-reload skills + routines from disk (nil = skip)
+	ReflectionSink ReflectionSink     // inject reflection insights into conversation context (nil = skip)
+	CogServices    CognitiveServices  // LLM-dependent cognitive operations (nil = disabled)
+	OnFirstTick       func()                    // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
+	CuriositySignals  chan CuriositySignal      // buffered channel for event-driven curiosity (nil = disabled)
 
 	// Configurable cooldowns (zero = use defaults).
 	ObjectivePursuitCooldown   time.Duration
@@ -200,7 +206,7 @@ func (e *Engine) runOrchestrator(ctx context.Context, preferBrain bool, prompt s
 	var err error
 	e.withOrchestratorLock(func() {
 		opts := e.baseOrchestratorOpts()
-		opts.OnToolStart = func() { choice.Release(); acquired = false }
+		opts.OnToolStart = func(_ string) { choice.Release(); acquired = false }
 		opts.OnToolEnd = func(reCtx context.Context) error {
 			if reErr := choice.Reacquire(reCtx); reErr != nil {
 				return reErr
@@ -242,8 +248,8 @@ func (e *Engine) sendDeduped(text, logLabel string) bool {
 		return false
 	}
 	e.lastHeartbeatHash = h
-	if e.SendFunc != nil {
-		e.SendFunc(text)
+	if e.Notifier != nil {
+		e.Notifier.Send(text)
 	}
 	logger.Log.Infof("heartbeat: %s delivered", logLabel)
 	return true

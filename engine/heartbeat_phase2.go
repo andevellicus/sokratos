@@ -168,8 +168,8 @@ func (e *Engine) heartbeatPhase2Orchestrator(contextXML, stalenessNote string, c
 	case err != nil:
 		if strings.Contains(err.Error(), "too many tool call rounds") {
 			logger.Log.Warn("heartbeat: max rounds reached")
-			if e.SendFunc != nil {
-				e.SendFunc("I started a background task but couldn't complete it. You may want to check in.")
+			if e.Notifier != nil {
+				e.Notifier.Send("I started a background task but couldn't complete it. You may want to check in.")
 			}
 		} else {
 			logger.Log.Errorf("heartbeat: orchestrator error: %v", err)

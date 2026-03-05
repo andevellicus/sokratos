@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
@@ -21,6 +22,8 @@ type EpisodeMemory struct {
 	ID        int64
 	Summary   string
 	Embedding []float32
+	Entities  []string
+	CreatedAt time.Time
 }
 
 const episodeSynthesisPrompt = `You synthesize related memories into a cohesive episodic narrative. Given a numbered list of related memories, produce a 2-4 sentence summary that:
@@ -51,6 +54,56 @@ func cosineSimilarity(a, b []float32) float64 {
 	return dot / denom
 }
 
+// jaccardSimilarity returns the Jaccard similarity between two string sets
+// (case-insensitive). Returns 0 for two empty sets.
+func jaccardSimilarity(a, b []string) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	setA := make(map[string]struct{}, len(a))
+	for _, s := range a {
+		setA[strings.ToLower(s)] = struct{}{}
+	}
+	setB := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		setB[strings.ToLower(s)] = struct{}{}
+	}
+	intersection := 0
+	for k := range setA {
+		if _, ok := setB[k]; ok {
+			intersection++
+		}
+	}
+	union := len(setA) + len(setB) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+// compositeDistance combines cosine distance (semantic) with Jaccard similarity
+// (entity overlap). Entity overlap pulls the distance down, making memories
+// about the same entities more likely to cluster together.
+func compositeDistance(a, b EpisodeMemory) float64 {
+	cosineDist := 1.0 - cosineSimilarity(a.Embedding, b.Embedding)
+	entitySim := jaccardSimilarity(a.Entities, b.Entities)
+	return cosineDist*0.7 - entitySim*0.3
+}
+
+// clusterSpansDays returns true if the cluster spans more than one calendar day.
+func clusterSpansDays(cluster []EpisodeMemory) bool {
+	if len(cluster) < 2 {
+		return false
+	}
+	firstDay := cluster[0].CreatedAt.Truncate(24 * time.Hour)
+	for _, m := range cluster[1:] {
+		if m.CreatedAt.Truncate(24*time.Hour) != firstDay {
+			return true
+		}
+	}
+	return false
+}
+
 // clusterBySimilarity groups memories using greedy single-linkage clustering.
 // Two memories are linked if their cosine distance < distanceThreshold
 // (i.e., similarity > 1 - distanceThreshold).
@@ -72,7 +125,7 @@ func clusterBySimilarity(memories []EpisodeMemory, distanceThreshold float64) []
 			}
 			// Check if j is similar to any member of the current cluster.
 			for _, member := range cluster {
-				dist := 1.0 - cosineSimilarity(member.Embedding, memories[j].Embedding)
+				dist := compositeDistance(member, memories[j])
 				if dist < distanceThreshold {
 					cluster = append(cluster, memories[j])
 					assigned[j] = true
@@ -90,15 +143,15 @@ func clusterBySimilarity(memories []EpisodeMemory, distanceThreshold float64) []
 // synthesizes each cluster into an episodic memory. Returns the number of
 // episodes created.
 func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel string, synthesize SynthesizeFunc, grammarFn GrammarSubagentFunc) (int, error) {
-	// Query recent non-episode, non-reflection, non-superseded memories from last 24h.
+	// Query recent non-episode, non-reflection, non-superseded memories from last 72h.
 	rows, err := db.Query(ctx,
-		`SELECT id, summary, embedding
+		`SELECT id, summary, embedding, COALESCE(entities, ARRAY[]::TEXT[]), created_at
 		 FROM memories
 		 WHERE superseded_by IS NULL
-		   AND memory_type NOT IN (` + FormatSQLExclusion(ExcludeEpisodic) + `)
-		   AND created_at >= now() - INTERVAL '24 hours'
+		   AND memory_type NOT IN (`+FormatSQLExclusion(ExcludeEpisodic)+`)
+		   AND created_at >= now() - INTERVAL '72 hours'
 		 ORDER BY created_at DESC
-		 LIMIT 50`,
+		 LIMIT 80`,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("query recent memories: %w", err)
@@ -109,7 +162,7 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 	for rows.Next() {
 		var m EpisodeMemory
 		var vec pgvector.Vector
-		if err := rows.Scan(&m.ID, &m.Summary, &vec); err != nil {
+		if err := rows.Scan(&m.ID, &m.Summary, &vec, &m.Entities, &m.CreatedAt); err != nil {
 			continue
 		}
 		m.Embedding = vec.Slice()
@@ -128,7 +181,12 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 
 	episodeCount := 0
 	for _, cluster := range clusters {
-		if len(cluster) < 2 {
+		// Multi-day clusters need at least 3 members to ensure a strong thread.
+		minSize := 2
+		if clusterSpansDays(cluster) {
+			minSize = 3
+		}
+		if len(cluster) < minSize {
 			continue
 		}
 

@@ -13,6 +13,7 @@ For complex questions needing multi-step research, use delegate_task or plan_and
 
 - Call ONE tool per turn. You may include reasoning and context alongside your tool call.
 - Your training data is stale. If the answer could have changed since training, search first. NEVER guess or fabricate details.
+- When the user mentions something specific (a song, book, movie, game, person, event) and search_memory returns nothing relevant, use search_web to look it up. Do NOT ask the user what it is — find out yourself.
 - NEVER fabricate tool results. If a tool returns an error or no data, tell the user honestly or retry with corrected parameters. Do NOT invent fake headlines, summaries, or content.
 - Before using search_web, check if a registered skill can answer directly. Prefer skills over web searches.
 - Read at most %MAX_WEB_SOURCES% web sources per question.

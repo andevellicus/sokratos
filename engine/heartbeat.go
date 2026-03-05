@@ -8,6 +8,7 @@ import (
 
 	objpkg "sokratos/objectives"
 	"sokratos/logger"
+	"sokratos/memory"
 	"sokratos/textutil"
 	"sokratos/timefmt"
 	"sokratos/timeouts"
@@ -35,6 +36,7 @@ type heartbeatContext struct {
 	workItems        []workItem
 	recentActions    []actionRecord
 	objectives       []objpkg.Objective
+	failures         []memory.FailureSummary
 }
 
 // heartbeatTick handles a single heartbeat. Routines run on their own
@@ -60,8 +62,8 @@ func (e *Engine) heartbeatTick() {
 	}
 
 	// Hot-reload skills from disk.
-	if e.SyncFunc != nil {
-		e.SyncFunc()
+	if e.Reloader != nil {
+		e.Reloader.SyncSkills()
 	}
 
 	// Refresh user preferences from DB (picks up externally added prefs).
@@ -108,6 +110,9 @@ func (e *Engine) heartbeatTick() {
 
 	// Objective pursuit: actively work on highest-priority objectives.
 	e.runObjectivePursuitIfReady()
+
+	// Drain event-driven curiosity signals.
+	e.drainCuriositySignals()
 
 	// Phase 3: Periodic maintenance (decay + pruning).
 	e.runMaintenanceIfDue()
@@ -181,6 +186,9 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 	} else {
 		hc.objectives = activeObjectives
 	}
+
+	// Recent failures from the failed_operations table.
+	hc.failures = memory.QueryRecentFailures(queryCtx, e.DB, 6*time.Hour, 5)
 
 	return hc
 }
@@ -259,6 +267,16 @@ func (hc heartbeatContext) toXML() string {
 			fmt.Fprintf(&b, "    <objective %s>%s</objective>\n", attrs, g.Summary)
 		}
 		b.WriteString("  </active_objectives>\n")
+	}
+
+	// Recent background failures.
+	if len(hc.failures) > 0 {
+		b.WriteString("  <recent_failures>\n")
+		for _, f := range hc.failures {
+			fmt.Fprintf(&b, "    <failure type=%q count=\"%d\" last=%q>%s</failure>\n",
+				f.OpType, f.Count, f.LastSeen.Format(time.RFC3339), textutil.Truncate(f.LastError, 120))
+		}
+		b.WriteString("  </recent_failures>\n")
 	}
 
 	b.WriteString("</heartbeat_context>")

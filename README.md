@@ -10,7 +10,7 @@ Sokratos uses a **three-tier dispatch architecture** with two LLM backends and a
 |---------|------|-------|---------|
 | Brain | 11434 | Qwen3.5-122B-A10B (UD-Q4_K_XL) | Deep reasoning, orchestrator for complex requests, consolidation |
 | 9B | 11436 | Qwen3.5-9B (UD-Q4_K_XL) | Dispatch triage, synthesis, subagent tasks, orchestrator fallback (3 slots) |
-| Embedding | 8081 | BGE-large-en-v1.5 (q8_0) | 1024-dim vectors for pgvector |
+| Embedding | 8081 | Qwen3-Embedding-4B (Q8_0) | 2560-dim vectors for pgvector |
 
 ### Message Flow
 
@@ -18,7 +18,7 @@ Every user message goes through the 9B for **grammar-constrained triage**, which
 
 1. **Dispatch (single tool)** — 9B sends an ack, executes the tool, and synthesizes the response. Fully handled by the 9B.
 2. **Dispatch (multi-step)** — 9B sends an ack, then a `SubagentSupervisor` loop runs 2-5 tool rounds with grammar-constrained decisions.
-3. **Escalate to Brain** — 9B sends an instant ack ("Let me think about that..."), the Brain handles reasoning + tool calls silently, and the Brain's final response is sent directly to the user (no synthesis layer).
+3. **Escalate to orchestrator** — the 9B orchestrator handles the request directly (including tool calls). For complex reasoning, the orchestrator can invoke the `reason` tool to escalate to the Brain (122B). A "Thinking..." notification is sent to the user during Brain calls.
 
 A **slot router** manages backend allocation — Brain preferred for interactive messages (accuracy), 9B preferred for background work (throughput). During tool execution, slots are released and reacquired after, preventing long-running tools from blocking LLM access. See [docs/dispatch.md](docs/dispatch.md) for the full technical reference.
 
@@ -80,7 +80,7 @@ SUBAGENT_MODEL=Qwen3.5-9B-UD-Q4_K_XL
 SUBAGENT_SLOTS=3
 
 EMBEDDING_URL=http://your-mac:8081
-EMBEDDING_MODEL=bge-large-en-v1.5-q8_0
+EMBEDDING_MODEL=Qwen3-Embedding-4B-Q8_0
 
 SEARXNG_URL=http://localhost:9000
 ```
@@ -211,7 +211,7 @@ See [docs/dispatch.md](docs/dispatch.md) for the full technical reference on mes
 
 See [docs/memory-system.md](docs/memory-system.md) for the full technical reference.
 
-In brief: memories are stored as 1024-dim vectors in PostgreSQL with pgvector (HNSW index). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a dual-rate system: unretrieved memories (age>14d) use a ~15-day half-life, all others use ~30-day. Episode synthesis clusters related memories and reduces constituent salience by 40% so episodes are preferred in retrieval. Triage includes context-aware coverage checks — if 3+ similar memories already exist, the save bar is raised. Paradigm shifts trigger a fast-path: synchronous transition memory → mini-consolidation → immediate profile refresh. Higher-order synthesis layers (consolidation, episodic synthesis, reflection) are triggered by event-driven cognitive processing based on memory volume and user activity lulls. Reflection insights are routed back into conversation context for the orchestrator.
+In brief: memories are stored as 2560-dim vectors (Qwen3-Embedding-4B) in PostgreSQL with pgvector. At current scale, brute-force scan is used (HNSW/IVFFlat cap at 2000 dims). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a dual-rate system: unretrieved memories (age>14d) use a ~15-day half-life, all others use ~30-day. Episode synthesis clusters related memories and reduces constituent salience by 40% so episodes are preferred in retrieval. Triage includes context-aware coverage checks — if 3+ similar memories already exist, the save bar is raised. Paradigm shifts trigger a fast-path: synchronous transition memory → mini-consolidation → immediate profile refresh. Higher-order synthesis layers (consolidation, episodic synthesis, reflection) are triggered by event-driven cognitive processing based on memory volume and user activity lulls. Reflection insights are routed back into conversation context for the orchestrator.
 
 ## Routines
 
@@ -288,30 +288,39 @@ See `.config/routines.toml.example` for more examples.
 
 ```
 sokratos/
-  main.go              # Telegram bot, message loop, prefetch, wiring
+  main.go              # Entry point, serviceBundle, initServices, initLLM, message loop
+  wire.go              # initEngine, wireEngine (post-construction wiring), startup tasks
+  adapters.go          # Engine interface adapters (notifier, hot-reload, cognitive, reflection)
   message_loop.go      # Dispatch triage, escalation ack, Brain orchestration
+  objective_callbacks.go # Objective task completion and share gate wiring
   register_tools.go    # Domain-grouped tool registration
-  config.go            # Environment variable helpers
   confirm.go           # Telegram confirmation gate for sensitive tools
   prefetch.go          # Subconscious memory prefetch for message loop
   telegram.go          # Telegram helpers (photo download, typing indicator)
   format.go            # Markdown-to-Telegram HTML converter
+  adaptive/            # Runtime-tunable thresholds (Get/Set/Clamp, adaptive_params table)
   clients/             # LLM client hierarchy (baseClient, DTC, SubagentClient)
     base_client.go     # Shared HTTP client, health probe, circuit breaker
     deep_thinker_client.go  # Brain (122B) — thinking/no-think modes
     subagent_client.go      # 9B — semaphore-gated structured tasks
     subagent_supervisor.go  # Multi-turn grammar-constrained tool loop
     workqueue.go       # Priority work queue with retry and admission control
+  config/              # AppConfig struct and env-var parsing
   db/                  # PostgreSQL connection and schema auto-apply
-    schema.sql         # memories, tasks, routines, personality_traits, skill_kv, etc.
+    schema.sql         # memories, objectives, routines, adaptive_params, etc.
   engine/              # Heartbeat loop, context sliding, state, slot routing
-    engine.go          # Engine construction and Run() (3 independent loops)
+    engine.go          # Engine struct and Run() (3 independent loops)
+    interfaces.go      # Notifier, HotReloader, CognitiveServices, ReflectionSink
     cognitive.go       # Event-driven cognitive processing (consolidation, episodes, reflection)
+    curiosity.go       # Signal-driven curiosity dispatch
+    objectives.go      # Objective inference from conversation context
+    objective_pursuit.go # Cooldown-gated objective pursuit
     routines.go        # Routine execution within heartbeat (uses routines/ package)
     scheduler.go       # PostgreSQL-backed task scheduler
-    slide.go           # Context window management and archival (ArchiveDeps)
+    slide.go           # Context window management and archival
     slot_router.go     # Routes orchestrator calls between Brain and 9B
     state.go           # Thread-safe in-memory agent state with DB-backed prefs
+  objectives/          # Objective CRUD (Create, Get, ListActive, Complete, Retire, etc.)
   routines/            # Routine definitions, scheduling, file I/O, DB sync
     routines.go        # Entry, DueRoutine, NilIfEmpty, IsEmptyResult
     schedule.go        # NormalizeSchedule, ParseSchedules, IsScheduleDue (multi-time)
@@ -328,10 +337,11 @@ sokratos/
     ranking.go         # Shared SQL ranking formula (RankingOrderBy)
     bm25.go            # Client-side BM25 utilities
     decay.go           # Salience decay and usefulness regression
-    episodes.go        # Episodic memory synthesis
-    reflection.go      # Meta-cognitive reflection and retrieval tracking
+    episodes.go        # Episodic memory synthesis (thematic clustering)
+    reflection.go      # Meta-cognitive reflection, retrieval tracking, adaptive params
     personality.go     # Personality traits (DB read/write, prompt formatting)
     prefetch.go        # Shared prefetch logic for message loop and heartbeat
+    failed_ops.go      # Failed operation logging and recent failure queries
     format.go          # Memory formatting utilities
   tools/               # Tool implementations and registry
     tools.go           # Registry, Execute, NewScopedToolExec factory
@@ -341,9 +351,11 @@ sokratos/
     transpile.go       # TypeScript → JS transpilation via esbuild
     skill_vm.go        # Goja VM setup and skill runtime globals
     personality.go     # manage_personality tool
+    objectives.go      # manage_objectives tool
     routines.go        # manage_routines tool (uses routines/ package)
     delegate_task.go   # delegate_task tool (scoped tool access)
     plan_execute.go    # plan_and_execute + check_background_task tools
+    shell.go           # run_command tool (sandboxed shell execution)
     search_web.go      # search_web tool (SearXNG)
     read_url.go        # read_url tool (web page fetching)
     run_code.go        # run_code tool (sandboxed JS execution)
@@ -352,6 +364,7 @@ sokratos/
     triage_conversation.go # Conversation/email triage and save
     transition.go      # Paradigm shift fast-path
     bootstrap_profile.go   # Initial profile generation (/bootstrap)
+    triage_queue.go    # Deferred triage retry queue
   google/              # Google OAuth2, Gmail, Calendar clients
   httputil/            # HTTP client factory (shared transport config)
   textutil/            # Shared text processing (strip tags, extract JSON, truncate)

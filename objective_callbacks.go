@@ -112,7 +112,7 @@ type shareEval struct {
 // buildShareGate returns a ShareGate callback that rate-limits and quality-gates
 // proactive sharing of background task results with the user.
 func buildShareGate(sc *clients.SubagentClient, eng *engine.Engine, maxDaily int) func(directive, result string) {
-	if sc == nil || eng == nil || eng.SendFunc == nil {
+	if sc == nil || eng == nil || eng.Notifier == nil {
 		return nil
 	}
 	limiter := engine.NewShareLimiter(maxDaily)
@@ -152,7 +152,7 @@ ws ::= [ \t\n]*`
 		}
 
 		if eval.Summary != "" {
-			eng.SendFunc(eval.Summary)
+			eng.Notifier.Send(eval.Summary)
 			logger.Log.Infof("[share-gate] proactively shared: %s", eval.Summary)
 		}
 	}

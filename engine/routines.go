@@ -30,8 +30,8 @@ func (e *Engine) runRoutineScheduler() {
 
 	for range ticker.C {
 		// Hot-reload routines from disk before checking for due routines.
-		if e.RoutineSyncFunc != nil {
-			e.RoutineSyncFunc()
+		if e.Reloader != nil {
+			e.Reloader.SyncRoutines()
 		}
 		e.executeDueRoutines()
 	}

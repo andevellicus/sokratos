@@ -255,3 +255,12 @@ END $$;
 -- Link work items to the objective they serve.
 ALTER TABLE work_items ADD COLUMN IF NOT EXISTS objective_id BIGINT REFERENCES objectives(id);
 CREATE INDEX IF NOT EXISTS work_items_objective_idx ON work_items (objective_id) WHERE objective_id IS NOT NULL;
+
+-- Adaptive parameters: reflection-driven self-tuning of system thresholds.
+CREATE TABLE IF NOT EXISTS adaptive_params (
+    key VARCHAR(100) PRIMARY KEY,
+    value FLOAT NOT NULL,
+    source VARCHAR(50) NOT NULL DEFAULT 'default',
+    reason TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);

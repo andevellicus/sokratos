@@ -17,7 +17,7 @@ import (
 	"sokratos/tokens"
 )
 
-type consultDeepThinkerArgs struct {
+type deepThinkArgs struct {
 	ProblemStatement string `json:"problem_statement"`
 	MaxTokens        int    `json:"max_tokens,omitempty"` // defaults to 2048 if zero
 }
@@ -39,21 +39,21 @@ var dtcSearchRe = regexp.MustCompile(`(?i)<SEARCH>([\s\S]+?)</SEARCH>`)
 // per consult call (so at most maxDTCSearchRounds+1 total DTC completions).
 const maxDTCSearchRounds = 2
 
-// NewconsultDeepThinker returns a ToolFunc that closes over the given
+// NewDeepThink returns a ToolFunc that closes over the given
 // DeepThinkerClient and optional memory dependencies for context injection.
-func NewconsultDeepThinker(dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) ToolFunc {
+func NewDeepThink(dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		return consultDeepThinker(ctx, args, dtc, pool, embedURL, embedModel)
+		return deepThink(ctx, args, dtc, pool, embedURL, embedModel)
 	}
 }
 
-// consultDeepThinker sends a problem statement to the deep-reasoning LLM.
+// deepThink sends a problem statement to the deep-reasoning LLM.
 // It seeds the call with up to 3 prefetched memories, then runs a search loop:
 // if DTC emits <SEARCH>query</SEARCH> it fetches additional memories and calls
 // DTC again (up to maxDTCSearchRounds extra rounds). All retrieved memory IDs
 // are tracked for usefulness scoring.
-func consultDeepThinker(ctx context.Context, args json.RawMessage, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) (string, error) {
-	var a consultDeepThinkerArgs
+func deepThink(ctx context.Context, args json.RawMessage, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) (string, error) {
+	var a deepThinkArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("[DEEP THINKER UNAVAILABLE]: invalid arguments: %v. Proceed with best available reasoning.", err), nil
 	}
