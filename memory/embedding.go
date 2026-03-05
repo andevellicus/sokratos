@@ -6,11 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
 	"sokratos/httputil"
 )
+
+// eosToken is appended to all embedding inputs for Qwen3-Embedding,
+// which uses last-token pooling with <|endoftext|> as the pooling token.
+const eosToken = "<|endoftext|>"
 
 // --- Embedding client ---
 
@@ -33,11 +38,40 @@ type embeddedChunk struct {
 	Embedding []float32
 }
 
+// appendEOS appends the EOS pooling token to embedding inputs.
+func appendEOS(input any) any {
+	switch v := input.(type) {
+	case string:
+		return v + eosToken
+	case []string:
+		out := make([]string, len(v))
+		for i, s := range v {
+			out[i] = s + eosToken
+		}
+		return out
+	}
+	return input
+}
+
+// normalizeL2 applies L2 normalization to an embedding vector in place.
+func normalizeL2(v []float32) {
+	var sum float64
+	for _, x := range v {
+		sum += float64(x) * float64(x)
+	}
+	if norm := math.Sqrt(sum); norm > 0 {
+		scale := float32(1.0 / norm)
+		for i := range v {
+			v[i] *= scale
+		}
+	}
+}
+
 // doEmbeddingRequest marshals input, sends the HTTP request to the embedding
 // endpoint, checks the response status, and decodes the result. Shared by
 // GetEmbedding and GetEmbeddings.
 func doEmbeddingRequest(ctx context.Context, endpoint, model string, input any) (*embeddingResp, error) {
-	body, err := json.Marshal(embeddingReq{Input: input, Model: model})
+	body, err := json.Marshal(embeddingReq{Input: appendEOS(input), Model: model})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embedding request: %w", err)
 	}
@@ -76,7 +110,9 @@ func GetEmbedding(ctx context.Context, endpoint string, model string, text strin
 	if len(raw.Data) == 0 {
 		return nil, fmt.Errorf("embedding server returned empty data array")
 	}
-	return raw.Data[0].Embedding, nil
+	emb := raw.Data[0].Embedding
+	normalizeL2(emb)
+	return emb, nil
 }
 
 // embedWithFallback embeds text, recursively splitting in half on "too large"

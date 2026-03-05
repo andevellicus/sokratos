@@ -20,9 +20,9 @@ type sendEmailArgs struct {
 // NewSendEmail returns a ToolFunc that sends a plain-text email via Gmail.
 func NewSendEmail(svc *gm.Service) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a sendEmailArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return "", Errorf("invalid arguments: %v", err)
+		a, err := ParseArgs[sendEmailArgs](args)
+		if err != nil {
+			return "", err
 		}
 		if a.To == "" {
 			return "", Errorf("error: 'to' is required")

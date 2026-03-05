@@ -40,7 +40,7 @@ func ValidateTypeScriptSource(source string) (string, error) {
 		return "", err
 	}
 
-	if err := ValidateSkillSource(js); err != nil {
+	if err := validateSkillSource(js); err != nil {
 		return "", fmt.Errorf("transpiled JS validation failed: %w", err)
 	}
 

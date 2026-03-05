@@ -8,13 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
-	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
 
 // bootstrapOutput is the expected dual structure from the bootstrap prompt.
@@ -25,15 +23,11 @@ type bootstrapOutput struct {
 
 // BootstrapConfig holds dependencies for the /bootstrap command.
 type BootstrapConfig struct {
-	Pool          *pgxpool.Pool
-	DTC           *clients.DeepThinkerClient
-	EmbedEndpoint string
-	EmbedModel    string
-	AgentName     string
-	SendFunc      func(string)               // Telegram notification on completion/failure
-	OnProfile     func()                      // refresh engine profile/personality
-	BgGrammarFn   memory.GrammarSubagentFunc  // entity enrichment for saved memories
-	QueueFn       memory.WorkQueueFunc       // work queue for enrichment retries (nil = fire-and-forget)
+	PipelineDeps
+	AgentName string
+	SendFunc  func(string)          // Telegram notification on completion/failure
+	OnProfile func()                // refresh engine profile/personality
+	QueueFn   memory.WorkQueueFunc  // work queue for enrichment retries (nil = fire-and-forget)
 }
 
 // bootstrapResult classifies the outcome of a single bootstrap attempt.
@@ -45,6 +39,15 @@ const (
 	bsRetryJSON                             // JSON parse failure — retry immediately
 	bsRetryTransient                        // transient DTC error — retry after backoff
 )
+
+// bootstrapError bridges bootstrapAttempt's enum-style returns to the error
+// interface, allowing integration with RetryWithBackoff.
+type bootstrapError struct {
+	kind bootstrapResult
+	msg  string
+}
+
+func (e *bootstrapError) Error() string { return e.msg }
 
 // RunBootstrap generates an identity profile via the deep thinker. Intended
 // to be called as a goroutine from the /bootstrap command handler. Notifies
@@ -71,48 +74,37 @@ func RunBootstrap(cfg BootstrapConfig) {
 	}
 	userContent := loadBootstrapContext()
 
-	// Retry loop: up to 4 attempts with exponential backoff for transient errors.
-	const maxAttempts = 4
-	backoff := 5 * time.Second
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		result, state := bootstrapAttempt(ctx, cfg.Pool, cfg.DTC, cfg.EmbedEndpoint, cfg.EmbedModel, prompt, userContent, cfg.OnProfile, cfg.BgGrammarFn, cfg.QueueFn, attempt)
-
-		switch state {
-		case bsSuccess:
-			notify(cfg.SendFunc, result)
-			return
-
-		case bsFatal:
-			// Non-retryable error — notify with the result message.
-			if result != "" {
-				notify(cfg.SendFunc, result)
-			} else {
-				notify(cfg.SendFunc, "Bootstrap failed — check the logs for details.")
-			}
-			return
-
-		case bsRetryJSON:
-			if attempt < maxAttempts {
-				logger.Log.Warnf("[bootstrap] attempt %d: JSON parse failure, retrying...", attempt)
-			}
-
-		case bsRetryTransient:
-			if attempt < maxAttempts {
-				logger.Log.Warnf("[bootstrap] attempt %d: transient error, retrying in %s...", attempt, backoff)
-				select {
-				case <-ctx.Done():
-					notify(cfg.SendFunc, "Bootstrap timed out while waiting for the reasoning server.")
-					return
-				case <-time.After(backoff):
-					backoff *= 2
+	result, err := RetryWithBackoff(ctx, RetryConfig{
+		MaxAttempts:    4,
+		InitialBackoff: 5 * time.Second,
+		LogPrefix:      "bootstrap",
+		IsRetryable: func(e error) (bool, time.Duration) {
+			if be, ok := e.(*bootstrapError); ok {
+				switch be.kind {
+				case bsRetryJSON:
+					return true, 0 // immediate retry
+				case bsRetryTransient:
+					return true, 5 * time.Second
 				}
 			}
+			return false, 0
+		},
+	}, func(attempt int) (string, error) {
+		r, state := bootstrapAttempt(ctx, cfg.PipelineDeps, prompt, userContent, cfg.OnProfile, cfg.QueueFn, attempt)
+		if state == bsSuccess {
+			return r, nil
 		}
+		msg := r
+		if msg == "" {
+			msg = "Bootstrap failed — check the logs for details."
+		}
+		return "", &bootstrapError{kind: state, msg: msg}
+	})
+	if err != nil {
+		notify(cfg.SendFunc, err.Error())
+		return
 	}
-
-	logger.Log.Errorf("[bootstrap] all %d attempts failed", maxAttempts)
-	notify(cfg.SendFunc, "Bootstrap failed after multiple attempts. Please check that the reasoning server is running and try again.")
+	notify(cfg.SendFunc, result)
 }
 
 // notify calls sendFunc if non-nil.
@@ -169,8 +161,8 @@ func isTransientDTCError(err error) bool {
 }
 
 // bootstrapAttempt runs one DTC call + parse cycle. Returns (result, state).
-func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.DeepThinkerClient, embedEndpoint, embedModel, prompt, userContent string, onProfile func(), bgGrammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc, attempt int) (string, bootstrapResult) {
-	raw, err := dtc.CompleteNoThink(ctx, prompt, userContent, 8192)
+func bootstrapAttempt(ctx context.Context, deps PipelineDeps, prompt, userContent string, onProfile func(), queueFn memory.WorkQueueFunc, attempt int) (string, bootstrapResult) {
+	raw, err := deps.DTC.CompleteNoThink(ctx, prompt, userContent, tokens.BootstrapProfile)
 	if err != nil {
 		logger.Log.Errorf("[bootstrap] deep thinker call failed: %v", err)
 		if isTransientDTCError(err) {
@@ -189,7 +181,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.Deep
 	// Try dual structure first; fall back to legacy single-object format.
 	var dual bootstrapOutput
 	if err := json.Unmarshal([]byte(cleaned), &dual); err == nil && len(dual.Personality) > 0 {
-		result, bErr := bootstrapDual(ctx, pool, embedEndpoint, embedModel, bgGrammarFn, queueFn, dual)
+		result, bErr := bootstrapDual(ctx, deps, queueFn, dual)
 		if bErr != nil {
 			logger.Log.Errorf("[bootstrap] failed: %v", bErr)
 			return "Bootstrap failed — could not save profile. Check the logs for details.", bsFatal
@@ -212,7 +204,7 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.Deep
 	pretty, _ := json.MarshalIndent(parsed, "", "  ")
 	profileJSON := string(pretty)
 
-	if err := memory.WriteIdentityProfile(ctx, pool, embedEndpoint, embedModel, profileJSON); err != nil {
+	if err := memory.WriteIdentityProfile(ctx, deps.Pool, deps.EmbedEndpoint, deps.EmbedModel, profileJSON); err != nil {
 		logger.Log.Errorf("[bootstrap] write identity profile failed: %v", err)
 		return "Bootstrap failed — could not save profile. Check the logs for details.", bsFatal
 	}
@@ -227,9 +219,9 @@ func bootstrapAttempt(ctx context.Context, pool *pgxpool.Pool, dtc *clients.Deep
 // bootstrapDual processes the dual-structure bootstrap output: writes personality
 // traits, extracts user preferences and recurring topics to their native stores,
 // and writes a compact identity card (name + important_people only).
-func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embedModel string, bgGrammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc, dual bootstrapOutput) (string, error) {
+func bootstrapDual(ctx context.Context, deps PipelineDeps, queueFn memory.WorkQueueFunc, dual bootstrapOutput) (string, error) {
 	// Write personality traits.
-	traitCount := memory.ApplyPersonalityUpdates(ctx, pool, dual.Personality, "bootstrap")
+	traitCount := memory.ApplyPersonalityUpdates(ctx, deps.Pool, dual.Personality, "bootstrap")
 
 	// Parse the DT output to extract fields and build compact card.
 	var up struct {
@@ -257,7 +249,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 			if pref.Key == "" || pref.Value == "" {
 				continue
 			}
-			_, err := pool.Exec(ctx,
+			_, err := deps.Pool.Exec(ctx,
 				`INSERT INTO user_preferences (key, value, updated_at)
 				 VALUES ($1, $2, NOW())
 				 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
@@ -276,15 +268,15 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 		if topic == "" {
 			continue
 		}
-		memory.SaveToMemoryWithSalienceAsync(pool, memory.MemoryWriteRequest{
+		memory.SaveToMemoryWithSalienceAsync(deps.Pool, memory.MemoryWriteRequest{
 			Summary:       fmt.Sprintf("User's recurring interest/topic: %s", topic),
 			Tags:          []string{"interest", "user_knowledge", "recurring_topic"},
 			Salience:      7,
 			MemoryType:    "general",
 			Source:        "bootstrap",
-			EmbedEndpoint: embedEndpoint,
-			EmbedModel:    embedModel,
-		}, bgGrammarFn, queueFn)
+			EmbedEndpoint: deps.EmbedEndpoint,
+			EmbedModel:    deps.EmbedModel,
+		}, deps.GrammarFn, queueFn)
 		topicCount++
 	}
 	if topicCount > 0 {
@@ -309,7 +301,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 		profileJSON = string(pretty)
 	}
 
-	if err := memory.WriteIdentityProfile(ctx, pool, embedEndpoint, embedModel, profileJSON); err != nil {
+	if err := memory.WriteIdentityProfile(ctx, deps.Pool, deps.EmbedEndpoint, deps.EmbedModel, profileJSON); err != nil {
 		return "", fmt.Errorf("write identity profile: %w", err)
 	}
 
@@ -324,7 +316,7 @@ func bootstrapDual(ctx context.Context, pool *pgxpool.Pool, embedEndpoint, embed
 		{"check-calendar", "6 hours", strPtr("search_calendar"), strPtr("Alert about any events today or tomorrow."), true},
 	}
 	for _, r := range defaultRoutines {
-		_, err := pool.Exec(ctx,
+		_, err := deps.Pool.Exec(ctx,
 			`INSERT INTO routines (name, interval_duration, action, goal, silent_if_empty)
 			 VALUES ($1, $2::interval, $3, $4, $5)
 			 ON CONFLICT (name) DO NOTHING`,

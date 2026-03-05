@@ -8,6 +8,8 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"sokratos/timefmt"
 )
 
 var (
@@ -22,7 +24,7 @@ func Init(dir string) error {
 		return fmt.Errorf("create log directory: %w", err)
 	}
 
-	filename := time.Now().Format("2006-01-02_15-04-05") + ".log"
+	filename := time.Now().Format(timefmt.LogFile) + ".log"
 	path := filepath.Join(dir, filename)
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)

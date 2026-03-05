@@ -10,6 +10,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/tokens"
 )
 
 // --- Contradiction detection ---
@@ -335,7 +336,7 @@ func submitDeferredContradiction(queueFn WorkQueueFunc, db *pgxpool.Pool, newID 
 		SystemPrompt: contradictionSystemPrompt,
 		UserPrompt:   promptBuilder.String(),
 		Grammar:      "", // plain text output (no grammar constraint)
-		MaxTokens:    512,
+		MaxTokens:    tokens.MemoryEnrichment,
 		Timeout:      TimeoutContradictionCheck,
 		Retries:      2,
 		Priority:     PriorityNormal,

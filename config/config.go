@@ -55,6 +55,11 @@ type AppConfig struct {
 	ReflectionMemoryThreshold int
 	ShellHistoryTTLDays       int
 
+	ObjectivePursuitCooldown   time.Duration
+	ObjectiveInferenceCooldown time.Duration
+	CuriosityCooldown     time.Duration
+	MaxDailyShares        int
+
 	WorkspaceDir string
 
 	MaintenanceInterval   time.Duration
@@ -121,6 +126,11 @@ func Load() *AppConfig {
 		SkillKVTTLDays:            EnvInt("SKILL_KV_TTL_DAYS", 90),
 		ReflectionMemoryThreshold: EnvInt("REFLECTION_MEMORY_THRESHOLD", 50),
 		ShellHistoryTTLDays:       EnvInt("SHELL_HISTORY_TTL_DAYS", 30),
+
+		ObjectivePursuitCooldown:   EnvDuration("OBJECTIVE_PURSUIT_COOLDOWN", 4*time.Hour),
+		ObjectiveInferenceCooldown: EnvDuration("OBJECTIVE_INFERENCE_COOLDOWN", 8*time.Hour),
+		CuriosityCooldown:     EnvDuration("CURIOSITY_COOLDOWN", 2*time.Hour),
+		MaxDailyShares:        EnvInt("MAX_DAILY_SHARES", 3),
 
 		WorkspaceDir: EnvString("WORKSPACE_DIR", "workspace"),
 

@@ -16,6 +16,8 @@ import (
 	"sokratos/memory"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/timeouts"
+	"sokratos/tokens"
 )
 
 // triageResult is the structured output from a triage call.
@@ -37,7 +39,7 @@ func triageViaDTC(ctx context.Context, dtc *clients.DeepThinkerClient, triageGra
 		content = textutil.Truncate(content, maxLen)
 	}
 
-	raw, err := dtc.CompleteNoThinkWithGrammar(ctx, systemPrompt, content, triageGrammar, 2048)
+	raw, err := dtc.CompleteNoThinkWithGrammar(ctx, systemPrompt, content, triageGrammar, tokens.TriageDTC)
 	if err != nil {
 		return nil, fmt.Errorf("triage request: %w", err)
 	}
@@ -210,7 +212,7 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 
 	if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {
 		go func() {
-			psCtx, psCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			psCtx, psCancel := context.WithTimeout(context.Background(), timeouts.ParadigmShift)
 			defer psCancel()
 			// Build PipelineDeps from TriageConfig.
 			psDeps := PipelineDeps{
@@ -286,6 +288,8 @@ func TriageAndSaveConversationAsync(cfg TriageConfig, exchange string, toolsUsed
 			logger.Log.Warnf("[conversation_triage] triage failed: %v", err)
 			if cfg.RetryQueue != nil {
 				EnqueueConversationTriage(cfg.RetryQueue, cfg, triageInput, exchange, toolsUsed)
+			} else {
+				memory.LogFailedOp(cfg.Pool, "conversation_triage", "triage", err, nil)
 			}
 		}
 	}()
@@ -322,6 +326,8 @@ func TriageAndSaveEmailAsync(cfg TriageConfig, email google.Email) {
 			logger.Log.Warnf("[email_triage] failed: %v", err)
 			if cfg.RetryQueue != nil {
 				EnqueueEmailTriage(cfg.RetryQueue, cfg, formatted, formatted)
+			} else {
+				memory.LogFailedOp(cfg.Pool, "email_triage", "triage", err, nil)
 			}
 		}
 	}()
@@ -355,7 +361,7 @@ ws ::= [ \t\n\r]*`
 // triage summary and upserts it into personality_traits. Mirrors the paradigm
 // shift fast-path pattern.
 func applyPreferenceFastPath(cfg TriageConfig, summary, domainTag string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.MemorySave)
 	defer cancel()
 
 	prompt := `Extract one personality trait from this user preference. Return JSON:
@@ -366,7 +372,7 @@ func applyPreferenceFastPath(cfg TriageConfig, summary, domainTag string) {
 - key: brief snake_case identifier (e.g. "hobby_references", "verbosity", "emoji_usage")
 - value: concise description of what the user wants`
 
-	raw, err := cfg.DTC.CompleteNoThinkWithGrammar(ctx, prompt, summary, preferenceExtractionGrammar, 512)
+	raw, err := cfg.DTC.CompleteNoThinkWithGrammar(ctx, prompt, summary, preferenceExtractionGrammar, tokens.PreferenceExtract)
 	if err != nil {
 		logger.Log.Warnf("[triage:%s] preference extraction failed: %v", domainTag, err)
 		return

@@ -12,6 +12,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/timeouts"
 )
 
 // SubagentFunc calls a subagent model with system + user prompts and
@@ -109,6 +110,7 @@ func SaveToMemoryWithSalienceAsync(db *pgxpool.Pool, req MemoryWriteRequest, gra
 		id, err := ScoreAndWrite(ctx, db, req, grammarFn, queueFn)
 		if err != nil {
 			logger.Log.Errorf("[memory] async save failed: %v", err)
+			LogFailedOp(db, "memory_save", req.Source, err, map[string]any{"tags": req.Tags})
 			return
 		}
 		logger.Log.Infof("[memory] saved id=%d (salience=%.0f, tags=%v, source=%s)", id, req.Salience, req.Tags, req.Source)
@@ -253,7 +255,7 @@ func WriteIdentityProfile(ctx context.Context, db *pgxpool.Pool, embedEndpoint, 
 // limit, keeping the most recent `keep` rows (the active profile is always
 // the newest and is therefore always retained).
 func purgeSupersededProfiles(db *pgxpool.Pool, keep int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.RoutineDB)
 	defer cancel()
 
 	res, err := db.Exec(ctx,

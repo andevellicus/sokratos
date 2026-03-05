@@ -3,11 +3,11 @@ package memory
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/logger"
+	"sokratos/timeouts"
 )
 
 // LogFailedOp records a failed cognitive operation to the failed_operations
@@ -18,7 +18,7 @@ func LogFailedOp(pool *pgxpool.Pool, opType, label string, opErr error, contextD
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeouts.DBQuery)
 		defer cancel()
 
 		var ctxJSON []byte

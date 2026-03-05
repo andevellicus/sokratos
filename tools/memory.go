@@ -18,6 +18,7 @@ import (
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/timefmt"
+	"sokratos/tokens"
 )
 
 // --- Search tool ---
@@ -83,7 +84,7 @@ func rewriteQuery(ctx context.Context, sc *clients.SubagentClient, query string)
 	rewriteCtx, cancel := context.WithTimeout(ctx, TimeoutSubagentCall)
 	defer cancel()
 
-	content, err := sc.Complete(rewriteCtx, rewriteSystemPrompt, query, 512)
+	content, err := sc.Complete(rewriteCtx, rewriteSystemPrompt, query, tokens.QueryRewrite)
 	if err != nil {
 		logger.Log.Warnf("[memory] query rewrite failed: %v", err)
 		return nil
@@ -166,19 +167,19 @@ func queryMemories(ctx context.Context, pool *pgxpool.Pool, emb []float32, query
 	return results, rows.Err()
 }
 
-// SearchMemory implements multi-embedding retrieve, deduplicate, and re-rank:
+// searchMemory implements multi-embedding retrieve, deduplicate, and re-rank:
 //  1. Rewrite query via subagent → up to 3 variations
 //  2. Embed original + variations → up to 4 embeddings
 //  3. Query DB per embedding (LIMIT 5 each), deduplicate by content hash
 //  4. Re-rank candidates via subagent (if available and candidates > limit)
 //  5. Return top results sorted by relevance
-func SearchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *clients.SubagentClient, limit int) (string, error) {
+func searchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *clients.SubagentClient, limit int) (string, error) {
 	if limit <= 0 {
 		limit = 3
 	}
-	var a searchMemoryArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return fmt.Sprintf("invalid arguments: %v", err), nil
+	a, err := ParseArgs[searchMemoryArgs](args)
+	if err != nil {
+		return err.Error(), nil
 	}
 	if strings.TrimSpace(a.Query) == "" {
 		return "", fmt.Errorf("query must not be empty")
@@ -344,7 +345,7 @@ func rerankResults(ctx context.Context, sc *clients.SubagentClient, query string
 	rerankCtx, cancel := context.WithTimeout(ctx, TimeoutSubagentCall)
 	defer cancel()
 
-	content, err := sc.Complete(rerankCtx, rerankSystemPrompt, sb.String(), 256)
+	content, err := sc.Complete(rerankCtx, rerankSystemPrompt, sb.String(), tokens.Rerank)
 	if err != nil {
 		logger.Log.Warnf("[memory] re-ranking failed, using original order: %v", err)
 		return results
@@ -462,7 +463,7 @@ func saveMemoryAsync(pool *pgxpool.Pool, embedEndpoint, embedModel string,
 // NewSearchMemory returns a ToolFunc that closes over the pool, endpoints, and subagent.
 func NewSearchMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string, subagent *clients.SubagentClient, limit int) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		return SearchMemory(ctx, args, pool, embedEndpoint, embedModel, subagent, limit)
+		return searchMemory(ctx, args, pool, embedEndpoint, embedModel, subagent, limit)
 	}
 }
 
@@ -475,9 +476,9 @@ func NewSaveMemory(pool *pgxpool.Pool, embedEndpoint, embedModel string,
 	bgGrammarFn memory.GrammarSubagentFunc, grammarFn memory.GrammarSubagentFunc, queueFn memory.WorkQueueFunc) ToolFunc {
 
 	return func(_ context.Context, args json.RawMessage) (string, error) {
-		var a saveMemoryArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[saveMemoryArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		summary := strings.TrimSpace(a.Summary)
 		if summary == "" || strings.HasPrefix(summary, "<No ") || strings.HasPrefix(summary, "<no ") {

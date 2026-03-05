@@ -9,19 +9,22 @@ import (
 
 	"sokratos/logger"
 	"sokratos/memory"
+	objpkg "sokratos/objectives"
 	"sokratos/textutil"
 	"sokratos/timeouts"
+	"sokratos/tokens"
 )
 
 const (
-	curiosityCooldown    = 4 * time.Hour // min time between curiosity runs
-	curiosityMaxInactive = 6 * time.Hour // only trigger if user was active within this window
-	curiosityMinMemories = 15            // min recent memories to have enough signal
+	defaultCuriosityCooldown = 2 * time.Hour // min time between curiosity runs
+	curiosityMaxInactive     = 6 * time.Hour // only trigger if user was active within this window
+	curiosityMinMemories     = 15            // min recent memories to have enough signal
 )
 
 // CuriosityFunc is called by the curiosity engine with a research directive.
 // It should decompose and launch a background task. Returns the task ID.
-type CuriosityFunc func(directive string, priority int) (int64, error)
+// objectiveID is non-zero when launching for a specific objective (0 = curiosity/no objective).
+type CuriosityFunc func(directive string, priority int, objectiveID int64) (int64, error)
 
 // runCuriosityIfReady checks conditions and optionally fires a proactive
 // research task. Inserted as a phase in cognitive processing.
@@ -31,7 +34,11 @@ func (e *Engine) runCuriosityIfReady() {
 	}
 
 	// Cooldown check.
-	if time.Since(e.lastCuriosityRun) < curiosityCooldown {
+	cooldown := e.CuriosityCooldown
+	if cooldown == 0 {
+		cooldown = defaultCuriosityCooldown
+	}
+	if time.Since(e.lastCuriosityRun) < cooldown {
 		return
 	}
 
@@ -62,25 +69,8 @@ func (e *Engine) runCuriosityIfReady() {
 		return
 	}
 
-	// Query active goals (same pattern as heartbeat).
-	var goals []activeGoal
-	goalRows, gErr := e.DB.Query(ctx,
-		`SELECT id, summary FROM memories
-		 WHERE memory_type = 'goal'
-		   AND superseded_by IS NULL
-		   AND salience >= 6
-		   AND created_at >= NOW() - INTERVAL '14 days'
-		 ORDER BY salience DESC, created_at DESC
-		 LIMIT 3`)
-	if gErr == nil {
-		for goalRows.Next() {
-			var g activeGoal
-			if err := goalRows.Scan(&g.ID, &g.Summary); err == nil {
-				goals = append(goals, g)
-			}
-		}
-		goalRows.Close()
-	}
+	// Query active objectives from the objectives table.
+	activeObjectives, _ := objpkg.ListActive(ctx, e.DB)
 
 	// Ask the gatekeeper (Flash) to generate a research question.
 	prompt := `You are generating a proactive research question based on recent conversation patterns.
@@ -90,16 +80,16 @@ Rules:
 - The directive must be actionable via search_web + read_url tools.
 - Focus on topics the user has shown interest in but where knowledge is incomplete.
 - Do NOT repeat research that has already been done (check the summaries).
-- If active goals exist, STRONGLY prefer research that advances one of them. Reference which goal the research serves in the directive.
-- Only explore random tangents if no active goals exist or none have actionable research angles.
+- If active objectives exist, STRONGLY prefer research that advances one of them. Reference which objective the research serves in the directive.
+- Only explore random tangents if no active objectives exist or none have actionable research angles.
 - If nothing is worth researching, output: {"directive": "", "reasoning": "no gaps found"}`
 
-	// Build user content with goals prepended.
+	// Build user content with objectives prepended.
 	var uc strings.Builder
-	if len(goals) > 0 {
-		uc.WriteString("Active goals:\n")
-		for i, g := range goals {
-			fmt.Fprintf(&uc, "%d. %s\n", i+1, cleanGoalSummary(g.Summary))
+	if len(activeObjectives) > 0 {
+		uc.WriteString("Active objectives:\n")
+		for i, g := range activeObjectives {
+			fmt.Fprintf(&uc, "%d. %s\n", i+1, g.Summary)
 		}
 		uc.WriteString("\n")
 	}
@@ -113,7 +103,7 @@ char ::= [^"\\] | "\\" escape
 escape ::= ["\\nrt/]
 ws ::= [ \t\n]*`
 
-	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, userContent, grammarStr, 256)
+	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, userContent, grammarStr, tokens.GatekeeperDecision)
 	if err != nil {
 		logger.Log.Warnf("[curiosity] gatekeeper error: %v", err)
 		return
@@ -130,7 +120,7 @@ ws ::= [ \t\n]*`
 
 	// Launch background research task.
 	directive := fmt.Sprintf("[curiosity] %s", result.Directive)
-	taskID, err := e.Cognitive.CuriosityFunc(directive, 3) // low priority
+	taskID, err := e.Cognitive.CuriosityFunc(directive, 3, 0) // low priority, no objective
 	if err != nil {
 		logger.Log.Warnf("[curiosity] failed to launch: %v", err)
 		return

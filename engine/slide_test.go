@@ -258,3 +258,49 @@ func TestFingerprintMessages(t *testing.T) {
 		t.Error("different messages should produce different fingerprints")
 	}
 }
+
+func TestRecoverPartialFacts_Complete(t *testing.T) {
+	input := `{"facts": [{"text":"fact one","salience":7,"tags":["a"]},{"text":"fact two","salience":8,"tags":["b"]}]}`
+	facts := recoverPartialFacts(input)
+	if len(facts) != 2 {
+		t.Fatalf("recoverPartialFacts complete: got %d facts, want 2", len(facts))
+	}
+	if facts[0].Text != "fact one" || facts[1].Text != "fact two" {
+		t.Errorf("recoverPartialFacts complete: got %+v", facts)
+	}
+}
+
+func TestRecoverPartialFacts_Truncated(t *testing.T) {
+	// Two complete facts, third truncated mid-object.
+	input := `{"facts": [{"text":"one","salience":7,"tags":[]},{"text":"two","salience":8,"tags":[]},{"text":"thr`
+	facts := recoverPartialFacts(input)
+	if len(facts) != 2 {
+		t.Errorf("recoverPartialFacts truncated: got %d facts, want 2", len(facts))
+	}
+}
+
+func TestRecoverPartialFacts_NoFacts(t *testing.T) {
+	facts := recoverPartialFacts("garbage input with no JSON")
+	if len(facts) != 0 {
+		t.Errorf("recoverPartialFacts garbage: got %d facts, want 0", len(facts))
+	}
+}
+
+func TestRecoverPartialFacts_EmptyText(t *testing.T) {
+	input := `{"text":"","salience":5,"tags":[]}`
+	facts := recoverPartialFacts(input)
+	if len(facts) != 0 {
+		t.Errorf("recoverPartialFacts empty text: got %d facts, want 0 (empty text filtered)", len(facts))
+	}
+}
+
+func TestRecoverPartialFacts_BracesInText(t *testing.T) {
+	input := `{"text":"a {b} c","salience":6,"tags":["x"]}`
+	facts := recoverPartialFacts(input)
+	if len(facts) != 1 {
+		t.Fatalf("recoverPartialFacts braces: got %d facts, want 1", len(facts))
+	}
+	if facts[0].Text != "a {b} c" {
+		t.Errorf("recoverPartialFacts braces: text = %q, want %q", facts[0].Text, "a {b} c")
+	}
+}

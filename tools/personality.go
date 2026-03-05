@@ -23,9 +23,9 @@ type managePersonalityArgs struct {
 // The refreshFn callback updates the cached personality in the engine after mutations.
 func NewManagePersonality(pool *pgxpool.Pool, refreshFn func()) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a managePersonalityArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("Invalid arguments: %v", err), nil
+		a, err := ParseArgs[managePersonalityArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 
 		switch strings.ToLower(a.Action) {

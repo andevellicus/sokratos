@@ -123,6 +123,14 @@ var closingToolIntentRe = regexp.MustCompile(`</TOOL_INTENT>`)
 // a <CODE> block.
 var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)</TOOL_INTENT>`)
 
+// resolveParser returns the parser from opts, defaulting to SupervisorParser.
+func resolveParser(opts *QueryOrchestratorOpts) ToolIntentParser {
+	if opts != nil && opts.ToolAgent != nil && opts.ToolAgent.Parser != nil {
+		return opts.ToolAgent.Parser
+	}
+	return SupervisorParser{}
+}
+
 // extractToolIntent extracts the content of the first <TOOL_INTENT> tag.
 // It tries the CODE-block pattern first, then falls back to the simple one.
 func extractToolIntent(s string) (string, bool) {
@@ -353,29 +361,25 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 		content := textutil.StripThinkTags(raw)
 		logger.Log.Infof("[llm:supervisor] %s", content)
 
-		// Check for tool intent.
-		if intent, ok := extractToolIntent(content); ok {
-			// If the intent is just a bare tool name without arguments,
-			// push back to the orchestrator so it retries with proper args.
-			if !strings.Contains(intent, ":") && !strings.Contains(intent, "{") {
-				logger.Log.Warnf("[llm:supervisor] bare tool intent %q — requesting retry with arguments", intent)
-				messages = append(messages, Message{Role: "assistant", Content: raw})
-				messages = append(messages, Message{Role: "user", Content: "Your TOOL_INTENT must include arguments as JSON. Example: <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>. For tools with no arguments, use: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>"})
-				continue
-			}
+		// Check for tool intent via the pluggable parser.
+		parser := resolveParser(opts)
+		pr := parser.Parse(content)
 
+		if pr.Found && pr.BareIntent {
+			logger.Log.Warnf("[llm:supervisor] bare tool intent — requesting retry with arguments")
 			messages = append(messages, Message{Role: "assistant", Content: raw})
-
-			// Parse intent directly — the orchestrator already provides
-			// "tool_name: {args_json}" which we can construct into a tool
-			// call without an intermediate LLM.
-			toolJSON, ok := parseToolIntent(intent)
-			if !ok {
-				logger.Log.Warnf("[llm:supervisor] intent parse failed: %s", toolJSON)
-				messages = append(messages, Message{Role: "user", Content: "Tool call error: " + toolJSON})
-				continue
-			}
-
+			messages = append(messages, Message{Role: "user", Content: "Your TOOL_INTENT must include arguments as JSON. Example: <TOOL_INTENT>tool_name: {\"param\": \"value\"}</TOOL_INTENT>. For tools with no arguments, use: <TOOL_INTENT>tool_name: {}</TOOL_INTENT>"})
+			continue
+		}
+		if pr.Found && pr.Error != "" {
+			logger.Log.Warnf("[llm:supervisor] intent parse failed: %s", pr.Error)
+			messages = append(messages, Message{Role: "assistant", Content: raw})
+			messages = append(messages, Message{Role: "user", Content: "Tool call error: " + pr.Error})
+			continue
+		}
+		if pr.Found {
+			messages = append(messages, Message{Role: "assistant", Content: raw})
+			toolJSON := pr.ToolCallJSON
 			logger.Log.Infof("[llm:supervisor] parsed tool call: %s", toolJSON)
 
 			// Execute the tool.

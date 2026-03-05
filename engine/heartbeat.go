@@ -6,19 +6,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
+	objpkg "sokratos/objectives"
 	"sokratos/logger"
 	"sokratos/textutil"
 	"sokratos/timefmt"
 	"sokratos/timeouts"
 )
-
-// activeGoal represents an inferred user goal from memory.
-type activeGoal struct {
-	ID      int64
-	Summary string
-}
 
 // workItem represents a row from the unified work_items table for heartbeat
 // context assembly.
@@ -41,7 +34,7 @@ type heartbeatContext struct {
 	userLastActive   string // RFC3339 timestamp of last user message
 	workItems        []workItem
 	recentActions    []actionRecord
-	goals            []activeGoal
+	objectives       []objpkg.Objective
 }
 
 // heartbeatTick handles a single heartbeat. Routines run on their own
@@ -113,8 +106,8 @@ func (e *Engine) heartbeatTick() {
 		SlideAndArchiveContext(context.Background(), e.SM, e.MaxMessages, e.archiveDeps())
 	}
 
-	// Goal pursuit: actively work on highest-salience goals.
-	e.runGoalPursuitIfReady()
+	// Objective pursuit: actively work on highest-priority objectives.
+	e.runObjectivePursuitIfReady()
 
 	// Phase 3: Periodic maintenance (decay + pruning).
 	e.runMaintenanceIfDue()
@@ -181,67 +174,15 @@ func (e *Engine) gatherHeartbeatContext() heartbeatContext {
 		rows.Close()
 	}
 
-	// Active inferred goals (recent, high-salience, non-superseded).
-	goalRows, err := e.DB.Query(queryCtx,
-		`SELECT id, summary FROM memories
-		 WHERE memory_type = 'goal'
-		   AND superseded_by IS NULL
-		   AND salience >= 6
-		   AND created_at >= NOW() - INTERVAL '14 days'
-		 ORDER BY salience DESC, created_at DESC
-		 LIMIT 3`)
+	// Active objectives from the objectives table.
+	activeObjectives, err := objpkg.ListActive(queryCtx, e.DB)
 	if err != nil {
-		logger.Log.Warnf("heartbeat: failed to query goals: %v", err)
+		logger.Log.Warnf("heartbeat: failed to query objectives: %v", err)
 	} else {
-		for goalRows.Next() {
-			var g activeGoal
-			if err := goalRows.Scan(&g.ID, &g.Summary); err != nil {
-				logger.Log.Warnf("heartbeat: failed to scan goal row: %v", err)
-				continue
-			}
-			// Skip goals that have recent background task attempts.
-			if isGoalAlreadyAttempted(queryCtx, e.DB, g.Summary) {
-				continue
-			}
-			hc.goals = append(hc.goals, g)
-		}
-		goalRows.Close()
+		hc.objectives = activeObjectives
 	}
 
 	return hc
-}
-
-// cleanGoalSummary strips the "[Inferred Goal] " prefix and "\nEvidence:" suffix
-// from a goal memory summary, returning just the goal text.
-func cleanGoalSummary(summary string) string {
-	clean := summary
-	if idx := strings.Index(clean, "[Inferred Goal] "); idx >= 0 {
-		clean = clean[idx+len("[Inferred Goal] "):]
-	}
-	if idx := strings.Index(clean, "\nEvidence:"); idx >= 0 {
-		clean = clean[:idx]
-	}
-	return strings.TrimSpace(clean)
-}
-
-// isGoalAlreadyAttempted checks if a work item was recently (24h) started
-// for a goal. It strips the "[Inferred Goal]" prefix and evidence, then checks
-// for ILIKE match against recent work item directives.
-func isGoalAlreadyAttempted(ctx context.Context, db *pgxpool.Pool, goalSummary string) bool {
-	clean := cleanGoalSummary(goalSummary)
-	if clean == "" {
-		return false
-	}
-
-	var count int
-	err := db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM work_items
-		 WHERE created_at >= NOW() - INTERVAL '24 hours'
-		   AND directive ILIKE '%' || $1 || '%'`, clean).Scan(&count)
-	if err != nil {
-		return false // fail open
-	}
-	return count > 0
 }
 
 // toXML formats the heartbeat context as a dense XML block. Empty sections
@@ -304,15 +245,20 @@ func (hc heartbeatContext) toXML() string {
 		b.WriteString("  </recent_actions>\n")
 	}
 
-	// Active inferred goals.
-	if len(hc.goals) == 0 {
-		b.WriteString("  <active_goals>none</active_goals>\n")
+	// Active objectives with lifecycle info.
+	if len(hc.objectives) == 0 {
+		b.WriteString("  <active_objectives>none</active_objectives>\n")
 	} else {
-		b.WriteString("  <active_goals>\n")
-		for _, g := range hc.goals {
-			fmt.Fprintf(&b, "    <goal id=\"%d\">%s</goal>\n", g.ID, cleanGoalSummary(g.Summary))
+		b.WriteString("  <active_objectives>\n")
+		for _, g := range hc.objectives {
+			attrs := fmt.Sprintf("id=\"%d\" status=\"%s\" priority=\"%s\" attempts=\"%d\"",
+				g.ID, g.Status, g.Priority, g.Attempts)
+			if g.LastPursued != nil {
+				attrs += fmt.Sprintf(" last_pursued=\"%s\"", g.LastPursued.Format(time.RFC3339))
+			}
+			fmt.Fprintf(&b, "    <objective %s>%s</objective>\n", attrs, g.Summary)
 		}
-		b.WriteString("  </active_goals>\n")
+		b.WriteString("  </active_objectives>\n")
 	}
 
 	b.WriteString("</heartbeat_context>")

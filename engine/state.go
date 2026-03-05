@@ -299,7 +299,7 @@ func (sm *StateManager) persistSnapshot() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.SnapshotSave)
 	defer cancel()
 
 	_, err = sm.pool.Exec(ctx,

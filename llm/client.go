@@ -201,7 +201,8 @@ var systemPromptBase = strings.TrimSpace(prompts.System)
 // the orchestrator produces free-form text with <TOOL_INTENT> tags, and
 // parseToolIntent translates intents into structured JSON.
 type ToolAgentConfig struct {
-	ToolDescriptions string // full tool descriptions for system prompt (static + dynamic skills)
+	ToolDescriptions string          // full tool descriptions for system prompt (static + dynamic skills)
+	Parser           ToolIntentParser // nil defaults to SupervisorParser{}
 }
 
 // QueryOrchestratorOpts holds optional parameters for QueryOrchestrator.

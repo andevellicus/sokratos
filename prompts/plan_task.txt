@@ -20,6 +20,7 @@ Rules:
 - The "tools_needed" array should list which tools the step is likely to use (for logging/planning only — the subagent has access to all allowed tools regardless).
 - Do NOT include steps that require user interaction or confirmation.
 - Do NOT include steps that the subagent cannot accomplish with its available tools.
+- When the directive involves writing code, prefer creating a TypeScript skill via create_skill over writing files to disk. The skill runtime (goja/esbuild, ES2020) supports http_request, call_tool, delegate, KV store, and more. Use manage_skills with action "test" to iterate.
 - If the directive is too vague to decompose, return a single step that gathers clarifying information.
 - Each step should produce a concrete result that subsequent steps can build upon.
 - Mark synthesis/analysis steps clearly (e.g., "Analyze the search results..." or "Synthesize findings...") — these will be routed to a stronger reasoning model. Information-gathering steps should come first.

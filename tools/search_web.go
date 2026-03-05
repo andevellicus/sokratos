@@ -33,9 +33,9 @@ func NewSearchWeb(searxngURL string) ToolFunc {
 	client := httputil.NewClient(TimeoutSearXNG)
 
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a searchWebArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[searchWebArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if strings.TrimSpace(a.Query) == "" {
 			return "query is required", nil

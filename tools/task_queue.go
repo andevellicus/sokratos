@@ -22,9 +22,9 @@ type addTaskArgs struct {
 // current wait.
 func NewAddTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a addTaskArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[addTaskArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if a.Task == "" {
 			return "error: task is required", nil
@@ -61,7 +61,7 @@ func NewAddTask(pool *pgxpool.Pool, interruptChan chan struct{}) ToolFunc {
 		}
 
 		var id int64
-		err := pool.QueryRow(ctx,
+		err = pool.QueryRow(ctx,
 			`INSERT INTO work_items (type, directive, due_at, recurrence, status)
 			 VALUES ('scheduled', $1, $2, $3, 'pending') RETURNING id`,
 			a.Task, dueAt, recurrenceNs).Scan(&id)

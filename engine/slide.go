@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
@@ -17,6 +16,7 @@ import (
 	"sokratos/textutil"
 	"sokratos/timefmt"
 	"sokratos/timeouts"
+	"sokratos/tokens"
 )
 
 // ArchiveDeps groups dependencies for context archival (embedding + memory save).
@@ -215,7 +215,7 @@ func distillAndSaveArchive(deps ArchiveDeps, archiveText string) {
 			SystemPrompt: prompt,
 			UserPrompt:   archiveText,
 			Grammar:      distillationGrammar,
-			MaxTokens:    2048,
+			MaxTokens:    tokens.Distillation,
 			Timeout:      timeouts.Distillation,
 			Retries:      2,
 			Priority:     memory.PriorityHigh,
@@ -244,13 +244,14 @@ func distillViaSubagent(deps ArchiveDeps, prompt, archiveText string) {
 			SystemPrompt: prompt,
 			UserPrompt:   archiveText,
 			Grammar:      distillationGrammar,
-			MaxTokens:    2048,
+			MaxTokens:    tokens.Distillation,
 			Timeout:      timeouts.Distillation,
 			Retries:      2,
 			Priority:     memory.PriorityHigh,
 			OnComplete: func(raw string, err error) {
 				if err != nil {
 					logger.Log.Warnf("[slide] conversation distillation failed: %v; discarding archive", err)
+					memory.LogFailedOp(deps.DB, "distillation", "subagent_queue", err, nil)
 					return
 				}
 				saveDistilledFacts(deps, raw)
@@ -276,6 +277,7 @@ func distillViaSubagent(deps ArchiveDeps, prompt, archiveText string) {
 	}
 	if err != nil {
 		logger.Log.Warnf("[slide] conversation distillation failed: %v; discarding archive", err)
+		memory.LogFailedOp(deps.DB, "distillation", "direct_call", err, nil)
 		return
 	}
 	saveDistilledFacts(deps, raw)
@@ -361,7 +363,7 @@ func saveDistilledFacts(deps ArchiveDeps, raw string) {
 // isNearDuplicate embeds the text and checks if a semantically similar memory
 // already exists. Returns false on any error (fail-open).
 func isNearDuplicate(deps ArchiveDeps, text string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), memory.TimeoutEmbeddingCall)
 	defer cancel()
 
 	emb, err := memory.GetEmbedding(ctx, deps.EmbedEndpoint, deps.EmbedModel, text)

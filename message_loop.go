@@ -88,18 +88,20 @@ func handleBootstrap(mc messageContext) string {
 		}
 	}
 	go pipelines.RunBootstrap(pipelines.BootstrapConfig{
-		Pool:          db.Pool,
-		DTC:           mc.svc.DTC,
-		EmbedEndpoint: mc.cfg.EmbedURL,
-		EmbedModel:    mc.cfg.EmbedModel,
-		AgentName:     mc.cfg.AgentName,
-		SendFunc:      bootstrapSend,
+		PipelineDeps: pipelines.PipelineDeps{
+			Pool:          db.Pool,
+			DTC:           mc.svc.DTC,
+			EmbedEndpoint: mc.cfg.EmbedURL,
+			EmbedModel:    mc.cfg.EmbedModel,
+			GrammarFn:     mc.svc.BgGrammarFunc,
+		},
+		AgentName: mc.cfg.AgentName,
+		SendFunc:  bootstrapSend,
 		OnProfile: func() {
 			mc.eng.RefreshProfile()
 			mc.eng.RefreshPersonality()
 		},
-		BgGrammarFn: mc.svc.BgGrammarFunc,
-		QueueFn:     mc.svc.QueueFunc,
+		QueueFn: mc.svc.QueueFunc,
 	})
 	return "Profile generation started in the background. I'll notify you when it's ready."
 }
@@ -201,6 +203,17 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 
 	// Phase 1: Snapshot history (StateManager has its own RWMutex).
 	history := mc.svc.StateMgr.ReadMessages()
+
+	// Phase 1.5: Staleness trim — if there's a long gap since the last
+	// conversation message, old topics are stale and will confuse the Brain.
+	// Keep only recent messages for immediate context.
+	const staleGap = 30 * time.Minute
+	if len(history) > 4 {
+		lastMsg := history[len(history)-1]
+		if !lastMsg.Time.IsZero() && time.Since(lastMsg.Time) > staleGap {
+			history = history[len(history)-4:]
+		}
+	}
 
 	// Phase 2: Prefetch (network I/O — no engine state needed).
 	var prefetchContent string
@@ -439,6 +452,10 @@ var neverDispatchTools = map[string]bool{
 	"plan_and_execute":    true,
 	"delegate_task":       true,
 	"ask_database":        true,
+	"manage_objectives":   true,
+	"write_file":          true,
+	"patch_file":          true,
+	"update_skill":        true,
 }
 
 // dispatchEscalation captures context from a failed dispatch attempt so

@@ -17,6 +17,7 @@ import (
 	"sokratos/prompts"
 	"sokratos/textutil"
 	"sokratos/timefmt"
+	"sokratos/tokens"
 )
 
 // PipelineDeps groups the common dependencies threaded through consolidation,
@@ -289,7 +290,7 @@ func ConsolidateCore(ctx context.Context, deps PipelineDeps, opts ConsolidateOpt
 		} else {
 			reqCtx, cancel = context.WithTimeout(ctx, TimeoutConsolidationDefault)
 		}
-		raw, cErr := deps.DTC.CompleteNoThink(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), 4096)
+		raw, cErr := deps.DTC.CompleteNoThink(reqCtx, strings.TrimSpace(prompts.Consolidation), fixedPrompt.String(), tokens.Consolidation)
 		cancel()
 		if cErr != nil {
 			return totalProcessed, fmt.Errorf("consolidation request (batch %d): %w", batch, cErr)
@@ -607,13 +608,24 @@ func RunInitialConsolidation(deps PipelineDeps, memoryLimit int) {
 	// Use a lower threshold (5) than the regular consolidation (8) so the
 	// initial profile can incorporate all available memories, including
 	// freshly backfilled emails and conversations.
-	n, err := ConsolidateCore(ctx, deps, ConsolidateOpts{
-		SalienceThreshold: startupThreshold,
-		MemoryLimit:       memoryLimit,
-		Timeout:           TimeoutInitConsolidation,
+	n, err := RetryWithBackoff(ctx, RetryConfig{
+		MaxAttempts:    3,
+		InitialBackoff: 5 * time.Second,
+		LogPrefix:      "consolidate:startup",
+		IsRetryable: func(e error) (bool, time.Duration) {
+			if isTransientDTCError(e) {
+				return true, 5 * time.Second
+			}
+			return false, 0
+		},
+	}, func(_ int) (int, error) {
+		return ConsolidateCore(ctx, deps, ConsolidateOpts{
+			SalienceThreshold: startupThreshold,
+			MemoryLimit:       memoryLimit,
+			Timeout:           TimeoutInitConsolidation,
+		})
 	})
 	if err != nil {
-		logger.Log.Errorf("[consolidate] startup: %v", err)
 		return
 	}
 	if n == 0 {

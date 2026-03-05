@@ -38,6 +38,23 @@ func registerCoreTools(registry *tools.Registry, stateMgr *engine.StateManager) 
 	})
 }
 
+func registerObjectiveTools(registry *tools.Registry, pool *pgxpool.Pool) {
+	if pool == nil {
+		return
+	}
+	registry.Register("manage_objectives", tools.NewManageObjectives(pool), tools.ToolSchema{
+		Name:        "manage_objectives",
+		Description: "Create, update, pause, resume, complete, retire, or list objectives",
+		Params: []tools.ParamSchema{
+			{Name: "op", Type: "string", Required: true},
+			{Name: "summary", Type: "string", Required: false},
+			{Name: "objective_id", Type: "number", Required: false},
+			{Name: "priority", Type: "string", Required: false},
+			{Name: "notes", Type: "string", Required: false},
+		},
+	})
+}
+
 func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan chan struct{}, subagent *clients.SubagentClient) {
 	if pool == nil {
 		return
@@ -96,7 +113,7 @@ func registerDelegateTask(registry *tools.Registry, subagent *clients.SubagentCl
 	if subagent == nil {
 		return nil
 	}
-	coreTools := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url", "run_command"}
+	coreTools := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url", "run_command", "read_file", "write_file", "patch_file", "list_files", "create_skill", "manage_skills", "update_skill"}
 	schemas := registry.SchemasForTools(coreTools)
 	g := grammar.BuildSubagentToolGrammar(schemas)
 	dc := tools.NewDelegateConfig(coreTools, g)
@@ -140,6 +157,15 @@ func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGramm
 			{Name: "test_args", Type: "string", Required: false},
 		},
 	})
+	registry.Register("update_skill", tools.NewUpdateSkill(registry, skillsDir, rebuildGrammar, deps), tools.ToolSchema{
+		Name:        "update_skill",
+		Description: "Update an existing skill's source code (validates and tests before saving)",
+		Params: []tools.ParamSchema{
+			{Name: "name", Type: "string", Required: true},
+			{Name: "code", Type: "string", Required: true},
+			{Name: "test_args", Type: "string", Required: true},
+		},
+	})
 }
 
 func registerPlanTools(registry *tools.Registry, dtc *clients.DeepThinkerClient,
@@ -151,7 +177,8 @@ func registerPlanTools(registry *tools.Registry, dtc *clients.DeepThinkerClient,
 		return
 	}
 
-	registry.Register("plan_and_execute", tools.NewPlanAndExecute(dtc, subagent, dc, registry, wt), tools.ToolSchema{
+	planDeps := tools.PlanExecDeps{SC: subagent, DTC: dtc, DC: dc, Registry: registry}
+	registry.Register("plan_and_execute", tools.NewPlanAndExecute(planDeps, wt), tools.ToolSchema{
 		Name:        "plan_and_execute",
 		Description: "Decompose and execute complex multi-step tasks (background=true for async)",
 		Params: []tools.ParamSchema{
@@ -198,6 +225,7 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 
 	registerCoreTools(registry, svc.StateMgr)
 	registerDBTools(registry, db.Pool, svc.InterruptChan, svc.Subagent)
+	registerObjectiveTools(registry, db.Pool)
 	registerAITools(registry, svc.DTC, db.Pool, cfg.EmbedURL, cfg.EmbedModel)
 
 	if db.Pool != nil && cfg.EmbedURL != "" {
@@ -258,6 +286,9 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 			{Name: "code", Type: "string", Required: true},
 		},
 	})
+
+	// Register file I/O tools.
+	registerFileTools(registry, cfg.WorkspaceDir)
 
 	// Register shell command tool.
 	shellExec := registerShellTool(registry, db.Pool, cfg)
@@ -357,6 +388,44 @@ func registerWebTools(registry *tools.Registry, searxngURL string) {
 		Params: []tools.ParamSchema{
 			{Name: "url", Type: "string", Required: true},
 			{Name: "max_chars", Type: "number", Required: false},
+		},
+	})
+}
+
+func registerFileTools(registry *tools.Registry, workspaceDir string) {
+	registry.Register("read_file", tools.NewReadFile(workspaceDir), tools.ToolSchema{
+		Name:        "read_file",
+		Description: "Read a file from the workspace (returns numbered lines)",
+		Params: []tools.ParamSchema{
+			{Name: "path", Type: "string", Required: true},
+			{Name: "offset", Type: "number", Required: false},
+			{Name: "limit", Type: "number", Required: false},
+		},
+	})
+	registry.Register("write_file", tools.NewWriteFile(workspaceDir), tools.ToolSchema{
+		Name:        "write_file",
+		Description: "Create or overwrite a file in the workspace",
+		Params: []tools.ParamSchema{
+			{Name: "path", Type: "string", Required: true},
+			{Name: "content", Type: "string", Required: true},
+		},
+	})
+	registry.Register("patch_file", tools.NewPatchFile(workspaceDir), tools.ToolSchema{
+		Name:        "patch_file",
+		Description: "Find and replace a unique string in a workspace file",
+		Params: []tools.ParamSchema{
+			{Name: "path", Type: "string", Required: true},
+			{Name: "old_string", Type: "string", Required: true},
+			{Name: "new_string", Type: "string", Required: true},
+		},
+	})
+	registry.Register("list_files", tools.NewListFiles(workspaceDir), tools.ToolSchema{
+		Name:        "list_files",
+		Description: "List files in a workspace directory with optional glob pattern",
+		Params: []tools.ParamSchema{
+			{Name: "path", Type: "string", Required: true},
+			{Name: "pattern", Type: "string", Required: false},
+			{Name: "recursive", Type: "boolean", Required: false},
 		},
 	})
 }

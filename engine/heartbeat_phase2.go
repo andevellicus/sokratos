@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/timeouts"
+	"sokratos/tokens"
 )
 
 // executivePromptBase returns the Phase 2 system message template.
@@ -66,10 +67,10 @@ type gatekeeperDecision struct {
 func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, conversationStale bool) {
 	prompt := fmt.Sprintf(gatekeeperPromptBase, stalenessNote)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.ObjectiveEval)
 	defer cancel()
 
-	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, contextXML, gatekeeperGrammar, 256)
+	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, contextXML, gatekeeperGrammar, tokens.GatekeeperDecision)
 	if err != nil {
 		logger.Log.Warnf("heartbeat: gatekeeper error, falling back to orchestrator: %v", err)
 		e.heartbeatPhase2Orchestrator(contextXML, stalenessNote, conversationStale)

@@ -11,7 +11,17 @@ import (
 	"sokratos/logger"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
+
+// PlanExecDeps groups the execution-layer dependencies shared by plan
+// decomposition, step execution, and background plan launching.
+type PlanExecDeps struct {
+	SC       *clients.SubagentClient
+	DTC      *clients.DeepThinkerClient
+	DC       *DelegateConfig
+	Registry *Registry
+}
 
 // scratchpadBudget is the max characters per scratchpad entry.
 const scratchpadBudget = 1500
@@ -121,7 +131,7 @@ func decomposePlan(ctx context.Context, dtc *clients.DeepThinkerClient, directiv
 	decompCtx, cancel := context.WithTimeout(ctx, TimeoutPlanDecomposition)
 	defer cancel()
 
-	raw, err := dtc.CompleteNoThink(decompCtx, strings.TrimSpace(prompts.PlanTask), userContent, 2048)
+	raw, err := dtc.CompleteNoThink(decompCtx, strings.TrimSpace(prompts.PlanTask), userContent, tokens.PlanDecomposition)
 	if err != nil {
 		return nil, fmt.Errorf("plan decomposition: %w", err)
 	}
@@ -147,8 +157,7 @@ func decomposePlan(ctx context.Context, dtc *clients.DeepThinkerClient, directiv
 // SubagentSupervisor (Flash); complex synthesis/analysis steps route to DTC
 // directly. A scratchpad carries concise context between steps. When dtc is
 // non-nil, mid-flight replanning is enabled on step failures.
-func executeSteps(ctx context.Context, sc *clients.SubagentClient, dtc *clients.DeepThinkerClient,
-	dc *DelegateConfig, registry *Registry, directive string, steps []planStep,
+func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, steps []planStep,
 	progressFn func(completed, total int)) []stepResult {
 
 	results := make([]stepResult, 0, len(steps))
@@ -177,15 +186,15 @@ func executeSteps(ctx context.Context, sc *clients.SubagentClient, dtc *clients.
 		var result string
 		var err error
 
-		if isComplexStep(step) && dtc != nil {
+		if isComplexStep(step) && deps.DTC != nil {
 			// Route complex reasoning steps to DTC directly (no tool access needed).
 			logger.Log.Infof("[plan] step %d/%d routed to DTC (complex): %s", i+1, len(steps), step.Description)
-			result, err = dtc.Complete(stepCtx, systemPrompt, step.Description, 4096)
+			result, err = deps.DTC.Complete(stepCtx, systemPrompt, step.Description, tokens.PlanStep)
 		} else {
 			// Simple retrieval steps go through Flash via SubagentSupervisor.
 			logger.Log.Infof("[plan] executing step %d/%d: %s", i+1, len(steps), step.Description)
-			toolExec := NewScopedToolExec(registry, dc)
-			result, err = clients.SubagentSupervisor(stepCtx, sc, dc.Grammar(), systemPrompt,
+			toolExec := NewScopedToolExec(deps.Registry, deps.DC)
+			result, err = clients.SubagentSupervisor(stepCtx, deps.SC, deps.DC.Grammar(), systemPrompt,
 				step.Description, toolExec, 10)
 		}
 		stepCancel()
@@ -224,10 +233,10 @@ func executeSteps(ctx context.Context, sc *clients.SubagentClient, dtc *clients.
 
 		// Check replan triggers: step failed + more than 1 step remaining + not already replanned.
 		remaining := len(steps) - (i + 1)
-		shouldReplan := !replanned && dtc != nil && remaining > 0 && !sr.Success &&
+		shouldReplan := !replanned && deps.DTC != nil && remaining > 0 && !sr.Success &&
 			(consecutiveFailures >= 2 || remaining <= 2)
 		if shouldReplan {
-			newSteps, replanErr := replanRemaining(ctx, dtc, directive, pad, steps[i+1:])
+			newSteps, replanErr := replanRemaining(ctx, deps.DTC, directive, pad, steps[i+1:])
 			if replanErr != nil {
 				logger.Log.Warnf("[plan] replanning failed: %v", replanErr)
 			} else {
@@ -309,7 +318,7 @@ func replanRemaining(ctx context.Context, dtc *clients.DeepThinkerClient, direct
 	replanCtx, cancel := context.WithTimeout(ctx, TimeoutPlanDecomposition)
 	defer cancel()
 
-	raw, err := dtc.CompleteNoThink(replanCtx, strings.TrimSpace(prompts.ReplanTask), b.String(), 2048)
+	raw, err := dtc.CompleteNoThink(replanCtx, strings.TrimSpace(prompts.ReplanTask), b.String(), tokens.PlanDecomposition)
 	if err != nil {
 		return nil, fmt.Errorf("replan call: %w", err)
 	}
@@ -354,13 +363,11 @@ func formatResults(results []stepResult) string {
 // NewPlanAndExecute returns a ToolFunc that decomposes a directive into steps
 // via DTC, then executes them via SubagentSupervisor with accumulated context.
 // When background=true, planning runs synchronously but execution is async.
-func NewPlanAndExecute(dtc *clients.DeepThinkerClient, sc *clients.SubagentClient,
-	dc *DelegateConfig, registry *Registry, wt *WorkTracker) ToolFunc {
-
+func NewPlanAndExecute(deps PlanExecDeps, wt *WorkTracker) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a planAndExecuteArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[planAndExecuteArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if strings.TrimSpace(a.Directive) == "" {
 			return "directive is required", nil
@@ -375,7 +382,7 @@ func NewPlanAndExecute(dtc *clients.DeepThinkerClient, sc *clients.SubagentClien
 		}
 
 		// Phase 1: Decompose (always synchronous).
-		plan, err := decomposePlan(ctx, dtc, a.Directive, extraContext)
+		plan, err := decomposePlan(ctx, deps.DTC, a.Directive, extraContext)
 		if err != nil {
 			return fmt.Sprintf("Failed to decompose plan: %v", err), nil
 		}
@@ -387,7 +394,7 @@ func NewPlanAndExecute(dtc *clients.DeepThinkerClient, sc *clients.SubagentClien
 
 		// Phase 2: Execute.
 		if a.Background && wt != nil {
-			taskID, err := wt.Start(a.Directive, a.Priority, plan.Steps, sc, dtc, dc, registry)
+			taskID, err := wt.Start(a.Directive, a.Priority, 0, plan.Steps, deps)
 			if err != nil {
 				return fmt.Sprintf("Failed to start background task: %v", err), nil
 			}
@@ -398,7 +405,7 @@ func NewPlanAndExecute(dtc *clients.DeepThinkerClient, sc *clients.SubagentClien
 		fgCtx, cancel := context.WithTimeout(ctx, TimeoutPlanForeground)
 		defer cancel()
 
-		results := executeSteps(fgCtx, sc, dtc, dc, registry, a.Directive, plan.Steps, nil)
+		results := executeSteps(fgCtx, deps, a.Directive, plan.Steps, nil)
 		return formatResults(results), nil
 	}
 }

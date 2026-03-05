@@ -3,17 +3,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS memories (
     id BIGSERIAL PRIMARY KEY,
     summary TEXT NOT NULL,
-    embedding VECTOR (1024) NOT NULL,
+    embedding VECTOR (2560) NOT NULL,
     salience FLOAT DEFAULT 5,
     tags TEXT [],
     created_at TIMESTAMPTZ DEFAULT now(),
     last_accessed TIMESTAMPTZ DEFAULT now()
 );
 
--- HNSW handles continuous inserts/deletes without periodic reindexing,
--- unlike IVFFlat which requires REINDEX as data distribution shifts.
-CREATE INDEX IF NOT EXISTS memories_embedding_hnsw_idx ON memories USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
+-- No vector index: pgvector HNSW/IVFFlat cap at 2000 dims; at current scale
+-- (< 100K rows) exact brute-force scan is sub-millisecond and gives perfect recall.
+DROP INDEX IF EXISTS memories_embedding_hnsw_idx;
+DROP INDEX IF EXISTS memories_embedding_ivfflat_idx;
 
 -- Add last_accessed column for salience decay (safe to re-run).
 ALTER TABLE memories
@@ -225,3 +225,33 @@ CREATE TABLE IF NOT EXISTS shell_history (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS shell_history_created_idx ON shell_history (created_at DESC);
+
+-- Rename legacy goals table to objectives (idempotent: skipped if already renamed).
+ALTER TABLE IF EXISTS goals RENAME TO objectives;
+
+-- Objective lifecycle tracking.
+CREATE TABLE IF NOT EXISTS objectives (
+    id BIGSERIAL PRIMARY KEY,
+    summary TEXT NOT NULL,
+    status VARCHAR(20) DEFAULT 'active',    -- active, in_progress, completed, paused, retired
+    priority VARCHAR(10) DEFAULT 'medium',  -- high, medium, low
+    source VARCHAR(20) DEFAULT 'explicit',  -- explicit, inferred
+    progress_notes TEXT,                     -- accumulated notes from pursuit attempts
+    attempts INT DEFAULT 0,
+    last_pursued_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS objectives_status_idx ON objectives (status) WHERE status IN ('active', 'in_progress');
+
+-- Rename legacy goal_id column to objective_id (idempotent).
+DO $$ BEGIN
+    ALTER TABLE work_items RENAME COLUMN goal_id TO objective_id;
+EXCEPTION WHEN undefined_column THEN NULL;
+END $$;
+
+-- Link work items to the objective they serve.
+ALTER TABLE work_items ADD COLUMN IF NOT EXISTS objective_id BIGINT REFERENCES objectives(id);
+CREATE INDEX IF NOT EXISTS work_items_objective_idx ON work_items (objective_id) WHERE objective_id IS NOT NULL;

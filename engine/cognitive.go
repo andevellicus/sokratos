@@ -28,8 +28,8 @@ func (e *Engine) runMaintenanceIfDue() {
 		logger.Log.Infof("[engine] decayed salience for %d memories", n)
 	}
 
-	if e.MemoryStalenessDays > 0 {
-		if n, err := memory.PruneStaleMemories(ctx, e.DB, e.MemoryStalenessDays); err != nil {
+	if e.TTL.MemoryStalenessDays > 0 {
+		if n, err := memory.PruneStaleMemories(ctx, e.DB, e.TTL.MemoryStalenessDays); err != nil {
 			logger.Log.Warnf("[engine] memory pruning failed: %v", err)
 		} else if n > 0 {
 			logger.Log.Infof("[engine] pruned %d stale memories", n)
@@ -47,12 +47,12 @@ func (e *Engine) runMaintenanceIfDue() {
 		days  int
 	}
 	for _, pq := range []pruneSpec{
-		{"work_items", `DELETE FROM work_items WHERE status IN ('completed','failed','cancelled') AND completed_at < now() - ($1 || ' days')::interval`, e.WorkItemsTTLDays},
-		{"processed_emails", `DELETE FROM processed_emails WHERE seen_at < now() - ($1 || ' days')::interval`, e.ProcessedEmailsTTLDays},
-		{"processed_events", `DELETE FROM processed_events WHERE seen_at < now() - ($1 || ' days')::interval`, e.ProcessedEventsTTLDays},
-		{"failed_operations", `DELETE FROM failed_operations WHERE created_at < now() - ($1 || ' days')::interval`, e.FailedOpsTTLDays},
-		{"skill_kv", `DELETE FROM skill_kv WHERE updated_at < now() - ($1 || ' days')::interval`, e.SkillKVTTLDays},
-		{"shell_history", `DELETE FROM shell_history WHERE created_at < now() - ($1 || ' days')::interval`, e.ShellHistoryTTLDays},
+		{"work_items", `DELETE FROM work_items WHERE status IN ('completed','failed','cancelled') AND completed_at < now() - ($1 || ' days')::interval`, e.TTL.WorkItemsTTLDays},
+		{"processed_emails", `DELETE FROM processed_emails WHERE seen_at < now() - ($1 || ' days')::interval`, e.TTL.ProcessedEmailsTTLDays},
+		{"processed_events", `DELETE FROM processed_events WHERE seen_at < now() - ($1 || ' days')::interval`, e.TTL.ProcessedEventsTTLDays},
+		{"failed_operations", `DELETE FROM failed_operations WHERE created_at < now() - ($1 || ' days')::interval`, e.TTL.FailedOpsTTLDays},
+		{"skill_kv", `DELETE FROM skill_kv WHERE updated_at < now() - ($1 || ' days')::interval`, e.TTL.SkillKVTTLDays},
+		{"shell_history", `DELETE FROM shell_history WHERE created_at < now() - ($1 || ' days')::interval`, e.TTL.ShellHistoryTTLDays},
 	} {
 		if pq.days <= 0 {
 			continue
@@ -105,7 +105,7 @@ func (e *Engine) runCognitiveIfTriggered() {
 	// 2. Episode synthesis.
 	if e.Cognitive.SynthesizeFunc != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), timeouts.Synthesis)
-		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.SynthesizeFunc, e.GrammarFunc)
+		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.SynthesizeFunc, e.Memory.GrammarFn)
 		cancel()
 		if synthErr != nil {
 			logger.Log.Warnf("[engine] episode synthesis failed: %v", synthErr)
@@ -120,8 +120,8 @@ func (e *Engine) runCognitiveIfTriggered() {
 	// 4. Proactive curiosity.
 	e.runCuriosityIfReady()
 
-	// 4.5. Goal inference.
-	e.runGoalInferenceIfReady()
+	// 4.5. Objective inference.
+	e.runObjectiveInferenceIfReady()
 
 	// 5. Refresh cached profile and personality.
 	e.RefreshProfile()
@@ -171,7 +171,7 @@ func (e *Engine) triggerReflection() {
 		since = *lastReflection
 	}
 
-	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.ReflectionPrompt, e.Cognitive.SynthesizeFunc, e.GrammarFunc, since)
+	id, err := memory.ReflectOnMemories(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.Cognitive.ReflectionPrompt, e.Cognitive.SynthesizeFunc, e.Memory.GrammarFn, since)
 	if err != nil {
 		logger.Log.Warnf("[engine] reflection failed: %v", err)
 	} else if id > 0 {

@@ -10,11 +10,19 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"sokratos/clients"
+	objpkg "sokratos/objectives"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/textutil"
 )
+
+// ObjectiveTaskResult captures the outcome of a background task linked to an objective.
+type ObjectiveTaskResult struct {
+	ObjectiveID int64
+	Directive   string
+	Status      string // "completed" or "failed"
+	Result      string // formatted step results
+}
 
 // WorkTracker manages async task execution with DB-backed state. It tracks
 // background plans, routine executions, and scheduled tasks in the unified
@@ -23,7 +31,9 @@ import (
 type WorkTracker struct {
 	db         *pgxpool.Pool
 	sendFunc   func(string)
-	OnComplete func(directive, status string) // called after a background task finishes (nil = no-op)
+	OnComplete              func(directive, status string)     // called after a background task finishes (nil = no-op)
+	OnObjectiveTaskComplete func(ObjectiveTaskResult)          // called when an objective-linked task finishes (nil = no-op)
+	ShareGate               func(directive, result string)     // quality gate for proactive sharing (nil = disabled)
 	mu         sync.Mutex
 	active     map[int64]context.CancelFunc // cancel funcs for all running work
 	sem        chan struct{}                 // concurrency limiter for background plans (cap 3)
@@ -41,19 +51,38 @@ func NewWorkTracker(db *pgxpool.Pool, sendFunc func(string)) *WorkTracker {
 
 // Start creates a DB row for a background plan, launches a goroutine, and
 // returns the task ID. Planning must complete before calling this.
-func (wt *WorkTracker) Start(directive string, priority int, steps []planStep,
-	sc *clients.SubagentClient, dtc *clients.DeepThinkerClient, dc *DelegateConfig, registry *Registry) (int64, error) {
+// objectiveID links the task to an objective (0 = no objective).
+func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, steps []planStep,
+	deps PlanExecDeps) (int64, error) {
 
 	ctx := context.Background()
+
+	// Set objective_id in the INSERT if linked to an objective.
 	var taskID int64
-	err := wt.db.QueryRow(ctx,
-		`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at)
-		 VALUES ('background', $1, 'running', $2, $3, now(), now() + $4::interval)
-		 RETURNING id`,
-		directive, len(steps), priority, fmt.Sprintf("%d seconds", int(TimeoutPlanBackground.Seconds())),
-	).Scan(&taskID)
+	var err error
+	if objectiveID > 0 {
+		err = wt.db.QueryRow(ctx,
+			`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at, objective_id)
+			 VALUES ('background', $1, 'running', $2, $3, now(), now() + $4::interval, $5)
+			 RETURNING id`,
+			directive, len(steps), priority, fmt.Sprintf("%d seconds", int(TimeoutPlanBackground.Seconds())), objectiveID,
+		).Scan(&taskID)
+	} else {
+		err = wt.db.QueryRow(ctx,
+			`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at)
+			 VALUES ('background', $1, 'running', $2, $3, now(), now() + $4::interval)
+			 RETURNING id`,
+			directive, len(steps), priority, fmt.Sprintf("%d seconds", int(TimeoutPlanBackground.Seconds())),
+		).Scan(&taskID)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("create background task: %w", err)
+	}
+
+	// Update objective status when linked.
+	if objectiveID > 0 {
+		objpkg.UpdateStatus(ctx, wt.db, objectiveID, "in_progress")
+		objpkg.IncrementAttempts(ctx, wt.db, objectiveID)
 	}
 
 	bgCtx, cancel := context.WithTimeout(ctx, TimeoutPlanBackground)
@@ -88,7 +117,7 @@ func (wt *WorkTracker) Start(directive string, priority int, steps []planStep,
 			}
 		}
 
-		results := executeSteps(bgCtx, sc, dtc, dc, registry, directive, steps, progressFn)
+		results := executeSteps(bgCtx, deps, directive, steps, progressFn)
 		formatted := formatResults(results)
 
 		succeeded := 0
@@ -121,6 +150,21 @@ func (wt *WorkTracker) Start(directive string, priority int, steps []planStep,
 
 		if wt.OnComplete != nil {
 			wt.OnComplete(directive, status)
+		}
+
+		// Fire objective-linked callback for initiative chaining.
+		if objectiveID > 0 && wt.OnObjectiveTaskComplete != nil {
+			wt.OnObjectiveTaskComplete(ObjectiveTaskResult{
+				ObjectiveID: objectiveID,
+				Directive:   directive,
+				Status:      status,
+				Result:      formatted,
+			})
+		}
+
+		// Fire proactive sharing gate.
+		if wt.ShareGate != nil && succeeded > 0 {
+			wt.ShareGate(directive, formatted)
 		}
 	}()
 
@@ -370,18 +414,18 @@ func (wt *WorkTracker) List(ctx context.Context) (string, error) {
 
 // LaunchBackgroundPlan decomposes a directive via DTC and launches it as a
 // background work item. Returns the task ID. Used by the curiosity engine.
-func LaunchBackgroundPlan(wt *WorkTracker, dtc *clients.DeepThinkerClient,
-	sc *clients.SubagentClient, dc *DelegateConfig, registry *Registry,
-	directive string, priority int) (int64, error) {
+// objectiveID links the task to an objective (0 = no objective).
+func LaunchBackgroundPlan(wt *WorkTracker, deps PlanExecDeps,
+	directive string, priority int, objectiveID int64) (int64, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanDecomposition)
 	defer cancel()
 
-	plan, err := decomposePlan(ctx, dtc, directive, "")
+	plan, err := decomposePlan(ctx, deps.DTC, directive, "")
 	if err != nil {
 		return 0, fmt.Errorf("curiosity plan decomposition: %w", err)
 	}
-	return wt.Start(directive, priority, plan.Steps, sc, dtc, dc, registry)
+	return wt.Start(directive, priority, objectiveID, plan.Steps, deps)
 }
 
 // NewCheckBackgroundTask returns a ToolFunc for listing, checking status, or

@@ -37,7 +37,7 @@ func NewShellExec(pool *pgxpool.Pool, workspaceDir, configPath string) (*ShellEx
 		return nil, fmt.Errorf("resolve workspace dir: %w", err)
 	}
 
-	cfg, err := LoadShellConfig(configPath)
+	cfg, err := loadShellConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load shell config: %w", err)
 	}
@@ -85,7 +85,7 @@ func (se *ShellExec) SyncIfChanged() {
 		return
 	}
 
-	cfg, err := LoadShellConfig(se.configPath)
+	cfg, err := loadShellConfig(se.configPath)
 	if err != nil {
 		logger.Log.Warnf("[shell] failed to reload config: %v", err)
 		return
@@ -113,25 +113,38 @@ func (se *ShellExec) execute(ctx context.Context, command, workingDir string) (s
 	cfg := se.config
 	se.mu.RUnlock()
 
-	// Extract the binary name from the command.
-	binary := extractBinary(command)
-	if binary == "" {
+	// Extract all binary names from the (potentially compound) command.
+	binaries := extractBinaries(command)
+	if len(binaries) == 0 {
 		return "", Errorf("could not parse command binary")
 	}
 
-	// Allowlist check.
-	if !cfg.IsAllowed(binary) {
-		return fmt.Sprintf("Command %q is not in the allowlist.\n%s", binary, cfg.CommandDescriptions()), nil
+	// Allowlist check: every binary must be allowed.
+	for _, b := range binaries {
+		if !cfg.IsAllowed(b) {
+			return fmt.Sprintf("Command %q is not in the allowlist.\n%s", b, cfg.CommandDescriptions()), nil
+		}
+	}
+
+	// Resolve timeout (max across all binaries) and workspace constraint
+	// (most restrictive — if any binary requires workspace_only, enforce it).
+	timeout := cfg.ResolvedTimeout(binaries[0])
+	wsOnly := cfg.ResolvedWorkspaceOnly(binaries[0])
+	for _, b := range binaries[1:] {
+		if t := cfg.ResolvedTimeout(b); t > timeout {
+			timeout = t
+		}
+		if cfg.ResolvedWorkspaceOnly(b) {
+			wsOnly = true
+		}
 	}
 
 	// Resolve working directory.
-	resolvedDir, err := se.resolveWorkDir(binary, workingDir, cfg)
+	resolvedDir, err := se.resolveWorkDir(wsOnly, workingDir)
 	if err != nil {
 		return err.Error(), nil // soft error
 	}
 
-	// Timeout from config.
-	timeout := cfg.ResolvedTimeout(binary)
 	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -200,9 +213,7 @@ func (se *ShellExec) execute(ctx context.Context, command, workingDir string) (s
 }
 
 // resolveWorkDir determines the effective working directory for a command.
-func (se *ShellExec) resolveWorkDir(binary, workingDir string, cfg *ShellConfig) (string, error) {
-	wsOnly := cfg.ResolvedWorkspaceOnly(binary)
-
+func (se *ShellExec) resolveWorkDir(wsOnly bool, workingDir string) (string, error) {
 	if wsOnly {
 		// Workspace-constrained: resolve relative to workspace dir.
 		resolved := se.workspaceDir
@@ -250,19 +261,51 @@ func (se *ShellExec) auditAsync(command, workDir string, exitCode int, stdoutPre
 	}()
 }
 
-// extractBinary returns the base name of the first token in a command string.
-// Uses filepath.Base to prevent path traversal (/usr/bin/rm → rm).
-func extractBinary(command string) string {
-	command = strings.TrimSpace(command)
-	if command == "" {
-		return ""
+// extractBinaries returns the base names of all command binaries in a
+// potentially compound command (split on &&, ||, ;, |). Deduplicates while
+// preserving order.
+func extractBinaries(command string) []string {
+	segments := splitShellCompound(command)
+	var binaries []string
+	seen := make(map[string]bool)
+	for _, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		fields := strings.Fields(seg)
+		if len(fields) == 0 {
+			continue
+		}
+		b := filepath.Base(fields[0])
+		if b != "" && !seen[b] {
+			binaries = append(binaries, b)
+			seen[b] = true
+		}
 	}
-	// Split on first whitespace.
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		return ""
+	return binaries
+}
+
+// splitShellCompound splits a command string on shell compound operators
+// (&&, ||, ;, |) returning the individual command segments.
+func splitShellCompound(command string) []string {
+	// Replace multi-char operators first so single-char variants don't
+	// partially match them.
+	const sep = "\x00"
+	s := strings.ReplaceAll(command, "&&", sep)
+	s = strings.ReplaceAll(s, "||", sep)
+	s = strings.ReplaceAll(s, ";", sep)
+	s = strings.ReplaceAll(s, "|", sep)
+
+	parts := strings.Split(s, sep)
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
 	}
-	return filepath.Base(fields[0])
+	return result
 }
 
 // truncateOutput truncates a string to maxLen characters, appending "..." if truncated.

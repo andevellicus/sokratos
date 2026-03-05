@@ -43,9 +43,9 @@ func NewReadURL() ToolFunc {
 	client := httputil.NewClient(TimeoutURLFetch)
 
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a readURLArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[readURLArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if strings.TrimSpace(a.URL) == "" {
 			return "url is required", nil

@@ -11,6 +11,7 @@ import (
 	"sokratos/memory"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
 
 // generateTransitionMemory is the synchronous core that creates a transition
@@ -77,7 +78,7 @@ func generateTransitionMemory(
 	}
 
 	// Call deep thinker with thinking enabled for creative synthesis.
-	raw, err := deps.DTC.Complete(ctx, strings.TrimSpace(prompts.Transition), b.String(), 1024)
+	raw, err := deps.DTC.Complete(ctx, strings.TrimSpace(prompts.Transition), b.String(), tokens.DTCTransition)
 	if err != nil {
 		return 0, fmt.Errorf("deep thinker synthesis failed: %w", err)
 	}

@@ -17,9 +17,9 @@ type updateStateArgs struct {
 // StateManager. The LLM can pass a new status and current task description.
 func NewUpdateState(sm *engine.StateManager) ToolFunc {
 	return func(_ context.Context, args json.RawMessage) (string, error) {
-		var a updateStateArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[updateStateArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 
 		sm.Update(func(s *engine.AgentState) {

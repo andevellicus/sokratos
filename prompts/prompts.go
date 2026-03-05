@@ -44,5 +44,5 @@ var HeartbeatMode string
 //go:embed routine_mode.txt
 var RoutineMode string
 
-//go:embed goal_inference.txt
-var GoalInference string
+//go:embed objective_inference.txt
+var ObjectiveInference string

@@ -25,9 +25,9 @@ type forgetTopicArgs struct {
 // memories and creates an archive note.
 func NewForgetTopic(pool *pgxpool.Pool, embedEndpoint, embedModel string) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a forgetTopicArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[forgetTopicArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 
 		topic := strings.TrimSpace(a.Topic)

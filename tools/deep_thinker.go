@@ -14,6 +14,7 @@ import (
 	"sokratos/memory"
 	"sokratos/prompts"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
 
 type consultDeepThinkerArgs struct {
@@ -38,20 +39,20 @@ var dtcSearchRe = regexp.MustCompile(`(?i)<SEARCH>([\s\S]+?)</SEARCH>`)
 // per consult call (so at most maxDTCSearchRounds+1 total DTC completions).
 const maxDTCSearchRounds = 2
 
-// NewConsultDeepThinker returns a ToolFunc that closes over the given
+// NewconsultDeepThinker returns a ToolFunc that closes over the given
 // DeepThinkerClient and optional memory dependencies for context injection.
-func NewConsultDeepThinker(dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) ToolFunc {
+func NewconsultDeepThinker(dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		return ConsultDeepThinker(ctx, args, dtc, pool, embedURL, embedModel)
+		return consultDeepThinker(ctx, args, dtc, pool, embedURL, embedModel)
 	}
 }
 
-// ConsultDeepThinker sends a problem statement to the deep-reasoning LLM.
+// consultDeepThinker sends a problem statement to the deep-reasoning LLM.
 // It seeds the call with up to 3 prefetched memories, then runs a search loop:
 // if DTC emits <SEARCH>query</SEARCH> it fetches additional memories and calls
 // DTC again (up to maxDTCSearchRounds extra rounds). All retrieved memory IDs
 // are tracked for usefulness scoring.
-func ConsultDeepThinker(ctx context.Context, args json.RawMessage, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) (string, error) {
+func consultDeepThinker(ctx context.Context, args json.RawMessage, dtc *clients.DeepThinkerClient, pool *pgxpool.Pool, embedURL, embedModel string) (string, error) {
 	var a consultDeepThinkerArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("[DEEP THINKER UNAVAILABLE]: invalid arguments: %v. Proceed with best available reasoning.", err), nil
@@ -60,7 +61,7 @@ func ConsultDeepThinker(ctx context.Context, args json.RawMessage, dtc *clients.
 		return "[DEEP THINKER UNAVAILABLE]: problem_statement is required. Proceed with best available reasoning.", nil
 	}
 	if a.MaxTokens == 0 {
-		a.MaxTokens = 2048
+		a.MaxTokens = tokens.DTCDefault
 	}
 
 	// Seed with up to 3 relevant memories before the first DTC call.

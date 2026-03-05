@@ -7,6 +7,7 @@ import (
 
 	"sokratos/logger"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
 
 const defaultSubagentToolResultLen = 8000
@@ -38,7 +39,7 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 	errorRetries := 0
 
 	for usedRounds < maxRounds {
-		raw, err := sc.CompleteMultiTurnWithGrammar(ctx, messages, grammar, 2048)
+		raw, err := sc.CompleteMultiTurnWithGrammar(ctx, messages, grammar, tokens.SubagentSupervisor)
 		if err != nil {
 			return "", fmt.Errorf("subagent round %d: %w", usedRounds, err)
 		}

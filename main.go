@@ -26,6 +26,8 @@ import (
 	"sokratos/prompts"
 	"sokratos/routines"
 	"sokratos/textutil"
+	"sokratos/timeouts"
+	"sokratos/tokens"
 	"sokratos/tools"
 )
 
@@ -87,7 +89,7 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 	if dtc != nil {
 		capturedDTC := dtc
 		synthesizeFunc = func(ctx context.Context, systemPrompt, content string) (string, error) {
-			return capturedDTC.Complete(ctx, systemPrompt, content, 2048)
+			return capturedDTC.Complete(ctx, systemPrompt, content, tokens.DTCSynthesis)
 		}
 	}
 
@@ -119,13 +121,13 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		// reasoning (consolidation, synthesis, consulting). TryComplete
 		// skips gracefully when slots are full.
 		subagentFunc = func(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-			return subagent.Complete(ctx, systemPrompt, userPrompt, 1024)
+			return subagent.Complete(ctx, systemPrompt, userPrompt, tokens.SubagentGeneral)
 		}
 		grammarFunc = func(ctx context.Context, systemPrompt, userPrompt, grammar string) (string, error) {
-			return subagent.CompleteWithGrammar(ctx, systemPrompt, userPrompt, grammar, 1024)
+			return subagent.CompleteWithGrammar(ctx, systemPrompt, userPrompt, grammar, tokens.SubagentGeneral)
 		}
 		bgGrammarFunc = func(ctx context.Context, systemPrompt, userPrompt, grammar string) (string, error) {
-			return subagent.TryCompleteWithGrammar(ctx, systemPrompt, userPrompt, grammar, 1024)
+			return subagent.TryCompleteWithGrammar(ctx, systemPrompt, userPrompt, grammar, tokens.SubagentGeneral)
 		}
 		queueFunc = func(req memory.WorkRequest) {
 			subagent.QueueWork(req)
@@ -177,7 +179,7 @@ type llmBundle struct {
 
 func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	trimFn := func(msgs []llm.Message) []llm.Message {
-		return engine.TrimMessages(msgs, 12)
+		return engine.TrimMessages(msgs, engine.DefaultMaxTail)
 	}
 
 	llmClient := llm.NewClient(cfg.LLMURL)
@@ -199,7 +201,7 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	triageGrammar := grammar.BuildTriageGrammar()
 
 	logger.Log.Info("Warming up LLM model...")
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), timeouts.LLMWarmup)
 	_, err := llmClient.Chat(warmupCtx, llm.ChatRequest{
 		Model:    cfg.LLMModel,
 		Messages: []llm.Message{{Role: "user", Content: "ping"}},
@@ -267,14 +269,16 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		EmbedEndpoint:          cfg.EmbedURL,
 		EmbedModel:             cfg.EmbedModel,
 		MaxMessages:            40,
-		MaintenanceInterval:    cfg.MaintenanceInterval,
-		MemoryStalenessDays:    cfg.MemoryStalenessDays,
-		WorkItemsTTLDays:       cfg.WorkItemsTTLDays,
-		ProcessedEmailsTTLDays: cfg.ProcessedEmailsTTLDays,
-		ProcessedEventsTTLDays: cfg.ProcessedEventsTTLDays,
-		FailedOpsTTLDays:       cfg.FailedOpsTTLDays,
-		SkillKVTTLDays:         cfg.SkillKVTTLDays,
-		ShellHistoryTTLDays:    cfg.ShellHistoryTTLDays,
+		MaintenanceInterval: cfg.MaintenanceInterval,
+		TTL: engine.TTLConfig{
+			MemoryStalenessDays:    cfg.MemoryStalenessDays,
+			WorkItemsTTLDays:       cfg.WorkItemsTTLDays,
+			ProcessedEmailsTTLDays: cfg.ProcessedEmailsTTLDays,
+			ProcessedEventsTTLDays: cfg.ProcessedEventsTTLDays,
+			FailedOpsTTLDays:       cfg.FailedOpsTTLDays,
+			SkillKVTTLDays:         cfg.SkillKVTTLDays,
+			ShellHistoryTTLDays:    cfg.ShellHistoryTTLDays,
+		},
 		SendFunc: func(text string) {
 			for id := range cfg.AllowedIDs {
 				msg := tgbotapi.NewMessage(id, mdToTelegramHTML(text))
@@ -290,12 +294,19 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		},
 		InterruptChan: svc.InterruptChan,
 		Gatekeeper:    svc.Subagent,
-		DTCQueueFunc:  svc.DTCQueueFunc,
-		SubagentFunc:  svc.SubagentFunc,
-		GrammarFunc:   svc.GrammarFunc,
-		BgGrammarFunc: svc.BgGrammarFunc,
-		QueueFunc:     svc.QueueFunc,
+		Memory: engine.MemoryFuncs{
+			DTCQueueFn:  svc.DTCQueueFunc,
+			SubagentFn:  svc.SubagentFunc,
+			GrammarFn:   svc.GrammarFunc,
+			BgGrammarFn: svc.BgGrammarFunc,
+			QueueFn:     svc.QueueFunc,
+		},
 	}
+
+	// Wire configurable cooldowns.
+	eng.ObjectivePursuitCooldown = cfg.ObjectivePursuitCooldown
+	eng.ObjectiveInferenceCooldown = cfg.ObjectiveInferenceCooldown
+	eng.CuriosityCooldown = cfg.CuriosityCooldown
 
 	// Defer initial consolidation until after the first heartbeat tick so
 	// Qwen3.5-27B is available for interactive requests during startup.
@@ -337,7 +348,7 @@ func runStartupTasks() {
 // work_items and drops the old table. Safe to call multiple times — no-ops
 // if the tasks table doesn't exist.
 func migrateTasksTable() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.RoutineDB)
 	defer cancel()
 
 	var exists bool
@@ -499,6 +510,8 @@ func main() {
 			summary := fmt.Sprintf("Background task %s: %s", status, textutil.Truncate(directive, 80))
 			eng.RecordBackgroundCompletion("background_task", summary)
 		}
+		workTracker.OnObjectiveTaskComplete = buildObjectiveTaskCallback(db.Pool, svc.Subagent, eng)
+		workTracker.ShareGate = buildShareGate(svc.Subagent, eng, cfg.MaxDailyShares)
 		workTracker.CleanupOrphans()
 		workTracker.CleanupOldTasks()
 		eng.WorkMonitor = workTracker
@@ -595,16 +608,16 @@ func main() {
 
 	// Wire curiosity function for proactive research during cognitive lulls.
 	if workTracker != nil && svc.DTC != nil && svc.Subagent != nil && delegateConfig != nil {
-		eng.Cognitive.CuriosityFunc = func(directive string, priority int) (int64, error) {
-			return tools.LaunchBackgroundPlan(workTracker, svc.DTC, svc.Subagent, delegateConfig, registry, directive, priority)
+		eng.Cognitive.CuriosityFunc = func(directive string, priority int, objectiveID int64) (int64, error) {
+			return tools.LaunchBackgroundPlan(workTracker, tools.PlanExecDeps{SC: svc.Subagent, DTC: svc.DTC, DC: delegateConfig, Registry: registry}, directive, priority, objectiveID)
 		}
 	}
 
-	// Wire goal inference for cognitive processing.
-	if db.Pool != nil && svc.DTC != nil && cfg.EmbedURL != "" {
+	// Wire objective inference for cognitive processing.
+	if db.Pool != nil && svc.DTC != nil {
 		capturedDTC := svc.DTC
-		eng.Cognitive.GoalInferenceFunc = func(ctx context.Context) error {
-			return engine.RunGoalInference(ctx, db.Pool, capturedDTC.Complete, cfg.EmbedURL, cfg.EmbedModel, svc.GrammarFunc, svc.QueueFunc)
+		eng.Cognitive.ObjectiveInferenceFunc = func(ctx context.Context) error {
+			return engine.RunObjectiveInference(ctx, db.Pool, capturedDTC.Complete)
 		}
 	}
 
@@ -701,7 +714,7 @@ func main() {
 				caption = "What's in this image?"
 			}
 			if svc.Subagent != nil {
-				capCtx, capCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				capCtx, capCancel := context.WithTimeout(context.Background(), timeouts.SubagentCall)
 				imgCaption, capErr := svc.Subagent.CaptionImage(capCtx, "Describe the image in one or two sentences. Be specific about key subjects, text, and context.", dataURI, 256)
 				capCancel()
 				if capErr != nil {

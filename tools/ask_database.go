@@ -11,6 +11,7 @@ import (
 	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
 
 type askDBArgs struct {
@@ -23,9 +24,9 @@ type askDBArgs struct {
 // model always sees the current table definitions.
 func NewAskDatabase(pool *pgxpool.Pool, sc *clients.SubagentClient) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a askDBArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[askDBArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if a.Query == "" {
 			return "error: natural_language_query is required", nil
@@ -42,7 +43,7 @@ func NewAskDatabase(pool *pgxpool.Pool, sc *clients.SubagentClient) ToolFunc {
 			"The database has these tables:\n\n" + schemaDDL +
 			"\n\nOutput ONLY the SQL statement. Do not include any explanations or formatting."
 
-		result, err := sc.Complete(ctx, systemPrompt, a.Query, 512)
+		result, err := sc.Complete(ctx, systemPrompt, a.Query, tokens.SQLGen)
 		if err != nil {
 			return fmt.Sprintf("SQL generation failed: %v", err), nil
 		}

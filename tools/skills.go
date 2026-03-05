@@ -101,7 +101,7 @@ func LoadSkills(dir string) ([]Skill, error) {
 				logger.Log.Warnf("[skills] TS transpilation failed for %s: %v", skillName, tErr)
 				continue
 			}
-			if err := ValidateSkillSource(transpiled); err != nil {
+			if err := validateSkillSource(transpiled); err != nil {
 				logger.Log.Warnf("[skills] invalid transpiled JS in %s: %v", skillName, err)
 				continue
 			}
@@ -110,7 +110,7 @@ func LoadSkills(dir string) ([]Skill, error) {
 				manifest.Language = "typescript"
 			}
 		} else if jsData, jsErr := os.ReadFile(jsPath); jsErr == nil {
-			if err := ValidateSkillSource(string(jsData)); err != nil {
+			if err := validateSkillSource(string(jsData)); err != nil {
 				logger.Log.Warnf("[skills] invalid JS in %s: %v", skillName, err)
 				continue
 			}
@@ -578,10 +578,10 @@ func needsIIFEWrap(source string) bool {
 	return strings.Contains(errStr, "return") || strings.Contains(errStr, "await") || strings.Contains(errStr, "Unexpected identifier")
 }
 
-// ValidateSkillSource compiles JavaScript source in goja to catch syntax errors
+// validateSkillSource compiles JavaScript source in goja to catch syntax errors
 // without executing it. If the source contains top-level return or await statements
 // (illegal in script mode), it retries after wrapping in an async IIFE.
-func ValidateSkillSource(source string) error {
+func validateSkillSource(source string) error {
 	_, err := goja.Compile("handler.js", source, false)
 	if err == nil {
 		return nil
@@ -596,10 +596,10 @@ func ValidateSkillSource(source string) error {
 	return fmt.Errorf("JS syntax error: %w", err)
 }
 
-// GenerateSkillMD produces a SKILL.md file content from the given fields.
+// generateSkillMD produces a SKILL.md file content from the given fields.
 // When language is "typescript", a `language: typescript` line is emitted in
 // the frontmatter. Empty or "javascript" omits the field (default).
-func GenerateSkillMD(name, description, language string, params []ParamSchema) string {
+func generateSkillMD(name, description, language string, params []ParamSchema) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	fmt.Fprintf(&b, "name: %s\n", name)

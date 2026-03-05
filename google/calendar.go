@@ -158,7 +158,7 @@ func ParseEvent(e *cal.Event, calID, calName string) Event {
 			}
 		} else if e.Start.Date != "" {
 			ev.AllDay = true
-			if t, err := time.Parse("2006-01-02", e.Start.Date); err == nil {
+			if t, err := time.Parse(timefmt.DateOnly, e.Start.Date); err == nil {
 				ev.Start = t
 			}
 		}
@@ -170,7 +170,7 @@ func ParseEvent(e *cal.Event, calID, calName string) Event {
 				ev.End = t
 			}
 		} else if e.End.Date != "" {
-			if t, err := time.Parse("2006-01-02", e.End.Date); err == nil {
+			if t, err := time.Parse(timefmt.DateOnly, e.End.Date); err == nil {
 				ev.End = t
 			}
 		}

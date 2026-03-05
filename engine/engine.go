@@ -55,7 +55,27 @@ type CognitiveConfig struct {
 	ReflectionPrompt          string                                                                  // system prompt for reflection synthesis
 	SynthesizeFunc            func(ctx context.Context, systemPrompt, content string) (string, error) // LLM call for synthesis
 	CuriosityFunc             CuriosityFunc                                                           // launches background research tasks (nil = disabled)
-	GoalInferenceFunc         func(ctx context.Context) error                                        // infer user goals from recent patterns (nil = disabled)
+	ObjectiveInferenceFunc    func(ctx context.Context) error                                        // infer user objectives from recent patterns (nil = disabled)
+}
+
+// MemoryFuncs groups the memory-related function dependencies.
+type MemoryFuncs struct {
+	DTCQueueFn  memory.WorkQueueFunc       // DTC work queue — preferred for distillation (less hallucination)
+	SubagentFn  memory.SubagentFunc        // for conversation archive distillation (nil = skip distillation)
+	GrammarFn   memory.GrammarSubagentFunc // for grammar-constrained quality scoring (nil = skip enrichment)
+	BgGrammarFn memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
+	QueueFn     memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
+}
+
+// TTLConfig groups the TTL fields for periodic table pruning (0 = disabled).
+type TTLConfig struct {
+	MemoryStalenessDays    int
+	WorkItemsTTLDays       int
+	ProcessedEmailsTTLDays int
+	ProcessedEventsTTLDays int
+	FailedOpsTTLDays       int
+	SkillKVTTLDays         int
+	ShellHistoryTTLDays    int
 }
 
 // Engine holds all dependencies for the heartbeat loop.
@@ -75,22 +95,13 @@ type Engine struct {
 	ProfileContent     string        // identity profile JSON for system prompt injection
 	TemporalContent    string        // temporal context XML for system prompt injection
 
-	MaintenanceInterval    time.Duration // interval between maintenance runs (decay, pruning); 0 = 30m default
-	MemoryStalenessDays    int           // prune decayed memories older than this many days (0 = disabled)
-	WorkItemsTTLDays       int           // prune terminal work items older than this (0 = disabled)
-	ProcessedEmailsTTLDays int           // prune email dedup entries older than this (0 = disabled)
-	ProcessedEventsTTLDays int           // prune calendar event dedup entries older than this (0 = disabled)
-	FailedOpsTTLDays       int           // prune failed operation logs older than this (0 = disabled)
-	SkillKVTTLDays         int           // prune skill KV entries older than this (0 = disabled)
-	ShellHistoryTTLDays    int           // prune shell history entries older than this (0 = disabled)
-	SendFunc            func(text string)    // sends a message to the user via Telegram
-	InterruptChan       chan struct{}        // signals the task scheduler to recalculate
-	Gatekeeper          GatekeeperClient     // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
-	DTCQueueFunc        memory.WorkQueueFunc       // DTC work queue — preferred for distillation (less hallucination)
-	SubagentFunc        memory.SubagentFunc        // for conversation archive distillation (nil = skip distillation)
-	GrammarFunc         memory.GrammarSubagentFunc // for grammar-constrained quality scoring (nil = skip enrichment)
-	BgGrammarFunc       memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
-	QueueFunc           memory.WorkQueueFunc       // background work queue for distillation/enrichment (nil = direct call)
+	MaintenanceInterval time.Duration // interval between maintenance runs (decay, pruning); 0 = 30m default
+	TTL                 TTLConfig     // periodic table pruning thresholds
+	Memory              MemoryFuncs   // memory-related function dependencies
+
+	SendFunc      func(text string) // sends a message to the user via Telegram
+	InterruptChan chan struct{}      // signals the task scheduler to recalculate
+	Gatekeeper    GatekeeperClient  // fast gatekeeper for heartbeat Phase 2 (nil = use orchestrator)
 	WorkMonitor          WorkMonitor           // tracks running work items; nil = no tracking
 	RoutineTimeout       time.Duration         // max duration for a single routine execution (default 5m)
 	Router               SlotRouter            // routes orchestrator calls to Brain or subagent fallback; nil = use LLM.Client
@@ -99,12 +110,17 @@ type Engine struct {
 	ReflectionNotifyFunc func(summary string) // inject reflection insights into conversation context (nil = skip)
 	OnFirstTick          func()               // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
 
+	// Configurable cooldowns (zero = use defaults).
+	ObjectivePursuitCooldown   time.Duration
+	ObjectiveInferenceCooldown time.Duration
+	CuriosityCooldown          time.Duration
+
 	// Internal timers (not configured externally).
-	lastCognitiveRun      time.Time
-	lastMaintenanceRun    time.Time
-	lastCuriosityRun      time.Time
-	lastGoalInferenceRun  time.Time
-	lastGoalPursuitRun    time.Time
+	lastCognitiveRun           time.Time
+	lastMaintenanceRun         time.Time
+	lastCuriosityRun           time.Time
+	lastObjectiveInferenceRun  time.Time
+	lastObjectivePursuitRun    time.Time
 	lastHeartbeatHash  [32]byte // SHA-256 of last proactive heartbeat reply (dedup guard)
 	recentActions      []actionRecord // last ≤5 actions taken (routines + heartbeat); no mutex — sequential callers only
 }
@@ -251,7 +267,7 @@ func (e *Engine) resolveOrchestrator(ctx context.Context, preferBrain bool) Orch
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.
 func (e *Engine) archiveDeps() ArchiveDeps {
-	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, DTCQueueFn: e.DTCQueueFunc, SubagentFn: e.SubagentFunc, GrammarFn: e.GrammarFunc, BgGrammarFn: e.BgGrammarFunc, QueueFn: e.QueueFunc}
+	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, DTCQueueFn: e.Memory.DTCQueueFn, SubagentFn: e.Memory.SubagentFn, GrammarFn: e.Memory.GrammarFn, BgGrammarFn: e.Memory.BgGrammarFn, QueueFn: e.Memory.QueueFn}
 }
 
 // Run starts the engine's background loops. Three independent loops run

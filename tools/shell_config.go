@@ -29,9 +29,9 @@ type ShellCommandCfg struct {
 	WorkspaceOnly *bool  `toml:"workspace_only"`
 }
 
-// LoadShellConfig reads and parses a TOML shell config file. Returns sensible
+// loadShellConfig reads and parses a TOML shell config file. Returns sensible
 // defaults if the file doesn't exist.
-func LoadShellConfig(path string) (*ShellConfig, error) {
+func loadShellConfig(path string) (*ShellConfig, error) {
 	cfg := &ShellConfig{
 		Defaults: ShellDefaults{
 			Timeout:       "30s",

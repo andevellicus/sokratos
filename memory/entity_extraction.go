@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/logger"
+	"sokratos/tokens"
 )
 
 // --- Entity extraction ---
@@ -62,7 +63,7 @@ func submitDeferredEntityExtraction(queueFn WorkQueueFunc, db *pgxpool.Pool, ids
 		SystemPrompt: entityExtractionPrompt,
 		UserPrompt:   summary,
 		Grammar:      entityGrammar,
-		MaxTokens:    512,
+		MaxTokens:    tokens.MemoryEnrichment,
 		Timeout:      TimeoutQualityScore,
 		Retries:      2,
 		Priority:     PriorityLow,

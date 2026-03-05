@@ -115,9 +115,9 @@ func markEventsProcessed(ctx context.Context, pool *pgxpool.Pool, events []googl
 // deduplicated against processed_events so the orchestrator only sees new ones.
 func NewSearchCalendar(svc *cal.Service, pool *pgxpool.Pool) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a searchCalendarArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return "", Errorf("invalid arguments: %v", err)
+		a, err := ParseArgs[searchCalendarArgs](args)
+		if err != nil {
+			return "", err
 		}
 
 		// Detect routine mode: no explicit arguments provided.

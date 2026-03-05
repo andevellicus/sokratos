@@ -45,16 +45,7 @@ func GetAllPersonalityTraits(ctx context.Context, db *pgxpool.Pool) ([]Personali
 		return nil, fmt.Errorf("query personality traits: %w", err)
 	}
 	defer rows.Close()
-
-	var traits []PersonalityTrait
-	for rows.Next() {
-		var t PersonalityTrait
-		if err := rows.Scan(&t.ID, &t.Category, &t.TraitKey, &t.TraitValue, &t.Context, &t.CreatedAt, &t.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("scan personality trait: %w", err)
-		}
-		traits = append(traits, t)
-	}
-	return traits, rows.Err()
+	return scanPersonalityTraits(rows)
 }
 
 // GetPersonalityTraitsByCategory returns traits filtered by category.
@@ -68,7 +59,14 @@ func GetPersonalityTraitsByCategory(ctx context.Context, db *pgxpool.Pool, categ
 		return nil, fmt.Errorf("query personality traits by category: %w", err)
 	}
 	defer rows.Close()
+	return scanPersonalityTraits(rows)
+}
 
+func scanPersonalityTraits(rows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}) ([]PersonalityTrait, error) {
 	var traits []PersonalityTrait
 	for rows.Next() {
 		var t PersonalityTrait

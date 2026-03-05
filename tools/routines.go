@@ -30,9 +30,9 @@ type routineArgs struct {
 // is non-nil, changes are also written back to the routines TOML file.
 func NewManageRoutines(pool *pgxpool.Pool, fileWriter routines.FileWriter) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a routineArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[routineArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if a.Name == "" {
 			return "error: name is required", nil

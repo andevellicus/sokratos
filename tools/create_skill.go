@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"sokratos/logger"
 )
@@ -32,7 +31,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			TestArgs    json.RawMessage `json:"test_args"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("Invalid arguments: %v", err), nil
+			return fmt.Sprintf("invalid arguments: %v", err), nil
 		}
 
 		// Validate name.
@@ -79,7 +78,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			}
 			execSource = transpiled
 		} else {
-			if err := ValidateSkillSource(a.Code); err != nil {
+			if err := validateSkillSource(a.Code); err != nil {
 				return fmt.Sprintf("JavaScript syntax error: %v", err), nil
 			}
 			execSource = a.Code
@@ -126,7 +125,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 			return "", fmt.Errorf("create skill directory: %w", err)
 		}
 
-		mdContent := GenerateSkillMD(a.Name, a.Description, lang, params)
+		mdContent := generateSkillMD(a.Name, a.Description, lang, params)
 		if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(mdContent), 0644); err != nil {
 			return "", fmt.Errorf("write SKILL.md: %w", err)
 		}
@@ -169,7 +168,7 @@ func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar Gramma
 			TestArgs json.RawMessage `json:"test_args"`
 		}
 		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("Invalid arguments: %v", err), nil
+			return fmt.Sprintf("invalid arguments: %v", err), nil
 		}
 
 		switch strings.ToLower(a.Action) {
@@ -214,7 +213,7 @@ func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar Gramma
 			rebuildGrammar()
 			// Clean up orphaned KV data for the deleted skill.
 			if deps.Pool != nil {
-				kvCtx, kvCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				kvCtx, kvCancel := context.WithTimeout(context.Background(), TimeoutSkillKV)
 				if _, err := deps.Pool.Exec(kvCtx, "DELETE FROM skill_kv WHERE skill_name=$1", a.Name); err != nil {
 					logger.Log.Warnf("[skills] failed to clean KV for deleted skill %s: %v", a.Name, err)
 				}
@@ -269,5 +268,111 @@ func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar Gramma
 		default:
 			return fmt.Sprintf("Unknown action %q — use 'list', 'delete', or 'test'", a.Action), nil
 		}
+	}
+}
+
+// NewUpdateSkill returns a ToolFunc that updates an existing skill's source
+// code on disk. It preserves the existing manifest (description, params,
+// language) and only replaces the handler source. The skill is validated,
+// test-executed, and overwritten on disk on success. No re-register is needed
+// because RegisterSkill closures re-read source from disk on each invocation.
+func NewUpdateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
+	return func(ctx context.Context, args json.RawMessage) (string, error) {
+		var a struct {
+			Name     string          `json:"name"`
+			Code     string          `json:"code"`
+			TestArgs json.RawMessage `json:"test_args"`
+		}
+		if err := json.Unmarshal(args, &a); err != nil {
+			return fmt.Sprintf("invalid arguments: %v", err), nil
+		}
+
+		if strings.TrimSpace(a.Name) == "" {
+			return "name is required", nil
+		}
+		if strings.TrimSpace(a.Code) == "" {
+			return "code is required", nil
+		}
+
+		// Verify skill exists on disk.
+		skillDir := filepath.Join(skillsDir, a.Name)
+		mdPath := filepath.Join(skillDir, "SKILL.md")
+		mdData, err := os.ReadFile(mdPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Sprintf("Skill %q not found on disk", a.Name), nil
+			}
+			return fmt.Sprintf("Failed to read skill manifest: %v", err), nil
+		}
+
+		// Parse existing manifest to get language, description, params.
+		manifest, _, err := parseSkillMD(mdData)
+		if err != nil {
+			return fmt.Sprintf("Failed to parse SKILL.md for %q: %v", a.Name, err), nil
+		}
+
+		lang := manifest.Language
+		if lang == "" {
+			lang = "javascript"
+		}
+
+		// Validate/transpile the new source.
+		var execSource string
+		if lang == "typescript" {
+			transpiled, tErr := ValidateTypeScriptSource(a.Code)
+			if tErr != nil {
+				return fmt.Sprintf("TypeScript error: %v", tErr), nil
+			}
+			execSource = transpiled
+		} else {
+			if err := validateSkillSource(a.Code); err != nil {
+				return fmt.Sprintf("JavaScript syntax error: %v", err), nil
+			}
+			execSource = a.Code
+		}
+
+		// Normalize test_args.
+		var testArgsRaw []byte
+		if len(a.TestArgs) == 0 {
+			testArgsRaw = []byte("{}")
+		} else if a.TestArgs[0] == '"' {
+			var s string
+			if err := json.Unmarshal(a.TestArgs, &s); err != nil {
+				return "Invalid JSON in test_args string", nil
+			}
+			testArgsRaw = []byte(s)
+			if !json.Valid(testArgsRaw) {
+				return "Invalid JSON inside test_args string value", nil
+			}
+		} else {
+			testArgsRaw = a.TestArgs
+		}
+		if !json.Valid(testArgsRaw) {
+			return "Invalid JSON in test_args", nil
+		}
+
+		// Test execution with the new source.
+		testResult, err := ExecuteSkill(ctx, a.Name, execSource, skillDir, testArgsRaw, deps)
+		if err != nil {
+			return fmt.Sprintf("Skill failed test execution: %v", err), nil
+		}
+
+		lowerResult := strings.ToLower(strings.TrimSpace(testResult))
+		if strings.Contains(lowerResult, "execution error") || strings.HasPrefix(lowerResult, "error") || strings.HasPrefix(lowerResult, "failed to") || strings.Contains(lowerResult, "failed to get") {
+			return fmt.Sprintf("Skill failed test execution: %s", testResult), nil
+		}
+
+		// Overwrite handler on disk.
+		handlerFile := "handler.js"
+		if lang == "typescript" {
+			handlerFile = "handler.ts"
+		}
+		scriptsDir := filepath.Join(skillDir, "scripts")
+		if err := os.WriteFile(filepath.Join(scriptsDir, handlerFile), []byte(a.Code), 0644); err != nil {
+			return "", fmt.Errorf("write %s: %w", handlerFile, err)
+		}
+
+		logger.Log.Infof("[skills] updated skill: %s", a.Name)
+		return fmt.Sprintf("Skill %q updated. Test result:\n%s", a.Name, testResult), nil
 	}
 }

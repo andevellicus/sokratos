@@ -25,9 +25,9 @@ type createEventArgs struct {
 // NewCreateEvent returns a ToolFunc that creates a new Google Calendar event.
 func NewCreateEvent(svc *cal.Service) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a createEventArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[createEventArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if a.Title == "" {
 			return "error: 'title' is required", nil

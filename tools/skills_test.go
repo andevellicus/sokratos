@@ -106,25 +106,25 @@ description: No name field here.
 	}
 }
 
-func TestValidateSkillSource(t *testing.T) {
+func Test_validateSkillSource(t *testing.T) {
 	// Valid JS.
-	if err := ValidateSkillSource(`var x = 1 + 2; x;`); err != nil {
+	if err := validateSkillSource(`var x = 1 + 2; x;`); err != nil {
 		t.Errorf("expected valid JS, got error: %v", err)
 	}
 
 	// Invalid JS.
-	if err := ValidateSkillSource(`var x = {;`); err == nil {
+	if err := validateSkillSource(`var x = {;`); err == nil {
 		t.Error("expected error for invalid JS")
 	}
 
 	// Top-level return (should pass via IIFE wrapping).
-	if err := ValidateSkillSource(`var x = 1 + 2; return x;`); err != nil {
+	if err := validateSkillSource(`var x = 1 + 2; return x;`); err != nil {
 		t.Errorf("expected return-based JS to pass via IIFE, got error: %v", err)
 	}
 
 	// Top-level return with function body.
 	src := `var resp = http_request("GET", "https://example.com"); return resp.body;`
-	if err := ValidateSkillSource(src); err != nil {
+	if err := validateSkillSource(src); err != nil {
 		t.Errorf("expected return-in-function-body to pass via IIFE, got error: %v", err)
 	}
 }
@@ -286,8 +286,8 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 	}
 }
 
-func TestGenerateSkillMD(t *testing.T) {
-	md := GenerateSkillMD("my_skill", "Does something useful.", "", []ParamSchema{
+func Test_generateSkillMD(t *testing.T) {
+	md := generateSkillMD("my_skill", "Does something useful.", "", []ParamSchema{
 		{Name: "query", Type: "string", Required: true},
 	})
 	if md == "" {
@@ -362,14 +362,14 @@ func TestLoadSkills_BuiltinSkillParams(t *testing.T) {
 	}
 }
 
-func TestGenerateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
+func Test_generateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	// Simulate create_skill: generate SKILL.md + handler.js, then load via LoadSkills.
 	dir := t.TempDir()
 	skillDir := filepath.Join(dir, "test_generated")
 	scriptsDir := filepath.Join(skillDir, "scripts")
 	os.MkdirAll(scriptsDir, 0755)
 
-	md := GenerateSkillMD("test_generated", "A tool-created skill for testing.", "", []ParamSchema{
+	md := generateSkillMD("test_generated", "A tool-created skill for testing.", "", []ParamSchema{
 		{Name: "city", Type: "string", Required: true},
 		{Name: "units", Type: "string", Required: false},
 	})
@@ -713,8 +713,8 @@ func TestExecuteSkill_TypeScript(t *testing.T) {
 	}
 }
 
-func TestGenerateSkillMD_WithLanguage(t *testing.T) {
-	md := GenerateSkillMD("ts_skill", "A TypeScript skill.", "typescript", []ParamSchema{
+func Test_generateSkillMD_WithLanguage(t *testing.T) {
+	md := generateSkillMD("ts_skill", "A TypeScript skill.", "typescript", []ParamSchema{
 		{Name: "input", Type: "string", Required: true},
 	})
 	if !strings.Contains(md, "language: typescript") {
@@ -737,9 +737,9 @@ func TestGenerateSkillMD_WithLanguage(t *testing.T) {
 	}
 }
 
-func TestGenerateSkillMD_JavaScriptDefault(t *testing.T) {
+func Test_generateSkillMD_JavaScriptDefault(t *testing.T) {
 	// Empty language should not emit a language line.
-	md := GenerateSkillMD("js_skill", "A JS skill.", "", nil)
+	md := generateSkillMD("js_skill", "A JS skill.", "", nil)
 	if strings.Contains(md, "language:") {
 		t.Errorf("expected no language line for default JS, got:\n%s", md)
 	}

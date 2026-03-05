@@ -28,6 +28,18 @@ func Errorf(format string, args ...any) *ToolError {
 	return &ToolError{Message: fmt.Sprintf(format, args...)}
 }
 
+// ParseArgs unmarshals JSON tool arguments into T, returning a consistent
+// "invalid arguments" error on failure. Callers that use the soft-error
+// convention can return (err.Error(), nil); callers that use ToolError can
+// return ("", err).
+func ParseArgs[T any](args json.RawMessage) (T, error) {
+	var v T
+	if err := json.Unmarshal(args, &v); err != nil {
+		return v, fmt.Errorf("invalid arguments: %w", err)
+	}
+	return v, nil
+}
+
 // ToolCall represents a tool invocation from the LLM.
 type ToolCall struct {
 	Name      string          `json:"name"`

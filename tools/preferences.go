@@ -19,9 +19,9 @@ type setPreferenceArgs struct {
 // Common keys: name, location, timezone, language.
 func NewSetPreference(sm *engine.StateManager) ToolFunc {
 	return func(_ context.Context, args json.RawMessage) (string, error) {
-		var a setPreferenceArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[setPreferenceArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		a.Key = strings.TrimSpace(a.Key)
 		a.Value = strings.TrimSpace(a.Value)

@@ -77,9 +77,9 @@ func (dc *DelegateConfig) IsAllowed(name string) bool {
 // so that newly created skills are immediately available.
 func NewDelegateTask(sc *clients.SubagentClient, registry *Registry, dc *DelegateConfig) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		var a delegateTaskArgs
-		if err := json.Unmarshal(args, &a); err != nil {
-			return fmt.Sprintf("invalid arguments: %v", err), nil
+		a, err := ParseArgs[delegateTaskArgs](args)
+		if err != nil {
+			return err.Error(), nil
 		}
 		if strings.TrimSpace(a.Directive) == "" {
 			return "directive is required", nil

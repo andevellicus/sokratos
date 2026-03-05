@@ -11,6 +11,7 @@ import (
 
 	"sokratos/logger"
 	"sokratos/textutil"
+	"sokratos/tokens"
 )
 
 // --- Structured writes with quality scoring ---
@@ -128,6 +129,7 @@ func EnrichViaGrammarFn(db *pgxpool.Pool, grammarFn GrammarSubagentFunc, ids []i
 	raw, err := grammarFn(ctx, qualitySystemPrompt, userContent, qualityGrammar)
 	if err != nil {
 		logger.Log.Warnf("[memory] quality scoring failed: %v", err)
+		LogFailedOp(db, "entity_enrichment", "quality_scoring", err, map[string]any{"memory_ids": ids})
 		return
 	}
 	applyEnrichment(db, ids, raw, baseSalience)
@@ -142,7 +144,7 @@ func submitEnrichment(queueFn WorkQueueFunc, db *pgxpool.Pool, ids []int64, summ
 		SystemPrompt: qualitySystemPrompt,
 		UserPrompt:   buildEnrichmentPrompt(summary, existingSummaries),
 		Grammar:      qualityGrammar,
-		MaxTokens:    512,
+		MaxTokens:    tokens.MemoryEnrichment,
 		Timeout:      TimeoutQualityEnrich,
 		Retries:      2,
 		Priority:     PriorityNormal,
