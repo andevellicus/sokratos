@@ -52,7 +52,7 @@ All three branches include an `ack` field — a brief natural reply shown to the
 2. **Dispatch (multi-step)** when the request needs 2-3 sequential tool calls but no complex reasoning.
 3. **Escalate** when the request needs judgment, creativity, complex reasoning, or involves side effects.
 
-Never dispatched: `send_email`, `create_event`, `create_skill`, `manage_skills`, `manage_routines`, `manage_personality`, `save_memory`, `forget_topic`, `consult_deep_thinker`, `plan_and_execute`, `delegate_task`, `ask_database`.
+Never dispatched: `send_email`, `create_event`, `create_skill`, `update_skill`, `manage_skills`, `manage_routines`, `manage_personality`, `manage_objectives`, `save_memory`, `forget_topic`, `reason`, `plan_and_execute`, `delegate_task`, `ask_database`, `write_file`, `patch_file`, `reply_to_job`, `cancel_job`.
 
 ---
 
@@ -129,7 +129,7 @@ During tool execution, the orchestrator slot is released (`OnToolStart`) and rea
 
 ## Synthesis (Dispatch Path Only)
 
-Post-tool synthesis in the dispatch path uses `buildSynthesisPrompt()`:
+Post-tool synthesis in the dispatch path uses `buildContextualPrompt()`:
 
 1. Personality content (voice/tone)
 2. Core instruction: "Present results naturally as if you already knew them"
@@ -147,17 +147,34 @@ Brain escalation does **not** use synthesis — the Brain's final response is se
 
 ---
 
+## Background Brain Jobs
+
+Complex tasks are offloaded to background Brain sessions (`runBackgroundJob` in `dispatch.go`) that run concurrently. Two paths:
+
+1. **Mandatory intercept** — `create_skill` and `update_skill` are intercepted at the supervisor level via `MandatedBrainTools` and always routed to a background Brain session.
+2. **Voluntary** — The 9B calls `reason(background=true)` which returns a `BackgroundJobRequest` sentinel error, propagated through the supervisor to `processMessage`.
+
+Each job selects a session prompt by `TaskType` (`brainSessionPrompts` map), falling back to `prompts.SessionReason` for general tasks. Jobs support multi-round tool execution (max 20 rounds) and can ask the user questions — the goroutine parks waiting for input via `reply_to_job`. The `toolSucceeded` flag provides a completion signal for jobs with a target tool (e.g. `create_skill`).
+
+---
+
+## Code Location
+
+All dispatch and background job code lives in `dispatch.go` (extracted from `message_loop.go`). The `message_loop.go` file retains `processMessage`, `completeMessageHandling`, command handlers (`handleReload`, `handleBootstrap`, `handleGoogle`), and the curiosity signal emitter.
+
+---
+
 ## Key Constants
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `timeoutDispatchTriage` | 5s | Triage grammar call |
-| `timeoutDispatchToolExec` | 5min | Single tool execution |
-| `timeoutDispatchSynthesis` | 30s | 9B synthesis |
-| `timeoutDispatchDTCSynthesis` | 45s | DTC synthesis fallback |
-| `timeoutMultiStepDispatch` | 90s | Multi-step supervisor loop |
-| `dispatchMaxTriageTokens` | 512 | Triage output token limit |
-| `dispatchMaxSynthTokens` | 2048 | Synthesis output token limit |
-| `dispatchMaxResultLen` | 8000 | Tool result truncation for synthesis input |
-| `dispatchProgressInterval` | 20s | Progress update frequency |
-| `maxMultiStepRounds` | 5 | Multi-step tool call rounds |
+| Constant | Value | Location | Purpose |
+|----------|-------|----------|---------|
+| `TimeoutDispatchTriage` | 10s | `tools/timeouts.go` | Triage grammar call |
+| `TimeoutDispatchToolExec` | 5min | `tools/timeouts.go` | Single tool execution |
+| `TimeoutDispatchSynthesis` | 30s | `tools/timeouts.go` | 9B synthesis |
+| `TimeoutDispatchDTCSynthesis` | 45s | `tools/timeouts.go` | DTC synthesis fallback |
+| `TimeoutMultiStepDispatch` | 90s | `tools/timeouts.go` | Multi-step supervisor loop |
+| `dispatchMaxTriageTokens` | 768 | `dispatch.go` | Triage output token limit |
+| `dispatchMaxSynthTokens` | 2048 | `dispatch.go` | Synthesis output token limit |
+| `dispatchMaxResultLen` | 8000 | `dispatch.go` | Tool result truncation for synthesis input |
+| `dispatchProgressInterval` | 20s | `dispatch.go` | Progress update frequency |
+| `maxMultiStepRounds` | 5 | `dispatch.go` | Multi-step tool call rounds |

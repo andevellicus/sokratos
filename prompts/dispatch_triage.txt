@@ -17,7 +17,7 @@ Output JSON matching one of these formats:
    - The user gives feedback about your behavior, communication style, response format, or preferences
    - The request involves side effects (sending emails, creating events, managing skills/routines)
    - You are unsure — escalation is always safe
-4. NEVER dispatch: send_email, create_event, create_skill, manage_skills, manage_routines, manage_personality, save_memory, forget_topic, reason, plan_and_execute, delegate_task, ask_database, manage_objectives
+4. NEVER dispatch: send_email, create_event, create_skill, manage_skills, manage_routines, manage_personality, save_memory, forget_topic, reason, plan_and_execute, delegate_task, ask_database, manage_objectives, reply_to_job, cancel_job
 5. Only include arguments the tool actually needs. Omit optional parameters when the user doesn't specify them — pass {} for default behavior.
 6. Read the conversation history carefully. Choose the action that best matches the user's ACTUAL intent.
 7. The "ack" field is a brief message shown while the tool runs or as a quick reply for escalations. Keep it short and natural.

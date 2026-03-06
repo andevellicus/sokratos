@@ -49,3 +49,12 @@ var ObjectiveInference string
 
 //go:embed dispatch_triage.txt
 var DispatchTriage string
+
+//go:embed session_create_skill.txt
+var SessionCreateSkill string
+
+//go:embed session_send_email.txt
+var SessionSendEmail string
+
+//go:embed session_reason.txt
+var SessionReason string

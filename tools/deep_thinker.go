@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/clients"
+	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
 	"sokratos/prompts"
@@ -20,6 +21,8 @@ import (
 type deepThinkArgs struct {
 	ProblemStatement string `json:"problem_statement"`
 	MaxTokens        int    `json:"max_tokens,omitempty"` // defaults to 2048 if zero
+	Background       bool   `json:"background"`
+	TaskType         string `json:"task_type,omitempty"`
 }
 
 // dtcSearchResult records one search round: the query DTC requested and the
@@ -60,6 +63,17 @@ func deepThink(ctx context.Context, args json.RawMessage, dtc *clients.DeepThink
 	if strings.TrimSpace(a.ProblemStatement) == "" {
 		return "[DEEP THINKER UNAVAILABLE]: problem_statement is required. Proceed with best available reasoning.", nil
 	}
+	// When background=true, return a BackgroundJobRequest instead of calling DTC.
+	// The supervisor will propagate this as an error to spawn a background Brain job.
+	if a.Background {
+		return "", &llm.BackgroundJobRequest{
+			Tool:             "reason",
+			UserGoal:         a.ProblemStatement,
+			TaskType:         a.TaskType,
+			ProblemStatement: a.ProblemStatement,
+		}
+	}
+
 	if a.MaxTokens == 0 {
 		a.MaxTokens = tokens.DTCDefault
 	}

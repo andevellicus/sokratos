@@ -149,7 +149,7 @@ The orchestrator has access to the following built-in tools:
 | `save_memory` | Persist a fact or preference to long-term memory |
 | `forget_topic` | Delete memories related to a topic by semantic similarity |
 | `consolidate_memory` | Synthesize high-salience memories into the core profile |
-| `consult_deep_thinker` | Route complex reasoning to the Brain model with full chain-of-thought |
+| `reason` | Route complex reasoning to the Brain model with full chain-of-thought. Supports `background=true` to spawn a background Brain session with tool access for complex tasks (skill creation, research, analysis). |
 | `delegate_task` | Delegate structured tasks to subagent with scoped tool access |
 | `plan_and_execute` | Decompose a directive into steps via DTC, execute via subagent (supports background mode) |
 | `check_background_task` | List, check status, or cancel background tasks |
@@ -166,7 +166,11 @@ The orchestrator has access to the following built-in tools:
 | `manage_personality` | Set, remove, or list personality traits |
 | `update_state` | Update the agent's current status and task |
 | `set_preference` | Store quick-access user preferences |
-| `create_skill` / `manage_skills` | Create or manage user-defined TypeScript/JavaScript tools |
+| `create_skill` / `update_skill` / `manage_skills` | Create, update, or manage user-defined TypeScript/JavaScript tools |
+| `manage_objectives` | Add, update, pause, resume, complete, retire, or list long-term objectives |
+| `reply_to_job` / `cancel_job` | Interact with or cancel background Brain jobs |
+| `run_command` | Execute shell commands in a sandboxed environment |
+| `read_file` / `write_file` / `patch_file` / `list_files` | File system operations within the workspace directory |
 
 ## Skill System
 
@@ -198,6 +202,7 @@ Skills execute in a goja ES2020 sandbox (30s timeout; 5min with delegation deps)
 |-------|--------|--------|
 | `get_weather` | `location` | `{location, current: {condition, temp_f, humidity, ...}, forecast: [{date, high_f, low_f, condition}]}` |
 | `scan_feeds` | `feeds` | RSS/Atom aggregator with parallel article summarization. Supports Twitter (via RSSHub), Reddit (native RSS), direct RSS/Atom, and any RSSHub route. |
+| `weekly_review` | — | Generates a structured weekly review by querying memory activity, active goals, work items, routine health, and personality evolution. |
 
 ### Creating Skills
 
@@ -206,6 +211,15 @@ The orchestrator can create new skills at runtime via `create_skill`. Skills are
 ## Dispatch Architecture
 
 See [docs/dispatch.md](docs/dispatch.md) for the full technical reference on message routing, triage, slot routing, and synthesis.
+
+## Background Brain Jobs
+
+Complex tasks (skill creation, research, multi-step analysis) can be offloaded to background Brain sessions that run concurrently while the 9B continues serving the user. Two paths converge:
+
+1. **Mandatory intercept** — `create_skill` and `update_skill` are intercepted at the supervisor level and always routed to a background Brain session.
+2. **Voluntary** — The 9B calls `reason(background=true, task_type="...")` to spawn a background Brain session for any complex task.
+
+Background jobs support multi-round tool execution and can ask the user clarifying questions (the job parks until input arrives via `reply_to_job`). Jobs can be cancelled via `cancel_job`. Session prompts are selected by `task_type` (e.g. `"create_skill"` uses a skill-creation prompt, general tasks use a reasoning prompt).
 
 ## Memory System
 
@@ -291,11 +305,13 @@ sokratos/
   main.go              # Entry point, serviceBundle, initServices, initLLM, message loop
   wire.go              # initEngine, wireEngine (post-construction wiring), startup tasks
   adapters.go          # Engine interface adapters (notifier, hot-reload, cognitive, reflection)
-  message_loop.go      # Dispatch triage, escalation ack, Brain orchestration
+  message_loop.go      # processMessage, completeMessageHandling, command handlers
+  dispatch.go          # Dispatch triage, multi-step dispatch, background Brain jobs, prompt builders
+  condense.go          # Tool result condensation and context summarization
+  prefetch.go          # Subconscious memory prefetch and usefulness evaluation
   objective_callbacks.go # Objective task completion and share gate wiring
   register_tools.go    # Domain-grouped tool registration
   confirm.go           # Telegram confirmation gate for sensitive tools
-  prefetch.go          # Subconscious memory prefetch for message loop
   telegram.go          # Telegram helpers (photo download, typing indicator)
   format.go            # Markdown-to-Telegram HTML converter
   adaptive/            # Runtime-tunable thresholds (Get/Set/Clamp, adaptive_params table)
@@ -311,15 +327,21 @@ sokratos/
   engine/              # Heartbeat loop, context sliding, state, slot routing
     engine.go          # Engine struct and Run() (3 independent loops)
     interfaces.go      # Notifier, HotReloader, CognitiveServices, ReflectionSink
+    background_jobs.go # BackgroundJob struct and StateManager job management
     cognitive.go       # Event-driven cognitive processing (consolidation, episodes, reflection)
     curiosity.go       # Signal-driven curiosity dispatch
+    heartbeat.go       # Heartbeat loop tick (Phase 1: gatekeeper triage)
+    heartbeat_phase2.go # Heartbeat Phase 2 (staleness detection, orchestrator call)
     objectives.go      # Objective inference from conversation context
     objective_pursuit.go # Cooldown-gated objective pursuit
     routines.go        # Routine execution within heartbeat (uses routines/ package)
     scheduler.go       # PostgreSQL-backed task scheduler
+    share_limiter.go   # Rate-limited proactive sharing (max N/day, 30min gap)
     slide.go           # Context window management and archival
     slot_router.go     # Routes orchestrator calls between Brain and 9B
     state.go           # Thread-safe in-memory agent state with DB-backed prefs
+    temporal.go        # Temporal context builder (upcoming tasks, events)
+    trim.go            # Tool result trimming for orchestrator context
   objectives/          # Objective CRUD (Create, Get, ListActive, Complete, Retire, etc.)
   routines/            # Routine definitions, scheduling, file I/O, DB sync
     routines.go        # Entry, DueRoutine, NilIfEmpty, IsEmptyResult
@@ -328,7 +350,7 @@ sokratos/
     file.go            # FileWriter interface, FileAdapter, LoadFile
     sync.go            # SyncFromFile, SyncIfChanged, Upsert, Delete, QueryDue, AdvanceTimer
   llm/                 # LLM client, supervisor pattern, tool intent extraction
-    client.go          # Chat API, QueryOrchestrator, FallbackMap
+    client.go          # Chat API, QueryOrchestrator, BackgroundJobRequest, FallbackMap
     supervisor.go      # Supervisor loop with regex-based tool parsing
   memory/              # Embedding, storage, scoring, decay, synthesis
     save.go            # SaveToMemoryAsync, SaveToMemoryWithSalienceAsync, identity profile
@@ -345,20 +367,24 @@ sokratos/
     format.go          # Memory formatting utilities
   tools/               # Tool implementations and registry
     tools.go           # Registry, Execute, NewScopedToolExec factory
+    timeouts.go        # Centralized tool-level timeouts (dispatch, plan, skill, etc.)
     memory.go          # search_memory, save_memory, retrieval tracking
     skills.go          # Skill loader, executor, and registry integration
     create_skill.go    # create_skill tool (TS transpile, test, persist)
     transpile.go       # TypeScript → JS transpilation via esbuild
     skill_vm.go        # Goja VM setup and skill runtime globals
+    deep_thinker.go    # reason tool (deep thinking + background Brain sessions)
     personality.go     # manage_personality tool
     objectives.go      # manage_objectives tool
     routines.go        # manage_routines tool (uses routines/ package)
     delegate_task.go   # delegate_task tool (scoped tool access)
     plan_execute.go    # plan_and_execute + check_background_task tools
+    background_jobs.go # reply_to_job + cancel_job tools
     shell.go           # run_command tool (sandboxed shell execution)
     search_web.go      # search_web tool (SearXNG)
     read_url.go        # read_url tool (web page fetching)
     run_code.go        # run_code tool (sandboxed JS execution)
+    work_tracker.go    # WorkTracker for background plans, routines, scheduled tasks
   pipelines/           # Multi-step processing pipelines
     consolidate_memory.go  # Memory consolidation (ConsolidateCore, ConsolidateImmediate)
     triage_conversation.go # Conversation/email triage and save
@@ -387,6 +413,7 @@ sokratos/
 |---------|-------------|
 | `/bootstrap` | Generate initial identity profile from conversation context |
 | `/reload` | Force re-sync routines and skills from TOML files to database |
+| `/google` | Re-authenticate Google OAuth (Gmail + Calendar) via Telegram |
 
 ## Development
 

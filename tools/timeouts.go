@@ -33,6 +33,13 @@ const (
 	// --- Shell ---
 	TimeoutShellAudit = 5 * time.Second
 
+	// --- Dispatch ---
+	TimeoutDispatchTriage       = 10 * time.Second
+	TimeoutDispatchToolExec     = 5 * time.Minute
+	TimeoutDispatchSynthesis    = 30 * time.Second
+	TimeoutDispatchDTCSynthesis = 45 * time.Second
+	TimeoutMultiStepDispatch    = 90 * time.Second
+
 	// --- Plan Execution ---
 	TimeoutPlanDecomposition = 60 * time.Second
 	TimeoutPlanStepExecution = 90 * time.Second

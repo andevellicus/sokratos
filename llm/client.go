@@ -205,6 +205,21 @@ type ToolAgentConfig struct {
 	Parser           ToolIntentParser // nil defaults to SupervisorParser{}
 }
 
+// BackgroundJobRequest is a sentinel error returned when the supervisor detects
+// a tool call that should be handled by a background Brain session instead.
+// Returned by both mandatory intercepts (create_skill, update_skill) and the
+// reason tool when called with background=true.
+type BackgroundJobRequest struct {
+	Tool             string // triggering tool ("create_skill") or "reason"
+	UserGoal         string // original user message (from supervisor's prompt param)
+	TaskType         string // maps to session prompt; "" = general
+	ProblemStatement string // for reason tool: the problem_statement arg
+}
+
+func (e *BackgroundJobRequest) Error() string {
+	return "background job requested for " + e.Tool
+}
+
 // QueryOrchestratorOpts holds optional parameters for QueryOrchestrator.
 type QueryOrchestratorOpts struct {
 	Parts              []ContentPart    // vision content parts for the user message
@@ -217,6 +232,7 @@ type QueryOrchestratorOpts struct {
 	MaxWebSources      int              // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
 	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
+	MandatedBrainTools map[string]string // tools that trigger a background Brain job (key=tool, value=task_type)
 	OnToolStart func(toolName string)            // called before tool execution with tool name (nil = no-op)
 	OnToolEnd   func(ctx context.Context) error // reacquire slot after tool execution (nil = no-op)
 }

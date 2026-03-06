@@ -40,7 +40,6 @@ type LLMConfig struct {
 	Client           *llm.Client
 	Model            string
 	ToolAgent        *llm.ToolAgentConfig // when set, enables the supervisor pattern
-	Fallbacks        llm.FallbackMap      // deterministic fallback chains for failed tools
 	MaxToolResultLen int                  // max chars per tool result (0 = default 2000)
 	MaxWebSources    int                  // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 }
@@ -235,7 +234,6 @@ func (e *Engine) baseOrchestratorOpts() *llm.QueryOrchestratorOpts {
 		MaxToolResultLen:   e.LLM.MaxToolResultLen,
 		MaxWebSources:      e.LLM.MaxWebSources,
 		ToolAgent:          e.LLM.ToolAgent,
-		Fallbacks:          e.LLM.Fallbacks,
 	}
 }
 

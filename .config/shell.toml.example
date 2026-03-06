@@ -1,0 +1,165 @@
+[defaults]
+timeout = "30s"
+max_output = 10000
+workspace_only = true
+
+# -- Filesystem (read-only) --
+[commands.ls]
+description = "List directory contents"
+workspace_only = false
+[commands.find]
+description = "Search for files by name/pattern"
+workspace_only = false
+[commands.cat]
+description = "Print file contents"
+workspace_only = false
+[commands.head]
+description = "Print first N lines of a file"
+workspace_only = false
+[commands.tail]
+description = "Print last N lines of a file"
+workspace_only = false
+[commands.wc]
+description = "Count lines, words, characters"
+workspace_only = false
+[commands.file]
+description = "Detect file type"
+workspace_only = false
+[commands.stat]
+description = "Display file metadata"
+workspace_only = false
+[commands.du]
+description = "Disk usage summary"
+workspace_only = false
+[commands.df]
+description = "Filesystem disk space"
+workspace_only = false
+[commands.tree]
+description = "Directory tree listing"
+workspace_only = false
+[commands.realpath]
+description = "Resolve symlinks to absolute path"
+workspace_only = false
+
+# -- Text processing --
+[commands.grep]
+description = "Search text with patterns"
+workspace_only = false
+[commands.rg]
+description = "Ripgrep — fast recursive search"
+workspace_only = false
+[commands.awk]
+description = "Pattern scanning and text processing"
+[commands.sed]
+description = "Stream editor for text transformation"
+[commands.sort]
+description = "Sort lines"
+[commands.uniq]
+description = "Filter duplicate lines"
+[commands.cut]
+description = "Extract columns from text"
+[commands.tr]
+description = "Translate or delete characters"
+[commands.jq]
+description = "JSON processor"
+[commands.diff]
+description = "Compare files line by line"
+workspace_only = false
+[commands.sha256sum]
+description = "Compute SHA-256 hash"
+[commands.md5sum]
+description = "Compute MD5 hash"
+[commands.base64]
+description = "Base64 encode/decode"
+
+# -- Network --
+[commands.curl]
+description = "HTTP client — fetch URLs, APIs"
+timeout = "60s"
+workspace_only = false
+[commands.wget]
+description = "Download files from the web"
+timeout = "60s"
+[commands.dig]
+description = "DNS lookup"
+workspace_only = false
+[commands.ping]
+description = "Test network connectivity"
+timeout = "10s"
+workspace_only = false
+[commands.whois]
+description = "Domain registration lookup"
+workspace_only = false
+
+# -- Output formatting --
+[commands.echo]
+description = "Print text to stdout"
+workspace_only = false
+[commands.printf]
+description = "Formatted text output"
+workspace_only = false
+
+# -- System info --
+[commands.date]
+description = "Display current date/time"
+workspace_only = false
+[commands.uname]
+description = "System information"
+workspace_only = false
+[commands.uptime]
+description = "System uptime and load"
+workspace_only = false
+[commands.whoami]
+description = "Current username"
+workspace_only = false
+[commands.hostname]
+description = "System hostname"
+workspace_only = false
+[commands.ps]
+description = "List running processes"
+workspace_only = false
+[commands.free]
+description = "Memory usage"
+workspace_only = false
+[commands.lsblk]
+description = "List block devices"
+workspace_only = false
+
+# -- Dev tools --
+[commands.python3]
+description = "Run Python scripts"
+timeout = "120s"
+[commands.node]
+description = "Run Node.js scripts"
+timeout = "120s"
+[commands.go]
+description = "Go toolchain (build, run, test)"
+timeout = "300s"
+workspace_only = false
+[commands.git]
+description = "Version control"
+workspace_only = false
+[commands.make]
+description = "Build automation"
+timeout = "120s"
+workspace_only = false
+
+# -- Workspace utilities --
+[commands.mkdir]
+description = "Create directories"
+[commands.touch]
+description = "Create empty files"
+[commands.cp]
+description = "Copy files"
+[commands.mv]
+description = "Move/rename files"
+[commands.tee]
+description = "Write stdin to file and stdout"
+[commands.chmod]
+description = "Change file permissions"
+[commands.tar]
+description = "Archive files"
+[commands.gzip]
+description = "Compress files"
+[commands.unzip]
+description = "Extract zip archives"

@@ -24,7 +24,7 @@ import (
 
 // --- Engine Initialization ---
 
-func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, registry *tools.Registry, fallbacks llm.FallbackMap) *engine.Engine {
+func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, registry *tools.Registry) *engine.Engine {
 	var mu sync.Mutex
 
 	eng := &engine.Engine{
@@ -32,7 +32,6 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 			Client:           lb.Client,
 			Model:            cfg.LLMModel,
 			ToolAgent:        lb.ToolAgent,
-			Fallbacks:        fallbacks,
 			MaxToolResultLen: cfg.MaxToolResultLen,
 			MaxWebSources:    cfg.MaxWebSources,
 		},

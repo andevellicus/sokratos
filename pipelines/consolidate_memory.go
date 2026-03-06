@@ -167,11 +167,17 @@ func mergeObjectArray(currentVal, updateVal any, idField string) any {
 	return currentArr
 }
 
-// toObjectSlice converts an any to []map[string]any.
+// toObjectSlice converts an any to []map[string]any. Handles both []any
+// (from JSON unmarshal) and []map[string]any (from mergeObjectArray).
 func toObjectSlice(v any) []map[string]any {
 	if v == nil {
 		return nil
 	}
+	// Direct type — returned by mergeObjectArray.
+	if typed, ok := v.([]map[string]any); ok {
+		return typed
+	}
+	// JSON unmarshal produces []any.
 	arr, ok := v.([]any)
 	if !ok {
 		return nil

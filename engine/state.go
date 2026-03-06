@@ -58,6 +58,9 @@ type StateManager struct {
 	messages         []llm.Message // conversation context (persisted via snapshot)
 	lastUserActivity time.Time     // last time a user message was received
 	lastPipelineID   int64         // Telegram message ID of the last completed interactive pipeline
+
+	jobsMu sync.RWMutex
+	jobs   map[string]*BackgroundJob
 }
 
 // NewStateManager creates a StateManager. If pool is non-nil, it loads user
@@ -69,6 +72,7 @@ func NewStateManager(pool *pgxpool.Pool) *StateManager {
 			Status:    "idle",
 			UserPrefs: make(map[string]string),
 		},
+		jobs: make(map[string]*BackgroundJob),
 	}
 	if pool != nil {
 		sm.loadPrefsFromDB()

@@ -57,24 +57,14 @@ func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, 
 
 	ctx := context.Background()
 
-	// Set objective_id in the INSERT if linked to an objective.
+	// Use NULLIF to set objective_id only when > 0 (single query, nullable param).
 	var taskID int64
-	var err error
-	if objectiveID > 0 {
-		err = wt.db.QueryRow(ctx,
-			`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at, objective_id)
-			 VALUES ('background', $1, 'running', $2, $3, now(), now() + $4::interval, $5)
-			 RETURNING id`,
-			directive, len(steps), priority, fmt.Sprintf("%d seconds", int(TimeoutPlanBackground.Seconds())), objectiveID,
-		).Scan(&taskID)
-	} else {
-		err = wt.db.QueryRow(ctx,
-			`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at)
-			 VALUES ('background', $1, 'running', $2, $3, now(), now() + $4::interval)
-			 RETURNING id`,
-			directive, len(steps), priority, fmt.Sprintf("%d seconds", int(TimeoutPlanBackground.Seconds())),
-		).Scan(&taskID)
-	}
+	err := wt.db.QueryRow(ctx,
+		`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at, objective_id)
+		 VALUES ('background', $1, 'running', $2, $3, now(), now() + $4::interval, NULLIF($5, 0))
+		 RETURNING id`,
+		directive, len(steps), priority, fmt.Sprintf("%d seconds", int(TimeoutPlanBackground.Seconds())), objectiveID,
+	).Scan(&taskID)
 	if err != nil {
 		return 0, fmt.Errorf("create background task: %w", err)
 	}

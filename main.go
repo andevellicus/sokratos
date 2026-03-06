@@ -287,8 +287,6 @@ func main() {
 		})
 	}
 
-	var fallbacks llm.FallbackMap
-
 	lb := initLLM(cfg, registry)
 
 	// Set the triage grammar now that initLLM has built it. The NewSearchEmail
@@ -315,7 +313,7 @@ func main() {
 		}
 	}
 
-	eng := initEngine(cfg, svc, lb, registry, fallbacks)
+	eng := initEngine(cfg, svc, lb, registry)
 	wired := wireEngine(cfg, svc, lb, eng, registry, emailTriageCfg, delegateConfig, shellExec)
 
 	runStartupTasks()
@@ -363,7 +361,6 @@ func main() {
 		lb:             lb,
 		registry:       registry,
 		emailTriageCfg: emailTriageCfg,
-		fallbacks:      fallbacks,
 		confirmExec:    confirmExec,
 		skillMtimes:    wired.skillMtimes,
 		skillDeps:      wired.skillDeps,

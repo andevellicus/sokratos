@@ -1,12 +1,12 @@
 # Memory System Overview
 
-The memory system is a **PostgreSQL + pgvector** store (1024-dim embeddings from BGE-large-en-v1.5) with multiple ingestion paths, a tiered ranking formula, several feedback loops, and higher-order synthesis layers.
+The memory system is a **PostgreSQL + pgvector** store (2560-dim embeddings from Qwen3-Embedding-4B) with multiple ingestion paths, a tiered ranking formula, several feedback loops, and higher-order synthesis layers.
 
 ---
 
 ## Storage (`memories` table)
 
-Each memory row holds: `summary`, `embedding` (vector(1024)), `salience` (1–10, default 5), `tags`, `memory_type` (general/fact/preference/event/email/calendar/episode/reflection/identity), `entities` (text[]), `confidence` (0–1), `retrieval_count`, `usefulness_score` (0–1, default 0.5), `source`, `superseded_by`, `related_ids`, and a generated `summary_tsv` column for full-text search. There are GIN indexes on tags, entities, and summary_tsv, plus an HNSW index on embeddings (handles continuous inserts/deletes without periodic reindexing, unlike IVFFlat).
+Each memory row holds: `summary`, `embedding` (vector(2560)), `salience` (1–10, default 5), `tags`, `memory_type` (general/fact/preference/event/email/calendar/episode/reflection/identity), `entities` (text[]), `confidence` (0–1), `retrieval_count`, `usefulness_score` (0–1, default 0.5), `source`, `superseded_by`, `related_ids`, and a generated `summary_tsv` column for full-text search. GIN indexes on tags, entities, and summary_tsv. At 2560 dimensions, HNSW/IVFFlat indexes are not available (cap at 2000 dims), so brute-force sequential scan is used for vector similarity.
 
 ---
 
@@ -19,7 +19,7 @@ Each memory row holds: `summary`, `embedding` (vector(1024)), `salience` (1–10
 | **LLM `save_memory` tool** | No | No | No | All saved |
 | **Context slide archive** | Subagent distillation (if available) | No | No | Fixed salience=3 (raw) / >= 5 (distilled facts) |
 
-All paths chunk content at **~1200 bytes** (`MaxChunkBytes`) before embedding. BGE-large-en-v1.5 has a 512-token context window; WordPiece tokenization ranges from ~4 bytes/token (plain English) down to ~2.8 bytes/token for structured/HTML content. 1200 bytes stays safely under the 512-token hard limit even for dense email content (~425 tokens at worst case).
+All paths chunk content at **~1200 bytes** (`MaxChunkBytes`) before embedding. This keeps each chunk well within the embedding model's context window while providing enough text for meaningful semantic representation.
 
 **Triage** produces a salience score (1–10), summary, category, and tags. All triage paths use the **subagent** (Qwen3.5-9B) with a GBNF grammar constraint for structured JSON output. A unified `triageAndSave()` core function handles the post-triage pipeline (build text/tags, save with contradiction check, paradigm shift detection), with domain-specific logic in `ShouldSave` closures. Failures are enqueued to a background **retry queue** with exponential backoff. For conversation triage, tool-grounded exchanges use a salience threshold of 3; unverified parametric responses use a threshold of 5 to prevent hallucinated facts from entering memory. Email triage saves at salience >= 1 unless the model explicitly sets `save: false`. The scoring rubric: 1–3 = routine noise, 4–6 = temporal/project relevance, 7–8 = high value/identity, 9–10 = critical/permanent (life-altering only).
 
@@ -65,7 +65,10 @@ cosine_distance
 
 ## Decay & Pruning (periodic maintenance in heartbeat)
 
-- **Salience decay**: `salience *= 0.977^days` (~30-day half-life). Floor of 1. Only affects memories not accessed in the last day.
+- **Salience decay** (dual-rate):
+  - **Standard rate**: `salience *= 0.977^days` (~30-day half-life) — applies to all memories.
+  - **Accelerated rate**: `salience *= 0.954^days` (~15-day half-life) — applies to unretrieved memories (`retrieval_count = 0`, age > 14 days). Ensures unused memories fade faster.
+  - Floor of 1. Only affects memories not accessed in the last day.
 - **Usefulness regression**: Memories not retrieved in 30+ days have `usefulness_score` regressed 5% toward 0.5 per tick, preventing permanently-low scores from blocking retrieval.
 - **Pruning**: Memories with `salience <= 1`, older than 90 days (configurable), AND either superseded or never retrieved are deleted.
 
@@ -105,7 +108,8 @@ Synthesis layers are triggered by **event-driven cognitive processing** (`engine
 | Value | Meaning |
 |---|---|
 | 1200 bytes | Max chunk size per embedding (`MaxChunkBytes`) |
-| 0.977/day | Salience decay rate (~30-day half-life) |
+| 0.977/day | Standard salience decay rate (~30-day half-life) |
+| 0.954/day | Accelerated decay for unretrieved memories (~15-day half-life) |
 | 3 / 5 | Conversation triage save threshold (tool-grounded / parametric) |
 | 8.0 | Episode salience |
 | 9.0 | Reflection salience |

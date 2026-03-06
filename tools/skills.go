@@ -587,8 +587,7 @@ func validateSkillSource(source string) error {
 		return nil
 	}
 	// If the error might be solved by a function wrapper, try wrapping in IIFE.
-	errStr := err.Error()
-	if strings.Contains(errStr, "return") || strings.Contains(errStr, "await") || strings.Contains(errStr, "Unexpected identifier") {
+	if needsIIFEWrap(source) {
 		if _, err2 := goja.Compile("handler.js", wrapInIIFE(source), false); err2 == nil {
 			return nil
 		}

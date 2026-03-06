@@ -114,10 +114,9 @@ func TestMergeProfileJSON(t *testing.T) {
 				var m map[string]any
 				json.Unmarshal([]byte(result), &m)
 				people := toObjectSlice(m["important_people"])
-				// mergeObjectArray returns []map[string]any which toObjectSlice
-				// can't cap (expects []any). All 17 entries survive.
-				if len(people) != 17 {
-					t.Errorf("expected 17 people, got %d", len(people))
+				// 14 existing + 3 new = 17, capped at 15.
+				if len(people) != 15 {
+					t.Errorf("expected 15 people, got %d", len(people))
 				}
 			},
 		},

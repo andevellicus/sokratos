@@ -36,6 +36,21 @@ func registerCoreTools(registry *tools.Registry, stateMgr *engine.StateManager) 
 			{Name: "value", Type: "string", Required: true},
 		},
 	})
+	registry.Register("reply_to_job", tools.NewReplyToJob(stateMgr), tools.ToolSchema{
+		Name:        "reply_to_job",
+		Description: "Send a message to a background Brain job that is waiting for input",
+		Params: []tools.ParamSchema{
+			{Name: "job_id", Type: "string", Required: true},
+			{Name: "message", Type: "string", Required: true},
+		},
+	})
+	registry.Register("cancel_job", tools.NewCancelJob(stateMgr), tools.ToolSchema{
+		Name:        "cancel_job",
+		Description: "Cancel an active background Brain job",
+		Params: []tools.ParamSchema{
+			{Name: "job_id", Type: "string", Required: true},
+		},
+	})
 }
 
 func registerObjectiveTools(registry *tools.Registry, pool *pgxpool.Pool) {
@@ -106,8 +121,12 @@ func registerAITools(registry *tools.Registry, dtc *clients.DeepThinkerClient, p
 	}
 	registry.Register("reason", tools.NewDeepThink(dtc, pool, embedURL, embedModel), tools.ToolSchema{
 		Name:        "reason",
-		Description: "Send a complex problem to the deep reasoning model (122B Brain) for thorough analysis",
-		Params:      []tools.ParamSchema{{Name: "problem_statement", Type: "string", Required: true}},
+		Description: "Send a complex problem to the deep reasoning model (122B Brain) for thorough analysis. Use background=true for tasks requiring tool access (skill creation, research, writing).",
+		Params: []tools.ParamSchema{
+			{Name: "problem_statement", Type: "string", Required: true},
+			{Name: "background", Type: "boolean", Required: false},
+			{Name: "task_type", Type: "string", Required: false},
+		},
 	})
 }
 

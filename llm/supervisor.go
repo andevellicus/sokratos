@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -386,7 +387,24 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 			if toolExec != nil {
 				toolName, originalArgs := extractToolNameAndArgs(toolJSON)
 
+				// Intercept tools mandated to run as background Brain jobs.
+				if opts != nil && opts.MandatedBrainTools != nil {
+					if taskType, isMBT := opts.MandatedBrainTools[toolName]; isMBT {
+						return "", messages[historyLen:], &BackgroundJobRequest{
+							Tool:     toolName,
+							UserGoal: prompt,
+							TaskType: taskType,
+						}
+					}
+				}
+
 				result, execErr := callTool(ctx, toolName, []byte(toolJSON))
+
+				// Check if the tool returned a BackgroundJobRequest (e.g. reason with background=true).
+				var bjr *BackgroundJobRequest
+				if errors.As(execErr, &bjr) {
+					return "", messages[historyLen:], bjr
+				}
 
 				// Determine failure and build the failure message.
 				var failureMsg string
