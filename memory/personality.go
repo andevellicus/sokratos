@@ -62,6 +62,25 @@ func GetPersonalityTraitsByCategory(ctx context.Context, db *pgxpool.Pool, categ
 	return scanPersonalityTraits(rows)
 }
 
+// FormatPreferencesForTriage returns a concise preference section for injection
+// into triage prompts (email, conversation). Queries only "preference" category
+// traits. Returns "" when no preferences exist or on error.
+func FormatPreferencesForTriage(ctx context.Context, db *pgxpool.Pool) string {
+	if db == nil {
+		return ""
+	}
+	traits, err := GetPersonalityTraitsByCategory(ctx, db, "preference")
+	if err != nil || len(traits) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## User Preferences\nThe user has expressed these preferences. Respect them when scoring — if an email matches a disinterest preference, score 0 and set save to false.\n")
+	for _, t := range traits {
+		fmt.Fprintf(&b, "- %s: %s\n", t.TraitKey, t.TraitValue)
+	}
+	return b.String()
+}
+
 func scanPersonalityTraits(rows interface {
 	Next() bool
 	Scan(...any) error

@@ -12,6 +12,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/prompts"
 	"sokratos/textutil"
 )
 
@@ -26,12 +27,7 @@ type EpisodeMemory struct {
 	CreatedAt time.Time
 }
 
-const episodeSynthesisPrompt = `You synthesize related memories into a cohesive episodic narrative. Given a numbered list of related memories, produce a 2-4 sentence summary that:
-- Captures the essential thread connecting these memories
-- Preserves key facts, names, dates, and outcomes
-- Reads as a natural narrative, not a bullet list
-
-Return a JSON object: {"summary": "<your narrative>"}. No other output.`
+var episodeSynthesisPrompt = strings.TrimSpace(prompts.EpisodeSynthesis)
 
 // SynthesizeFunc is the function signature for calling an LLM to synthesize text.
 type SynthesizeFunc func(ctx context.Context, systemPrompt, content string) (string, error)

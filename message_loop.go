@@ -159,7 +159,7 @@ func handleGoogle(mc messageContext) string {
 
 	// Register tools that were previously disabled.
 	if gmailWasNil && google.GmailService != nil {
-		registerGmailTools(mc.registry, db.Pool, mc.emailTriageCfg, mc.cfg.EmailDisplayBatch)
+		registerGmailTools(mc.registry, db.Pool, mc.emailTriageCfg, mc.cfg.EmailDisplayBatch, mc.svc.Subagent)
 		mc.rebuildGrammar()
 		logger.Log.Info("[/google] Gmail tools registered")
 	}
@@ -202,25 +202,32 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		}
 	}
 
-	// Phase 2: Prefetch (network I/O — no engine state needed).
-	var prefetchContent string
-	var prefetchIDs []int64
-	var prefetchSummaries string
-	if db.Pool != nil && mc.cfg.EmbedURL != "" && strings.TrimSpace(msgText) != "" {
-		pfCtx, pfCancel := context.WithTimeout(context.Background(), tools.TimeoutPrefetch)
-		if pf := subconsciousPrefetch(pfCtx, db.Pool, mc.cfg.EmbedURL, mc.cfg.EmbedModel, msgText, history, excludePipelineID); pf != nil {
-			prefetchContent = pf.Summaries
-			prefetchIDs = pf.IDs
-			prefetchSummaries = pf.Summaries
+	// Phase 2: Start prefetch + temporal context in a background goroutine.
+	// These run concurrently with triage (Phase 3.5), which doesn't need
+	// prefetch results — it only uses msgText + history.
+	type prefetchData struct {
+		content   string
+		ids       []int64
+		summaries string
+		temporal  string
+	}
+	pfCh := make(chan prefetchData, 1)
+	go func() {
+		var pd prefetchData
+		if db.Pool != nil && mc.cfg.EmbedURL != "" && strings.TrimSpace(msgText) != "" {
+			pfCtx, pfCancel := context.WithTimeout(context.Background(), tools.TimeoutPrefetch)
+			if pf := subconsciousPrefetch(pfCtx, db.Pool, mc.cfg.EmbedURL, mc.cfg.EmbedModel, msgText, history, excludePipelineID); pf != nil {
+				pd.content = pf.Summaries
+				pd.ids = pf.IDs
+				pd.summaries = pf.Summaries
+			}
+			pfCancel()
 		}
-		pfCancel()
-	}
-
-	// Phase 2.5: Build temporal context (DB query — outside the lock).
-	var temporalCtx string
-	if db.Pool != nil {
-		temporalCtx = engine.BuildTemporalContext(context.Background(), db.Pool)
-	}
+		if db.Pool != nil {
+			pd.temporal = engine.BuildTemporalContext(context.Background(), db.Pool)
+		}
+		pfCh <- pd
+	}()
 
 	// Phase 3: Snapshot personality/profile under the lock (microseconds),
 	// then release before the multi-second inference call so the heartbeat
@@ -242,43 +249,55 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		userPrompt += "\n\n" + jobCtx
 	}
 
-	// Phase 3.5: Subagent dispatch for simple tool calls.
+	// Phase 3.5: Check supervisor slot availability. If free, skip triage
+	// and go straight to the orchestrator — saves 3-5s of triage latency.
+	// Triage is only valuable when the supervisor is busy: it dispatches
+	// simple tool calls on a subagent slot without waiting.
+	var triageResult *dispatchResult
+	choice, gotSupervisor := mc.router.TryAcquirePrimary()
+	if !gotSupervisor {
+		// Supervisor busy — run triage (concurrent with prefetch) as fast-path.
+		triageResult, _ = runTriage(mc, msgText, history)
+	}
+
+	// Phase 3.6: Wait for prefetch (usually already done — prefetch ~2s,
+	// triage ~3-5s, so prefetch finishes while triage is running).
+	pf := <-pfCh
+
+	// Build dispatch context with prefetch results.
 	dctx := dispatchContext{
 		PersonalityContent: personalityContent,
 		ProfileContent:     profileContent,
-		PrefetchContent:    prefetchContent,
-		TemporalCtx:        temporalCtx,
-		PrefetchIDs:        prefetchIDs,
-		PrefetchSummaries:  prefetchSummaries,
+		PrefetchContent:    pf.content,
+		TemporalCtx:        pf.temporal,
+		PrefetchIDs:        pf.ids,
+		PrefetchSummaries:  pf.summaries,
 	}
-	handled, escalation, dispatchAck := tryDispatch(mc, msg, chatID, msgText, dctx, history)
-	if handled {
-		typingCancel()
-		return
-	}
-	// Only send an ack when there's a real escalation (failed dispatch that
-	// the orchestrator needs to retry). Normal triage-to-orchestrator handoffs
-	// don't need an ack — the 9B responds fast enough on its own.
-	if escalation != nil && dispatchAck != "" {
-		if _, ackErr := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(dispatchAck)); ackErr != nil {
-			logger.Log.Warnf("[dispatch] ack send failed: %v", ackErr)
-		} else {
-			logger.Log.Debugf("[dispatch] ack sent for escalation: %q", textutil.Truncate(dispatchAck, 60))
+
+	// Phase 3.7: Execute dispatch decision (needs prefetch for synthesis).
+	if triageResult != nil && triageResult.Dispatch {
+		handled, escalation := executeDispatch(mc, msg, chatID, msgText, dctx, triageResult)
+		if handled {
+			if gotSupervisor {
+				choice.Release()
+			}
+			typingCancel()
+			return
 		}
-	}
-	if escalation != nil {
-		userPrompt += fmt.Sprintf("\n\n<escalation_context>\nA lightweight dispatch was attempted but failed.\nTool: %s\nPhase: %s\nError: %s\nDo NOT retry the same call with the same parameters. Try a different approach or explain the issue.\n</escalation_context>",
-			escalation.ToolName, escalation.Phase, escalation.Error)
-		if escalation.ToolResult != "" {
-			userPrompt += fmt.Sprintf("\n\n<prior_tool_result tool=\"%s\">\nThe tool call succeeded but synthesis failed. Use these results directly — do NOT re-call the tool.\n%s\n</prior_tool_result>",
-				escalation.ToolName, escalation.ToolResult)
+		if escalation != nil {
+			userPrompt += fmt.Sprintf("\n\n<escalation_context>\nA lightweight dispatch was attempted but failed.\nTool: %s\nPhase: %s\nError: %s\nDo NOT retry the same call with the same parameters. Try a different approach or explain the issue.\n</escalation_context>",
+				escalation.ToolName, escalation.Phase, escalation.Error)
+			if escalation.ToolResult != "" {
+				userPrompt += fmt.Sprintf("\n\n<prior_tool_result tool=\"%s\">\nThe tool call succeeded but synthesis failed. Use these results directly — do NOT re-call the tool.\n%s\n</prior_tool_result>",
+					escalation.ToolName, escalation.ToolResult)
+			}
 		}
 	}
 
-	// Phase 4: Resolve which model handles this message. The 9B orchestrator
-	// handles simple-to-moderate tasks directly (including tool calls); Brain
-	// is the fallback when the 9B supervisor slot is busy.
-	choice := mc.router.AcquireOrFallback(context.Background(), false)
+	// Phase 4: Acquire orchestrator slot if we don't already have one.
+	if !gotSupervisor {
+		choice = mc.router.AcquireOrFallback(context.Background(), false)
+	}
 	acquired := true
 	defer func() {
 		if acquired {
@@ -291,8 +310,8 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		History:            history,
 		PersonalityContent: personalityContent,
 		ProfileContent:     profileContent,
-		TemporalContext:    temporalCtx,
-		PrefetchContent:    prefetchContent,
+		TemporalContext:    pf.temporal,
+		PrefetchContent:    pf.content,
 		MaxToolResultLen:   mc.cfg.MaxToolResultLen,
 		MaxWebSources:      mc.cfg.MaxWebSources,
 		ToolAgent:          mc.lb.ToolAgent,
@@ -350,8 +369,8 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		ToolContext:       toolCtx,
 		ToolsUsed:         toolsUsed,
 		MsgText:           msgText,
-		PrefetchIDs:       prefetchIDs,
-		PrefetchSummaries: prefetchSummaries,
+		PrefetchIDs:       pf.ids,
+		PrefetchSummaries: pf.summaries,
 		PipelineID:        pipelineID,
 		Err:               err,
 	})

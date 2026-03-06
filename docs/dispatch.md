@@ -8,31 +8,42 @@ The dispatch system routes user messages through a tiered architecture where the
 
 ```
 User message (Telegram)
-  → Prefetch (memory retrieval, temporal context)
-  → 9B Triage (grammar-constrained dispatch decision)
+  → TryAcquirePrimary (non-blocking supervisor slot check)
     │
-    ├─ dispatch: true (single tool)
-    │    → Send ack to user ("Sure, checking...")
-    │    → Execute tool
-    │    → 9B synthesis → single clean reply
+    ├─ Slot FREE → skip triage, go straight to orchestrator
+    │    (prefetch runs in background goroutine, collected before orchestrator call)
     │
-    ├─ dispatch: true, multi: true
-    │    → Send ack to user
-    │    → SubagentSupervisor loop (2-5 tool rounds)
-    │    → Final response from supervisor
-    │
-    └─ dispatch: false (escalate)
-         → Send ack to user ("Let me think about that...")
-         → Slot router acquires Brain or 9B
-         → Brain reasoning + tool calls
-         → Brain's final response sent directly to user
+    └─ Slot BUSY → run triage + prefetch in parallel
+         → 9B Triage (grammar-constrained dispatch decision)
+           │
+           ├─ dispatch: true (single tool)
+           │    → Send ack to user ("Sure, checking...")
+           │    → Execute tool
+           │    → 9B synthesis → single clean reply
+           │
+           ├─ dispatch: true, multi: true
+           │    → Send ack to user
+           │    → SubagentSupervisor loop (2-5 tool rounds)
+           │    → Final response from supervisor
+           │
+           └─ dispatch: false (escalate)
+                → Send ack to user ("Let me think about that...")
+                → Slot router acquires Brain or 9B
+                → Brain reasoning + tool calls
+                → Brain's final response sent directly to user
 ```
+
+### Conditional Triage
+
+Triage only runs when the supervisor slot is busy (`TryAcquirePrimary` returns false). When the supervisor is free, triage is skipped entirely — saving 3-5s of subagent latency. Triage is only valuable when the supervisor would have to wait; dispatching simple tool calls on a subagent slot avoids that wait.
+
+Prefetch (memory retrieval + temporal context) always runs in a background goroutine, concurrent with triage when triage is active.
 
 ---
 
 ## Triage (Grammar-Constrained)
 
-The 9B runs dispatch triage via `TryCompleteWithGrammar` — a non-blocking call that returns an error if no subagent slot is available (clean escalation to Brain).
+Triage only runs when the supervisor slot is busy (see Conditional Triage above). The 9B runs dispatch triage via `TryCompleteWithGrammar` — a non-blocking call that returns an error if no subagent slot is available (clean escalation to Brain).
 
 ### Grammar (`grammar/grammar.go` — `BuildDispatchGrammar`)
 
@@ -52,7 +63,7 @@ All three branches include an `ack` field — a brief natural reply shown to the
 2. **Dispatch (multi-step)** when the request needs 2-3 sequential tool calls but no complex reasoning.
 3. **Escalate** when the request needs judgment, creativity, complex reasoning, or involves side effects.
 
-Never dispatched: `send_email`, `create_event`, `create_skill`, `update_skill`, `manage_skills`, `manage_routines`, `manage_personality`, `manage_objectives`, `save_memory`, `forget_topic`, `reason`, `plan_and_execute`, `delegate_task`, `ask_database`, `write_file`, `patch_file`, `reply_to_job`, `cancel_job`.
+Never dispatched: `send_email`, `create_event`, `create_skill`, `update_skill`, `manage_skills`, `manage_routines`, `manage_personality`, `manage_objectives`, `save_memory`, `forget_topic`, `reason`, `plan_and_execute`, `delegate_task`, `ask_database`, `write_file`, `patch_file`, `reply_to_job`, `cancel_job`, `run_command`.
 
 ---
 
@@ -119,6 +130,11 @@ Try Brain (non-blocking) → Try 9B (non-blocking) → Block on Brain
 **Background** (`preferBrain=false`):
 ```
 Try 9B (non-blocking) → Block on Brain
+```
+
+**Conditional triage** (`TryAcquirePrimary`):
+```
+Try primary 9B slot (non-blocking) → if free, skip triage; if busy, run triage on subagent slot
 ```
 
 ### Slot Lifecycle

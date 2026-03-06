@@ -23,6 +23,7 @@ import (
 // import between engine and clients.
 type GatekeeperClient interface {
 	CompleteWithGrammar(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error)
+	TryCompleteWithGrammar(ctx context.Context, systemPrompt, userContent, grammar string, maxTokens int) (string, error)
 }
 
 // WorkMonitor tracks running work items (routines, background plans, scheduled

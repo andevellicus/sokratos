@@ -1,0 +1,5 @@
+Extract named entities from this text. Return a JSON array of strings.
+Include: people names, organizations, places, products, specific dates.
+Exclude: generic nouns, pronouns, common words.
+Return ONLY the JSON array. Example: ["John Smith", "Google", "Berlin"]
+If no entities found, return: []

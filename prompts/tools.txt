@@ -10,7 +10,8 @@ Usage rules:
 - When writing TypeScript skills: use `declare` statements for sandbox globals (args, skill_config, http_request, console, kv_get, kv_set, kv_delete, call_tool, delegate, delegate_batch, btoa, atob, sleep, env, hash_sha256, hash_hmac_sha256). Define interfaces for structured data (API responses, config shapes). Use const/let, not var. Type function parameters and return values. Declare statements are stripped at transpile time — they exist only for type safety. Wrap the main body in `(function main() { ... })();` so that `return` statements are valid TypeScript (TS errors on top-level return). Put declarations, interfaces, and pure helper functions outside the IIFE; put imperative logic with `return` inside it.
 - manage_skills: use action "test" with a skill name and optional test_args to verify a skill works. Use "list" to see installed skills. Use "delete" to remove a skill.
 - plan_and_execute: for multi-step tasks. Set background=true for async (3+ steps, "when you get a chance", "look into"). Use delegate_task for single-step research/reads.
-- max %MAX_WEB_SOURCES% sources per search_web query.
+- search_web auto-fetches the top 3 result pages. Use read_url only for non-search URLs or deeper reads.
+- max %MAX_WEB_SOURCES% additional read_url calls per question beyond auto-fetched results.
 - ALWAYS include {} args, even for no-arg tools.
 - If a skill fails or returns irrelevant results, try search_web as fallback.
 - search_memory: use factual keywords, not questions. Use tags to filter by source: "email", "calendar", "conversation". Use start_date/end_date for time ranges.

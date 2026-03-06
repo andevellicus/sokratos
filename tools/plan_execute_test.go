@@ -264,7 +264,7 @@ func TestStripHTML(t *testing.T) {
 
 // Ensure exported function isn't accidentally broken — this is a compile-time check.
 var _ = func() {
-	_ = NewSearchWeb("http://localhost:9000")
+	_ = NewSearchWeb("http://localhost:9000", nil)
 	_ = NewReadURL()
 	_ = context.Background // suppress unused import
 }

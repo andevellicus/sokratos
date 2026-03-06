@@ -303,11 +303,18 @@ func TriageAndSaveEmailAsync(cfg TriageConfig, email google.Email) {
 		ctx, cancel := context.WithTimeout(context.Background(), TimeoutConversationTriage)
 		defer cancel()
 
+		// Inject user preferences into the triage prompt so the model can
+		// filter emails about topics the user has expressed disinterest in.
+		triagePrompt := strings.TrimSpace(prompts.EmailTriage)
+		if prefs := memory.FormatPreferencesForTriage(ctx, cfg.Pool); prefs != "" {
+			triagePrompt += "\n\n" + prefs
+		}
+
 		formatted := google.FormatEmailSummary(email)
 		sourceDate := email.Date
 
 		err := triageAndSave(ctx, cfg, TriageSaveRequest{
-			TriagePrompt:  strings.TrimSpace(prompts.EmailTriage),
+			TriagePrompt:  triagePrompt,
 			TriageInput:   formatted,
 			SourceContent: formatted,
 			SourceLabel:   "Source email",

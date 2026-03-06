@@ -105,9 +105,9 @@ func Load() *AppConfig {
 		BrainURL:   os.Getenv("BRAIN_URL"),
 		BrainModel: os.Getenv("BRAIN_MODEL"),
 
-		MaxWebSources:     EnvInt("MAX_WEB_SOURCES", 2),
+		MaxWebSources:     EnvInt("MAX_WEB_SOURCES", 4),
 		MemorySearchLimit: EnvInt("MEMORY_SEARCH_LIMIT", 10),
-		MaxToolResultLen:  EnvInt("MAX_TOOL_RESULT_LEN", 8000),
+		MaxToolResultLen:  EnvInt("MAX_TOOL_RESULT_LEN", 16000),
 
 		ConsolidationMemoryLimit: EnvInt("CONSOLIDATION_MEMORY_LIMIT", 50),
 		HeartbeatInterval:        EnvDuration("HEARTBEAT_INTERVAL", 5*time.Minute),

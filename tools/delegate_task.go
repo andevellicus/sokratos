@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"sokratos/clients"
+	"sokratos/prompts"
 )
 
 const maxDelegateContextLen = 12000
@@ -17,17 +18,7 @@ type delegateTaskArgs struct {
 	Context   string `json:"context"`
 }
 
-const delegateSystemPrompt = `You are a research assistant with access to tools for searching, reading, and saving information.
-
-## Rules
-
-- Execute the user's directive by calling the available tools as needed.
-- For research tasks, use multi-hop strategies: search first, then read promising URLs, then synthesize.
-- When you have gathered enough information, respond with your findings.
-- Use save_memory to persist important findings that should be remembered long-term.
-- Be concise and factual. No preamble or explanation of your process.
-- If a tool returns an error, try an alternative approach before giving up.
-- If you cannot complete the task, explain why in your response.`
+var delegateSystemPrompt = strings.TrimSpace(prompts.DelegateSystem)
 
 // DelegateConfig holds the mutable grammar and allowed-tools list for
 // delegate_task. Updated atomically when skills are created or deleted.

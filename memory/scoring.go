@@ -10,6 +10,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/prompts"
 	"sokratos/textutil"
 	"sokratos/tokens"
 )
@@ -24,15 +25,7 @@ type qualityResult struct {
 	Confidence  float64  `json:"confidence"`  // 0-1: factual confidence
 }
 
-const qualitySystemPrompt = `You are a memory quality scorer. Given a memory summary (and optionally existing similar memories), evaluate it and return a JSON object:
-{"specificity": 0.0-1.0, "uniqueness": 0.0-1.0, "entities": ["entity1", "entity2"], "confidence": 0.0-1.0}
-
-- specificity: How specific and actionable is this information? (0=vague, 1=precise facts)
-- uniqueness: How novel is this compared to existing similar memories shown below? (0=redundant/already known, 1=entirely new information)
-- entities: Extract named entities (people, places, organizations, dates, products)
-- confidence: How factually confident is this statement? (0=uncertain, 1=definitive)
-
-Return ONLY the JSON object. No explanation.`
+var qualitySystemPrompt = strings.TrimSpace(prompts.QualityScoring)
 
 // qualityGrammar is a GBNF grammar constraining quality scoring output to a
 // valid JSON object with the expected fields. Without this, Flash models dump

@@ -33,26 +33,7 @@ ws ::= [ \t\n]*`
 
 // gatekeeperPromptBase is the system prompt for the fast gatekeeper.
 // It contains a %s placeholder for staleness context.
-const gatekeeperPromptBase = `You are a background heartbeat gatekeeper. Your job is to evaluate the provided context and decide whether proactive action is needed.
-
-%s
-
-Respond with exactly ONE JSON object:
-- {"action": "none"} — no action needed (the default; use this ~90%% of the time).
-- {"action": "tool", "intent": "..."} — a tool-based action is needed. Describe the intent concisely.
-- {"action": "message", "text": "..."} — send a short message directly to the user (only for truly urgent, time-sensitive items).
-
-Rules:
-- Check <recent_actions> to avoid repeating actions already taken.
-- Do NOT continue, revisit, or follow up on previous conversations.
-- Do NOT repeat information the user already knows.
-- Do NOT offer unsolicited help.
-- Prefer "none" unless there is a clear, actionable, time-sensitive reason to act.
-- If a background task recently completed (check <recent_actions>), consider whether follow-up is needed.
-- A pending task is only actionable if it is overdue or due within the next hour AND you can make progress without user input.
-- If <active_goals> lists goals you can make progress on, consider initiating a plan_and_execute background task via "tool" action.
-- Only pursue goals when you can make meaningful progress without user input.
-- Check <work_items> to avoid re-pursuing goals already being worked on.`
+var gatekeeperPromptBase = strings.TrimSpace(prompts.HeartbeatGatekeeper)
 
 // gatekeeperDecision represents the parsed gatekeeper JSON output.
 type gatekeeperDecision struct {
@@ -70,10 +51,9 @@ func (e *Engine) heartbeatPhase2Gatekeeper(contextXML, stalenessNote string, con
 	ctx, cancel := context.WithTimeout(context.Background(), timeouts.ObjectiveEval)
 	defer cancel()
 
-	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, contextXML, gatekeeperGrammar, tokens.GatekeeperDecision)
+	raw, err := e.Gatekeeper.TryCompleteWithGrammar(ctx, prompt, contextXML, gatekeeperGrammar, tokens.GatekeeperDecision)
 	if err != nil {
-		logger.Log.Warnf("heartbeat: gatekeeper error, falling back to orchestrator: %v", err)
-		e.heartbeatPhase2Orchestrator(contextXML, stalenessNote, conversationStale)
+		logger.Log.Debugf("heartbeat: gatekeeper skipped (slot busy or error): %v", err)
 		return
 	}
 

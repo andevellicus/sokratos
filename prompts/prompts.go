@@ -58,3 +58,30 @@ var SessionSendEmail string
 
 //go:embed session_reason.txt
 var SessionReason string
+
+//go:embed heartbeat_gatekeeper.txt
+var HeartbeatGatekeeper string
+
+//go:embed curiosity_gatekeeper.txt
+var CuriosityGatekeeper string
+
+//go:embed delegate_system.txt
+var DelegateSystem string
+
+//go:embed query_rewrite.txt
+var QueryRewrite string
+
+//go:embed query_rerank.txt
+var QueryRerank string
+
+//go:embed entity_extraction.txt
+var EntityExtraction string
+
+//go:embed quality_scoring.txt
+var QualityScoring string
+
+//go:embed contradiction_detection.txt
+var ContradictionDetection string
+
+//go:embed episode_synthesis.txt
+var EpisodeSynthesis string

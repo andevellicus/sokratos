@@ -38,6 +38,37 @@ func stripHTML(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// fetchURL fetches a URL, strips HTML, and returns plain text truncated to
+// maxChars. Shared by both the read_url tool and search_web auto-fetch.
+func fetchURL(ctx context.Context, client *http.Client, rawURL string, maxChars int) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+
+	text := stripHTML(string(body))
+	if len(text) > maxChars {
+		text = text[:maxChars] + "\n... (truncated)"
+	}
+	return text, nil
+}
+
 // NewReadURL returns a ToolFunc that fetches a URL and extracts text content.
 func NewReadURL() ToolFunc {
 	client := httputil.NewClient(TimeoutURLFetch)
@@ -52,8 +83,8 @@ func NewReadURL() ToolFunc {
 		}
 
 		const (
-			defaultMaxReadChars = 2000
-			maxReadChars        = 10000
+			defaultMaxReadChars = 5000
+			maxReadChars        = 20000
 		)
 		maxChars := defaultMaxReadChars
 		if a.MaxChars > 0 {
@@ -63,31 +94,9 @@ func NewReadURL() ToolFunc {
 			maxChars = maxReadChars
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
-		if err != nil {
-			return fmt.Sprintf("Failed to create request: %v", err), nil
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-		resp, err := client.Do(req)
+		text, err := fetchURL(ctx, client, a.URL, maxChars)
 		if err != nil {
 			return fmt.Sprintf("Failed to fetch URL: %v", err), nil
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Sprintf("HTTP %d: failed to fetch URL", resp.StatusCode), nil
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Sprintf("Failed to read response: %v", err), nil
-		}
-
-		text := stripHTML(string(body))
-
-		if len(text) > maxChars {
-			text = text[:maxChars] + "\n... (truncated)"
 		}
 
 		logger.Log.Infof("[read_url] fetched %d chars from %s", len(text), a.URL)

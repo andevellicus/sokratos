@@ -9,6 +9,7 @@ import (
 
 	"sokratos/adaptive"
 	"sokratos/logger"
+	"sokratos/prompts"
 	"sokratos/memory"
 	objpkg "sokratos/objectives"
 	"sokratos/textutil"
@@ -73,16 +74,7 @@ func (e *Engine) runCuriosityIfReady() {
 	activeObjectives, _ := objpkg.ListActive(ctx, e.DB)
 
 	// Ask the gatekeeper (Flash) to generate a research question.
-	prompt := `You are generating a proactive research question based on recent conversation patterns.
-Given recent memory summaries, identify ONE knowledge gap or interesting tangent worth exploring.
-Output JSON: {"directive": "<specific research task>", "reasoning": "<why this is worth exploring>"}
-Rules:
-- The directive must be actionable via search_web + read_url tools.
-- Focus on topics the user has shown interest in but where knowledge is incomplete.
-- Do NOT repeat research that has already been done (check the summaries).
-- If active objectives exist, STRONGLY prefer research that advances one of them. Reference which objective the research serves in the directive.
-- Only explore random tangents if no active objectives exist or none have actionable research angles.
-- If nothing is worth researching, output: {"directive": "", "reasoning": "no gaps found"}`
+	prompt := prompts.CuriosityGatekeeper
 
 	// Build user content with objectives prepended.
 	var uc strings.Builder
@@ -103,9 +95,9 @@ char ::= [^"\\] | "\\" escape
 escape ::= ["\\nrt/]
 ws ::= [ \t\n]*`
 
-	raw, err := e.Gatekeeper.CompleteWithGrammar(ctx, prompt, userContent, grammarStr, tokens.GatekeeperDecision)
+	raw, err := e.Gatekeeper.TryCompleteWithGrammar(ctx, prompt, userContent, grammarStr, tokens.GatekeeperDecision)
 	if err != nil {
-		logger.Log.Warnf("[curiosity] gatekeeper error: %v", err)
+		logger.Log.Debugf("[curiosity] gatekeeper skipped (slot busy or error): %v", err)
 		return
 	}
 

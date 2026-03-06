@@ -21,6 +21,12 @@ type SlotRouter interface {
 	// Brain is tried first (interactive messages need accuracy); when false,
 	// the primary 9B is tried first (routines, heartbeats, scheduler).
 	AcquireOrFallback(ctx context.Context, preferBrain bool) OrchestratorChoice
+
+	// TryAcquirePrimary attempts to acquire the primary (9B supervisor) slot
+	// without blocking. Returns the choice and true if acquired, or a zero
+	// value and false if the slot is busy. Used by the message loop to skip
+	// triage when the supervisor is immediately available.
+	TryAcquirePrimary() (OrchestratorChoice, bool)
 }
 
 // SlotChecker abstracts semaphore access for both DTC and SubagentClient.
@@ -77,6 +83,14 @@ func (r *slotRouter) primaryChoice() OrchestratorChoice {
 			return r.primarySlots.Acquire(ctx)
 		},
 	}
+}
+
+func (r *slotRouter) TryAcquirePrimary() (OrchestratorChoice, bool) {
+	if r.primarySlots.TryAcquire() {
+		logger.Log.Debug("[router] acquired orchestrator slot (non-blocking)")
+		return r.primaryChoice(), true
+	}
+	return OrchestratorChoice{}, false
 }
 
 func (r *slotRouter) AcquireOrFallback(ctx context.Context, preferBrain bool) OrchestratorChoice {
@@ -153,6 +167,15 @@ type passthroughRouter struct {
 // NewPassthroughRouter creates a router that always returns the given client/model.
 func NewPassthroughRouter(client *llm.Client, model string) SlotRouter {
 	return &passthroughRouter{client: client, model: model}
+}
+
+func (r *passthroughRouter) TryAcquirePrimary() (OrchestratorChoice, bool) {
+	return OrchestratorChoice{
+		Client:    r.client,
+		Model:     r.model,
+		Release:   func() {},
+		Reacquire: func(context.Context) error { return nil },
+	}, true
 }
 
 func (r *passthroughRouter) AcquireOrFallback(_ context.Context, _ bool) OrchestratorChoice {

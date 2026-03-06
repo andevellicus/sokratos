@@ -9,16 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/logger"
+	"sokratos/prompts"
 	"sokratos/tokens"
 )
 
 // --- Entity extraction ---
 
-const entityExtractionPrompt = `Extract named entities from this text. Return a JSON array of strings.
-Include: people names, organizations, places, products, specific dates.
-Exclude: generic nouns, pronouns, common words.
-Return ONLY the JSON array. Example: ["John Smith", "Google", "Berlin"]
-If no entities found, return: []`
+var entityExtractionPrompt = strings.TrimSpace(prompts.EntityExtraction)
 
 // entityGrammar is a GBNF grammar constraining entity extraction output to a
 // JSON array of strings.

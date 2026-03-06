@@ -72,6 +72,7 @@ var neverDispatchTools = map[string]bool{
 	"update_skill":       true,
 	"reply_to_job":       true,
 	"cancel_job":         true,
+	"run_command":        true,
 }
 
 // brainSessionPrompts maps task types to their Brain session system prompts.
@@ -220,18 +221,15 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 // to the user during long-running tool execution in the dispatch path.
 const dispatchProgressInterval = 20 * time.Second
 
-// tryDispatch attempts to handle a user message via the subagent dispatch path
-// (triage → tool call → synthesis) without involving the Brain. Returns
-// (handled, escalation, ack). handled=true means fully handled. ack is the
-// triage-generated acknowledgement text for escalations (dispatch:false).
-func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
-	msgText string, dctx dispatchContext, history []llm.Message) (bool, *dispatchEscalation, string) {
-
+// runTriage performs the grammar-constrained dispatch triage decision without
+// executing any tools. Returns the parsed triage result and any error. This is
+// separated from executeDispatch so that triage can run concurrently with
+// memory prefetch — triage only needs msgText + history, not prefetch results.
+func runTriage(mc messageContext, msgText string, history []llm.Message) (*dispatchResult, error) {
 	if mc.svc.Subagent == nil {
-		return false, nil, ""
+		return nil, fmt.Errorf("no subagent")
 	}
 
-	// --- Triage ---
 	used, total := mc.svc.Subagent.SlotsInUse()
 	logger.Log.Debugf("[dispatch] triage starting (subagent slots: %d/%d used)", used, total)
 
@@ -243,34 +241,45 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 	triageCancel()
 	if err != nil {
 		logger.Log.Debugf("[dispatch] triage skipped (subagent slots: %d/%d): %v", used, total, err)
-		return false, nil, "One moment..." // slots busy — clean escalation
+		return nil, err
 	}
 
 	var dr dispatchResult
 	if err := json.Unmarshal([]byte(raw), &dr); err != nil {
 		logger.Log.Warnf("[dispatch] triage parse failed: %v — raw: %s", err, textutil.Truncate(raw, 200))
-		return false, nil, "One moment..."
+		return nil, fmt.Errorf("triage parse: %w", err)
 	}
+	return &dr, nil
+}
+
+// executeDispatch handles a pre-triaged dispatch decision: tool execution +
+// synthesis for single-tool dispatches, or SubagentSupervisor for multi-step.
+// Returns (handled, escalation). handled=true means fully handled.
+func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
+	msgText string, dctx dispatchContext,
+	dr *dispatchResult) (bool, *dispatchEscalation) {
+
 	if !dr.Dispatch {
 		logger.Log.Debug("[dispatch] triage decided to escalate")
-		return false, nil, dr.Ack
+		return false, nil
 	}
 
 	// --- Multi-step dispatch via SubagentSupervisor ---
 	if dr.Multi {
-		return tryMultiStepDispatch(mc, msg, chatID, msgText, dctx, dr.Directive)
+		handled, esc, _ := tryMultiStepDispatch(mc, msg, chatID, msgText, dctx, dr.Directive)
+		return handled, esc
 	}
 
 	if !mc.registry.Has(dr.Tool) {
 		logger.Log.Warnf("[dispatch] triage returned unknown tool %q, escalating", dr.Tool)
-		return false, nil, dr.Ack
+		return false, nil
 	}
 	if neverDispatchTools[dr.Tool] {
 		logger.Log.Warnf("[dispatch] triage tried to dispatch never-dispatch tool %q, forcing escalation", dr.Tool)
-		return false, nil, dr.Ack
+		return false, nil
 	}
 
-	used, total = mc.svc.Subagent.SlotsInUse()
+	used, total := mc.svc.Subagent.SlotsInUse()
 	logger.Log.Infof("[dispatch] dispatching %s (subagent slots: %d/%d used)", dr.Tool, used, total)
 
 	// Send LLM-generated ack if the triage model wrote one.
@@ -317,11 +326,11 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 
 	if execErr != nil {
 		logger.Log.Warnf("[dispatch] tool %s hard error: %v — escalating", dr.Tool, execErr)
-		return false, &dispatchEscalation{ToolName: dr.Tool, Error: execErr.Error(), Phase: "execution"}, ""
+		return false, &dispatchEscalation{ToolName: dr.Tool, Error: execErr.Error(), Phase: "execution"}
 	}
 	if llm.IsToolSoftError(result) {
 		logger.Log.Infof("[dispatch] tool %s soft error, escalating to Brain for recovery", dr.Tool)
-		return false, &dispatchEscalation{ToolName: dr.Tool, Error: result, Phase: "execution"}, ""
+		return false, &dispatchEscalation{ToolName: dr.Tool, Error: result, Phase: "execution"}
 	}
 
 	// --- Synthesize ---
@@ -353,7 +362,7 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 				Error:      synthErr.Error(),
 				Phase:      "synthesis",
 				ToolResult: truncatedResult,
-			}, ""
+			}
 		}
 	}
 	reply = textutil.StripThinkTags(reply)
@@ -375,7 +384,7 @@ func tryDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 
 	totalElapsed := time.Since(toolStart)
 	logger.Log.Infof("[dispatch] handled %q via %s in %s (subagent path)", textutil.Truncate(msgText, 60), dr.Tool, totalElapsed.Round(time.Millisecond))
-	return true, nil, ""
+	return true, nil
 }
 
 // buildTriageSystemPrompt constructs the system prompt for dispatch triage.

@@ -1,0 +1,10 @@
+You are generating a proactive research question based on recent conversation patterns.
+Given recent memory summaries, identify ONE knowledge gap or interesting tangent worth exploring.
+Output JSON: {"directive": "<specific research task>", "reasoning": "<why this is worth exploring>"}
+Rules:
+- The directive must be actionable via search_web + read_url tools.
+- Focus on topics the user has shown interest in but where knowledge is incomplete.
+- Do NOT repeat research that has already been done (check the summaries).
+- If active objectives exist, STRONGLY prefer research that advances one of them. Reference which objective the research serves in the directive.
+- Only explore random tangents if no active objectives exist or none have actionable research angles.
+- If nothing is worth researching, output: {"directive": "", "reasoning": "no gaps found"}

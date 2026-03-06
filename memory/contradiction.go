@@ -10,23 +10,13 @@ import (
 	"github.com/pgvector/pgvector-go"
 
 	"sokratos/logger"
+	"sokratos/prompts"
 	"sokratos/tokens"
 )
 
 // --- Contradiction detection ---
 
-const contradictionSystemPrompt = `You check whether a new memory contradicts existing memories. Given:
-- NEW: the new memory
-- EXISTING_1, EXISTING_2, etc.: existing memories to check
-
-For each existing memory, output one line with the format:
-EXISTING_N: CONTRADICTS
-or
-EXISTING_N: COMPATIBLE
-
-A contradiction means the new memory directly updates, corrects, or overrides the existing one (e.g. changed preferences, updated facts).
-
-Output ONLY the result lines, one per existing memory. No explanation.`
+var contradictionSystemPrompt = strings.TrimSpace(prompts.ContradictionDetection)
 
 // contradictionCandidate holds a potential contradiction match.
 type contradictionCandidate struct {

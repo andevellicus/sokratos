@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"sokratos/clients"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/prompts"
 	"sokratos/timefmt"
 	"sokratos/tokens"
 )
@@ -50,21 +52,9 @@ type searchMemoryArgs struct {
 	MemoryType string              `json:"memory_type,omitempty"`
 }
 
-const rewriteSystemPrompt = `You are a search query optimizer for a personal memory database. Given the user's query, output exactly 3 alternative search queries that would help retrieve relevant memories.
+var rewriteSystemPrompt = strings.TrimSpace(prompts.QueryRewrite)
 
-Rules:
-- Preserve the specific people, places, topics, and timeframes mentioned in the original query.
-- Vary the phrasing and word choice to maximize semantic coverage (synonyms, related terms).
-- Keep each query concise (under 15 words).
-- Output ONLY the 3 queries, one per line. No numbering, no preamble, no explanation.`
-
-const rerankSystemPrompt = `You are a search result re-ranker. Given a query and a numbered list of memory summaries, output the numbers of the most relevant results in order of relevance.
-
-Rules:
-- Only include results that DIRECTLY relate to the query topic.
-- Be selective: return at most 5-6 results. Most queries should return 3-5.
-- Exclude results about unrelated personal topics unless the query asks about them.
-- Output ONLY the numbers, one per line, no explanation.`
+var rerankSystemPrompt = strings.TrimSpace(prompts.QueryRerank)
 
 // perEmbeddingLimit is the number of results to retrieve per embedding query.
 const perEmbeddingLimit = 5
@@ -215,29 +205,58 @@ func searchMemory(ctx context.Context, args json.RawMessage, pool *pgxpool.Pool,
 	var lastErr error
 	successCount := 0
 
-	for _, q := range queries {
-		emb, err := memory.GetEmbedding(ctx, embedEndpoint, embedModel, q)
-		if err != nil {
-			logger.Log.Warnf("[memory] embedding failed for query %q: %v", q, err)
-			lastErr = err
-			continue
-		}
-
-		results, err := queryMemories(ctx, pool, emb, a.Query, startDate, endDate, a.Tags, a.MemoryType)
-		if err != nil {
-			logger.Log.Warnf("[memory] query failed for %q: %v", q, err)
-			lastErr = err
-			continue
-		}
-		successCount++
-
-		for _, r := range results {
-			h := contentHash(r.summary)
-			if existing, ok := best[h]; !ok || r.score > existing.score {
-				best[h] = r
-			}
-		}
+	// Fan out embeddings in parallel — the embedding server handles concurrent requests.
+	type embResult struct {
+		query string
+		emb   []float32
+		err   error
 	}
+	embCh := make(chan embResult, len(queries))
+	for _, q := range queries {
+		go func(q string) {
+			emb, err := memory.GetEmbedding(ctx, embedEndpoint, embedModel, q)
+			embCh <- embResult{q, emb, err}
+		}(q)
+	}
+
+	embeddings := make(map[string][]float32, len(queries))
+	for range queries {
+		er := <-embCh
+		if er.err != nil {
+			logger.Log.Warnf("[memory] embedding failed for query %q: %v", er.query, er.err)
+			lastErr = er.err
+			continue
+		}
+		embeddings[er.query] = er.emb
+	}
+
+	// Query DB for each successful embedding (DB queries are fast, run sequentially).
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for q, emb := range embeddings {
+		wg.Add(1)
+		go func(q string, emb []float32) {
+			defer wg.Done()
+			results, err := queryMemories(ctx, pool, emb, a.Query, startDate, endDate, a.Tags, a.MemoryType)
+			if err != nil {
+				logger.Log.Warnf("[memory] query failed for %q: %v", q, err)
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			successCount++
+			for _, r := range results {
+				h := contentHash(r.summary)
+				if existing, ok := best[h]; !ok || r.score > existing.score {
+					best[h] = r
+				}
+			}
+			mu.Unlock()
+		}(q, emb)
+	}
+	wg.Wait()
 
 	// Error contract: only fail if ALL variations failed.
 	if successCount == 0 {

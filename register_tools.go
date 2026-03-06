@@ -301,9 +301,9 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 		}
 	}
 
-	registerGmailTools(registry, db.Pool, emailTriageCfg, cfg.EmailDisplayBatch)
+	registerGmailTools(registry, db.Pool, emailTriageCfg, cfg.EmailDisplayBatch, svc.Subagent)
 	registerCalendarTools(registry, db.Pool)
-	registerWebTools(registry, cfg.SearxngURL)
+	registerWebTools(registry, cfg.SearxngURL, svc.Subagent)
 
 	registry.Register("run_code", tools.NewRunCode(), tools.ToolSchema{
 		Name:        "run_code",
@@ -326,11 +326,11 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 }
 
 // registerGmailTools registers tools for searching and interacting with Gmail.
-func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, emailDisplayBatch int) {
+func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, emailDisplayBatch int, sc *clients.SubagentClient) {
 	if google.GmailService == nil {
 		return
 	}
-	registry.Register("search_email", tools.NewSearchEmail(google.GmailService, pool, triageCfg, emailDisplayBatch), tools.ToolSchema{
+	registry.Register("search_email", tools.NewSearchEmail(google.GmailService, pool, triageCfg, emailDisplayBatch, sc), tools.ToolSchema{
 		Name:        "search_email",
 		Description: "Search Gmail inbox with optional time bounds",
 		Params: []tools.ParamSchema{
@@ -397,9 +397,9 @@ func registerShellTool(registry *tools.Registry, pool *pgxpool.Pool, cfg *config
 	return se
 }
 
-func registerWebTools(registry *tools.Registry, searxngURL string) {
+func registerWebTools(registry *tools.Registry, searxngURL string, sc *clients.SubagentClient) {
 	if searxngURL != "" {
-		registry.Register("search_web", tools.NewSearchWeb(searxngURL), tools.ToolSchema{
+		registry.Register("search_web", tools.NewSearchWeb(searxngURL, sc), tools.ToolSchema{
 			Name:        "search_web",
 			Description: "Search the internet via SearXNG",
 			Params: []tools.ParamSchema{

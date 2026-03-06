@@ -10,6 +10,12 @@ const (
 	// (query rewriting, triage, re-ranking, contradiction checks).
 	SubagentGeneral = 1024
 
+	// WebSummary is for subagent web page content summarization in search_web.
+	WebSummary = 1024
+
+	// EmailSummary is for subagent email body summarization in search_email.
+	EmailSummary = 512
+
 	// SubagentSupervisor is the per-round budget for SubagentSupervisor
 	// tool-dispatch loops.
 	SubagentSupervisor = 2048

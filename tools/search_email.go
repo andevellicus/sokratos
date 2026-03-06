@@ -5,15 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	gm "google.golang.org/api/gmail/v1"
 
+	"sokratos/clients"
 	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/pipelines"
+	"sokratos/textutil"
 	"sokratos/timefmt"
+	"sokratos/tokens"
 )
 
 type searchEmailArgs struct {
@@ -22,6 +26,9 @@ type searchEmailArgs struct {
 	TimeMin    string  `json:"time_min"`
 	TimeMax    string  `json:"time_max"`
 }
+
+// emailBodyCap is the per-email body cap when subagent summarization is unavailable.
+const emailBodyCap = 2000
 
 // NewSearchEmail returns a ToolFunc that searches Gmail.
 //
@@ -34,7 +41,10 @@ type searchEmailArgs struct {
 //     emails are triaged and saved to memory in parallel background goroutines.
 //   - With arguments: pass-through Gmail search with optional time filters.
 //     Used for manual queries like "find emails from Mary."
-func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, displayBatch int) ToolFunc {
+//
+// When sc is non-nil, email bodies in the display batch are summarized via
+// subagent in parallel (non-blocking — falls back to truncated body if busy).
+func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, displayBatch int, sc *clients.SubagentClient) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a searchEmailArgs
 		if len(args) > 2 {
@@ -45,11 +55,11 @@ func NewSearchEmail(svc *gm.Service, pool *pgxpool.Pool, triageCfg *pipelines.Tr
 
 		// No-arg mode: dedup check for new emails.
 		if a.Query == "" && a.TimeMin == "" && a.TimeMax == "" {
-			return checkNewEmails(ctx, svc, pool, triageCfg, displayBatch)
+			return checkNewEmails(ctx, svc, pool, triageCfg, displayBatch, sc)
 		}
 
 		// Search mode: pass-through to Gmail.
-		return searchGmail(svc, a)
+		return searchGmail(ctx, svc, a, sc)
 	}
 }
 
@@ -96,7 +106,7 @@ func buildCheckQuery(since time.Time, now time.Time) (query string, effectiveSin
 // maxBatch emails to the orchestrator for immediate action.
 //
 // Searches all mail (inbox, sent, archived) except trash and spam.
-func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, displayBatch int) (string, error) {
+func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool, triageCfg *pipelines.TriageConfig, displayBatch int, sc *clients.SubagentClient) (string, error) {
 	since := lastEmailCheck(ctx, pool)
 	checkStart := time.Now()
 	query, _ := buildCheckQuery(since, checkStart)
@@ -160,11 +170,11 @@ func checkNewEmails(ctx context.Context, svc *gm.Service, pool *pgxpool.Pool, tr
 	if len(newEmails) > displayBatch {
 		header = fmt.Sprintf("%d new email(s) (%d more triaged in background):", len(batch), len(newEmails)-displayBatch)
 	}
-	return formatEmails(batch, header), nil
+	return formatEmails(ctx, batch, header, sc), nil
 }
 
 // searchGmail performs a direct Gmail API search with query and optional time filters.
-func searchGmail(svc *gm.Service, a searchEmailArgs) (string, error) {
+func searchGmail(ctx context.Context, svc *gm.Service, a searchEmailArgs, sc *clients.SubagentClient) (string, error) {
 	maxResults := int64(10)
 	if a.MaxResults > 0 {
 		maxResults = int64(a.MaxResults)
@@ -209,14 +219,89 @@ func searchGmail(svc *gm.Service, a searchEmailArgs) (string, error) {
 	}
 
 	logger.Log.Infof("[search_email] %d results found for %q", len(emails), finalQuery)
-	return formatEmails(emails, fmt.Sprintf("Found %d email(s):", len(emails))), nil
+	return formatEmails(ctx, emails, fmt.Sprintf("Found %d email(s):", len(emails)), sc), nil
 }
 
-func formatEmails(emails []google.Email, header string) string {
+// formatEmails formats a batch of emails for the orchestrator. When sc is
+// non-nil, email bodies are summarized in parallel via subagent; otherwise
+// the raw body is truncated.
+func formatEmails(ctx context.Context, emails []google.Email, header string, sc *clients.SubagentClient) string {
+	summaries := summarizeEmailBodies(ctx, sc, emails)
+
 	var b strings.Builder
 	b.WriteString(header)
 	for i, e := range emails {
-		fmt.Fprintf(&b, "\n\n--- Email %d ---\n%s", i+1, google.FormatEmailSummary(e))
+		fmt.Fprintf(&b, "\n\n--- Email %d ---\n", i+1)
+		fmt.Fprintf(&b, "From: %s\nTo: %s\n", e.From, e.To)
+		if e.CC != "" {
+			fmt.Fprintf(&b, "CC: %s\n", e.CC)
+		}
+		if e.BCC != "" {
+			fmt.Fprintf(&b, "BCC: %s\n", e.BCC)
+		}
+		dateStr := ""
+		if !e.Date.IsZero() {
+			dateStr = timefmt.FormatDateTime(e.Date)
+		}
+		fmt.Fprintf(&b, "Subject: %s\nDate: %s\n\n", e.Subject, dateStr)
+
+		if summary, ok := summaries[i]; ok {
+			b.WriteString(summary)
+		} else {
+			body := e.Body
+			if body == "" {
+				body = e.Snippet
+			}
+			b.WriteString(textutil.Truncate(body, emailBodyCap))
+		}
 	}
 	return b.String()
+}
+
+// summarizeEmailBodies fans out subagent summarization for email bodies in
+// parallel. Uses TryComplete (non-blocking) — returns an empty map if no
+// subagent is available or all slots are busy.
+func summarizeEmailBodies(ctx context.Context, sc *clients.SubagentClient, emails []google.Email) map[int]string {
+	if sc == nil {
+		return nil
+	}
+
+	type result struct {
+		index   int
+		summary string
+	}
+
+	ch := make(chan result, len(emails))
+	var wg sync.WaitGroup
+
+	systemPrompt := "Summarize this email concisely. Extract the key information: what is being communicated, any action items or deadlines, and important details. Strip signatures, disclaimers, quoted reply chains, and boilerplate. Return only the summary, no preamble."
+
+	for i, e := range emails {
+		if e.Body == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, e google.Email) {
+			defer wg.Done()
+			userContent := fmt.Sprintf("From: %s\nSubject: %s\n\n%s", e.From, e.Subject, textutil.Truncate(e.Body, 4000))
+			summary, err := sc.TryComplete(ctx, systemPrompt, userContent, tokens.EmailSummary)
+			if err != nil {
+				return
+			}
+			ch <- result{index: idx, summary: strings.TrimSpace(summary)}
+		}(i, e)
+	}
+	go func() { wg.Wait(); close(ch) }()
+
+	summaries := make(map[int]string)
+	for r := range ch {
+		if r.summary != "" {
+			summaries[r.index] = r.summary
+		}
+	}
+
+	if len(summaries) > 0 {
+		logger.Log.Infof("[search_email] summarized %d/%d email bodies via subagent", len(summaries), len(emails))
+	}
+	return summaries
 }

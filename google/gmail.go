@@ -123,9 +123,9 @@ func FetchEmails(svc *gm.Service, query string, maxResults int64) ([]Email, erro
 }
 
 // FormatEmailSummary returns a human-readable summary of an email,
-// with the body truncated at 500 characters.
+// with the body truncated at 2000 characters.
 func FormatEmailSummary(e Email) string {
-	body := textutil.Truncate(e.Body, 500)
+	body := textutil.Truncate(e.Body, 2000)
 	if body == "" {
 		body = e.Snippet
 	}
