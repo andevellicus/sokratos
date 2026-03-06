@@ -7,13 +7,12 @@ import (
 	"strings"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-
 	"sokratos/clients"
 	"sokratos/engine"
 	"sokratos/grammar"
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/platform"
 	"sokratos/prompts"
 	"sokratos/textutil"
 	"sokratos/timefmt"
@@ -88,6 +87,16 @@ var brainSessionAcks = map[string]string{
 	"send_email":   "I'll draft that email in the background. You can keep chatting — I'll send it your way for review shortly.",
 }
 
+// escalateTools is the set of tools that trigger inline escalation from the 9B
+// to the Brain. When the 9B supervisor tries to call one of these, the request
+// is replayed on the Brain for more capable handling.
+var escalateTools = map[string]bool{
+	"run_command":  true,
+	"write_file":   true,
+	"patch_file":   true,
+	"ask_database": true,
+}
+
 // mandatedBrainTools maps tools that MUST run as background Brain jobs to their
 // task_type (used for session prompt selection). The 9B is intercepted at the
 // supervisor level if it tries to call these directly.
@@ -146,7 +155,7 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 		ctx, cancel := context.WithCancel(context.Background())
 		job.SetActive(true, cancel)
 
-		choice := mc.router.AcquireOrFallback(ctx, true) // preferBrain
+		choice := mc.router.AcquireOrFallback(ctx, true, engine.PriorityUser) // preferBrain
 
 		// Wrap toolExec to detect when the triggering tool succeeds.
 		sessionToolExec := func(execCtx context.Context, raw json.RawMessage) (string, error) {
@@ -174,10 +183,10 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 
 		if qErr != nil {
 			if ctx.Err() != nil {
-				sendFormatted(mc.svc.Bot, job.ChatID, 0, formatReply("Background job cancelled."))
+				mc.platform.Send(context.Background(), job.ChannelID, "Background job cancelled.", "")
 			} else {
 				logger.Log.Warnf("[job:%s] error: %v", job.ID, qErr)
-				sendFormatted(mc.svc.Bot, job.ChatID, 0, formatReply("Background job error: "+qErr.Error()))
+				mc.platform.Send(context.Background(), job.ChannelID, "Background job error: "+qErr.Error(), "")
 			}
 			return
 		}
@@ -187,7 +196,7 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 
 		if toolSucceeded {
 			// Tool succeeded — send the Brain's final reply and record in conversation.
-			sendFormatted(mc.svc.Bot, job.ChatID, 0, formatReply(reply))
+			mc.platform.Send(context.Background(), job.ChannelID, reply, "")
 			mc.svc.StateMgr.AppendMessage(llm.Message{
 				Role:    "assistant",
 				Content: fmt.Sprintf("[Background %s completed: %s]", job.Tool, textutil.Truncate(reply, 200)),
@@ -196,20 +205,20 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 		}
 
 		// Brain has a question or produced output — send to user, park goroutine.
-		sendFormatted(mc.svc.Bot, job.ChatID, 0, formatReply(reply))
+		mc.platform.Send(context.Background(), job.ChannelID, reply, "")
 		job.SetLastQuestion(reply)
 
 		// Park — slot released, goroutine blocks waiting for user input.
 		input, inputOK := <-job.InputCh
 		if !inputOK {
-			sendFormatted(mc.svc.Bot, job.ChatID, 0, formatReply("Background job cancelled."))
+			mc.platform.Send(context.Background(), job.ChannelID, "Background job cancelled.", "")
 			return
 		}
 		job.SetLastQuestion("")
 		messages = append(messages, llm.Message{Role: "user", Content: input})
 	}
 
-	sendFormatted(mc.svc.Bot, job.ChatID, 0, formatReply("Background job reached maximum rounds without completing."))
+	mc.platform.Send(context.Background(), job.ChannelID, "Background job reached maximum rounds without completing.", "")
 }
 
 // ---------------------------------------------------------------------------
@@ -236,26 +245,35 @@ func runTriage(mc messageContext, msgText string, history []llm.Message) (*dispa
 	triagePrompt := buildTriageSystemPrompt(mc.registry, timefmt.FormatNatural(time.Now()))
 	triageInput := buildTriageInput(msgText, history)
 
+	triageStart := time.Now()
 	triageCtx, triageCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchTriage)
 	raw, err := mc.svc.Subagent.TryCompleteWithGrammarThinking(triageCtx, triagePrompt, triageInput, grammar.BuildDispatchGrammar(), dispatchMaxTriageTokens)
 	triageCancel()
 	if err != nil {
 		logger.Log.Debugf("[dispatch] triage skipped (subagent slots: %d/%d): %v", used, total, err)
+		mc.svc.Metrics.Since("triage.duration", triageStart, map[string]string{"decision": "error"})
 		return nil, err
 	}
 
 	var dr dispatchResult
 	if err := json.Unmarshal([]byte(raw), &dr); err != nil {
 		logger.Log.Warnf("[dispatch] triage parse failed: %v — raw: %s", err, textutil.Truncate(raw, 200))
+		mc.svc.Metrics.Since("triage.duration", triageStart, map[string]string{"decision": "error"})
 		return nil, fmt.Errorf("triage parse: %w", err)
 	}
+
+	decision := "escalate"
+	if dr.Dispatch {
+		decision = "dispatch"
+	}
+	mc.svc.Metrics.Since("triage.duration", triageStart, map[string]string{"decision": decision})
 	return &dr, nil
 }
 
 // executeDispatch handles a pre-triaged dispatch decision: tool execution +
 // synthesis for single-tool dispatches, or SubagentSupervisor for multi-step.
 // Returns (handled, escalation). handled=true means fully handled.
-func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
+func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
 	msgText string, dctx dispatchContext,
 	dr *dispatchResult) (bool, *dispatchEscalation) {
 
@@ -266,7 +284,7 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 
 	// --- Multi-step dispatch via SubagentSupervisor ---
 	if dr.Multi {
-		handled, esc, _ := tryMultiStepDispatch(mc, msg, chatID, msgText, dctx, dr.Directive)
+		handled, esc, _ := tryMultiStepDispatch(mc, msg, msgText, dctx, dr.Directive)
 		return handled, esc
 	}
 
@@ -276,6 +294,7 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 	}
 	if neverDispatchTools[dr.Tool] {
 		logger.Log.Warnf("[dispatch] triage tried to dispatch never-dispatch tool %q, forcing escalation", dr.Tool)
+		mc.svc.Metrics.Emit("dispatch.intercept", 1, map[string]string{"tool": dr.Tool})
 		return false, nil
 	}
 
@@ -284,8 +303,7 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 
 	// Send LLM-generated ack if the triage model wrote one.
 	if dr.Ack != "" {
-		ackFm := formatReply(dr.Ack)
-		if _, ackErr := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, ackFm); ackErr != nil {
+		if _, ackErr := mc.platform.Send(context.Background(), msg.ChannelID, dr.Ack, msg.ID); ackErr != nil {
 			logger.Log.Warnf("[dispatch] ack send failed: %v", ackErr)
 		} else {
 			logger.Log.Debugf("[dispatch] ack sent for %s: %q", dr.Tool, textutil.Truncate(dr.Ack, 60))
@@ -308,7 +326,7 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 			case <-ticker.C:
 				elapsed := int(time.Since(toolStart).Seconds())
 				update := fmt.Sprintf("Still working on %s... (%ds)", dr.Tool, elapsed)
-				sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(update))
+				mc.platform.Send(context.Background(), msg.ChannelID, update, msg.ID)
 				logger.Log.Debugf("[dispatch] progress: %s running for %ds", dr.Tool, elapsed)
 			case <-progressCtx.Done():
 				return
@@ -325,13 +343,16 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 	logger.Log.Infof("[dispatch] %s completed in %s", dr.Tool, elapsed.Round(time.Millisecond))
 
 	if execErr != nil {
+		mc.svc.Metrics.EmitDuration("tool.exec", elapsed, map[string]string{"tool": dr.Tool, "result": "hard_error"})
 		logger.Log.Warnf("[dispatch] tool %s hard error: %v — escalating", dr.Tool, execErr)
 		return false, &dispatchEscalation{ToolName: dr.Tool, Error: execErr.Error(), Phase: "execution"}
 	}
 	if llm.IsToolSoftError(result) {
+		mc.svc.Metrics.EmitDuration("tool.exec", elapsed, map[string]string{"tool": dr.Tool, "result": "soft_error"})
 		logger.Log.Infof("[dispatch] tool %s soft error, escalating to Brain for recovery", dr.Tool)
 		return false, &dispatchEscalation{ToolName: dr.Tool, Error: result, Phase: "execution"}
 	}
+	mc.svc.Metrics.EmitDuration("tool.exec", elapsed, map[string]string{"tool": dr.Tool, "result": "ok"})
 
 	// --- Synthesize ---
 	logger.Log.Debugf("[dispatch] synthesizing response for %s (%d chars of result)", dr.Tool, len(result))
@@ -342,10 +363,12 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 	}
 	synthesisInput := fmt.Sprintf("The user said: %s\n\nHere's what came back:\n%s", msgText, truncatedResult)
 
+	synthStart := time.Now()
 	synthCtx, synthCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchSynthesis)
 	reply, synthErr := mc.svc.Subagent.Complete(synthCtx, synthesisPrompt, synthesisInput, dispatchMaxSynthTokens)
 	synthCancel()
 
+	synthTier := "subagent"
 	if synthErr != nil {
 		// Tier 2: Try DTC CompleteNoThink as lightweight synthesis fallback.
 		if mc.svc.DTC != nil {
@@ -353,9 +376,11 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 			dtcCtx, dtcCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchDTCSynthesis)
 			reply, synthErr = mc.svc.DTC.CompleteNoThink(dtcCtx, synthesisPrompt, synthesisInput, dispatchMaxSynthTokens)
 			dtcCancel()
+			synthTier = "dtc"
 		}
 		// Tier 3: Both subagent and DTC failed — escalate to Brain with tool result attached.
 		if synthErr != nil {
+			mc.svc.Metrics.Since("synthesis.duration", synthStart, map[string]string{"tier": "failed"})
 			logger.Log.Warnf("[dispatch] all synthesis tiers failed for %s, escalating to Brain with tool result", dr.Tool)
 			return false, &dispatchEscalation{
 				ToolName:   dr.Tool,
@@ -365,10 +390,11 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 			}
 		}
 	}
+	mc.svc.Metrics.Since("synthesis.duration", synthStart, map[string]string{"tier": synthTier})
 	reply = textutil.StripThinkTags(reply)
 
 	// --- Post-processing + send (shared with Brain path) ---
-	completeMessageHandling(mc, msg, chatID, messageResult{
+	completeMessageHandling(mc, msg, messageResult{
 		Reply: reply,
 		Messages: []llm.Message{
 			{Role: "user", Content: msgText},
@@ -379,9 +405,10 @@ func executeDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
 		MsgText:           msgText,
 		PrefetchIDs:       dctx.PrefetchIDs,
 		PrefetchSummaries: dctx.PrefetchSummaries,
-		PipelineID:        int64(msg.MessageID),
+		PipelineID:        msg.PipelineID(),
 	})
 
+	mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "handled", "tool": dr.Tool, "phase": "single"})
 	totalElapsed := time.Since(toolStart)
 	logger.Log.Infof("[dispatch] handled %q via %s in %s (subagent path)", textutil.Truncate(msgText, 60), dr.Tool, totalElapsed.Round(time.Millisecond))
 	return true, nil
@@ -453,7 +480,7 @@ func buildContextualPrompt(dctx dispatchContext, instructions string) string {
 // tryMultiStepDispatch runs a multi-step dispatch using SubagentSupervisor.
 // The subagent executes 2-3 sequential tool calls and synthesizes a response.
 // Returns (handled, escalation, ack) matching tryDispatch signature.
-func tryMultiStepDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64,
+func tryMultiStepDispatch(mc messageContext, msg *platform.IncomingMessage,
 	msgText string, dctx dispatchContext, directive string) (bool, *dispatchEscalation, string) {
 
 	if mc.svc.Subagent == nil || mc.delegateConfig == nil {
@@ -464,7 +491,7 @@ func tryMultiStepDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64
 	logger.Log.Infof("[dispatch] multi-step: %q", textutil.Truncate(directive, 80))
 
 	// Ack.
-	sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply("Working on it..."))
+	mc.platform.Send(context.Background(), msg.ChannelID, "Working on it...", msg.ID)
 
 	systemPrompt := buildContextualPrompt(dctx, `You are a research assistant handling a multi-step request. Call the available tools as needed to gather information, then respond naturally to the user.
 
@@ -480,16 +507,19 @@ func tryMultiStepDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64
 	ctx, cancel := context.WithTimeout(context.Background(), tools.TimeoutMultiStepDispatch)
 	defer cancel()
 
+	multiStart := time.Now()
 	reply, err := clients.SubagentSupervisor(ctx, mc.svc.Subagent, g, systemPrompt, directive, toolExec, maxMultiStepRounds)
 	if err != nil {
 		logger.Log.Warnf("[dispatch] multi-step failed: %v — escalating", err)
+		mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "escalated", "phase": "multi_step"})
+		mc.svc.Metrics.Since("dispatch.multi_step", multiStart, nil)
 		return false, &dispatchEscalation{Phase: "multi-step", Error: err.Error()}, ""
 	}
 
 	reply = textutil.StripThinkTags(reply)
 
 	// Post-processing + send (shared with Brain path).
-	completeMessageHandling(mc, msg, chatID, messageResult{
+	completeMessageHandling(mc, msg, messageResult{
 		Reply: reply,
 		Messages: []llm.Message{
 			{Role: "user", Content: msgText},
@@ -500,9 +530,11 @@ func tryMultiStepDispatch(mc messageContext, msg *tgbotapi.Message, chatID int64
 		MsgText:           msgText,
 		PrefetchIDs:       dctx.PrefetchIDs,
 		PrefetchSummaries: dctx.PrefetchSummaries,
-		PipelineID:        int64(msg.MessageID),
+		PipelineID:        msg.PipelineID(),
 	})
 
+	mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "handled", "phase": "multi_step"})
+	mc.svc.Metrics.Since("dispatch.multi_step", multiStart, nil)
 	logger.Log.Infof("[dispatch] multi-step handled %q (subagent path)", textutil.Truncate(msgText, 60))
 	return true, nil, ""
 }

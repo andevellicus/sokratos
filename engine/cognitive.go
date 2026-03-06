@@ -54,6 +54,7 @@ func (e *Engine) runMaintenanceIfDue() {
 		{"failed_operations", `DELETE FROM failed_operations WHERE created_at < now() - ($1 || ' days')::interval`, e.TTL.FailedOpsTTLDays},
 		{"skill_kv", `DELETE FROM skill_kv WHERE updated_at < now() - ($1 || ' days')::interval`, e.TTL.SkillKVTTLDays},
 		{"shell_history", `DELETE FROM shell_history WHERE created_at < now() - ($1 || ' days')::interval`, e.TTL.ShellHistoryTTLDays},
+		{"metrics", `DELETE FROM metrics WHERE ts < now() - ($1 || ' days')::interval`, e.TTL.MetricsTTLDays},
 	} {
 		if pq.days <= 0 {
 			continue
@@ -66,6 +67,7 @@ func (e *Engine) runMaintenanceIfDue() {
 		}
 	}
 
+	e.Metrics.Since("maintenance.run", e.lastMaintenanceRun, nil)
 	logger.Log.Info("[engine] maintenance complete")
 }
 
@@ -90,6 +92,17 @@ func (e *Engine) runCognitiveIfTriggered() {
 	if !((bufferFull && lull) || ceilingHit) {
 		return
 	}
+
+	cogStart := time.Now()
+	trigger := "volume"
+	if ceilingHit {
+		trigger = "ceiling"
+	} else if lull {
+		trigger = "lull"
+	}
+	defer func() {
+		e.Metrics.Since("cognitive.run", cogStart, map[string]string{"trigger": trigger})
+	}()
 
 	logger.Log.Infof("[engine] cognitive processing triggered (count=%d, buffer_full=%v, lull=%v, ceiling=%v)",
 		count, bufferFull, lull, ceilingHit)

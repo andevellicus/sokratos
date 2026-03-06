@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"sokratos/engine"
 	"sokratos/httputil"
 	"sokratos/memory"
 	"sokratos/timeouts"
@@ -15,7 +16,7 @@ import (
 // limits concurrency to 1, matching the DTC server's single 32K slot.
 type DeepThinkerClient struct {
 	baseClient
-	sem chan struct{}
+	sem *engine.PrioritySem
 	wq  *WorkQueue
 }
 
@@ -32,7 +33,7 @@ func NewDeepThinkerClient(url, model string) *DeepThinkerClient {
 			cb:     newCircuitBreaker("dtc"),
 			logTag: "[dtc]",
 		},
-		sem: make(chan struct{}, 1),
+		sem: engine.NewPrioritySem(1),
 	}
 	d.wq = NewWorkQueue(16, 1, d.logTag, func(ctx context.Context, req memory.WorkRequest) (string, error) {
 		if req.Grammar != "" {
@@ -52,27 +53,35 @@ func (d *DeepThinkerClient) QueueWork(item memory.WorkRequest) {
 // Returns true if acquired (caller MUST call Release). Used by the slot
 // router to check if the Brain is available for orchestrator work.
 func (d *DeepThinkerClient) TryAcquire() bool {
-	select {
-	case d.sem <- struct{}{}:
-		return true
-	default:
-		return false
-	}
+	return d.sem.TryAcquire()
+}
+
+// TryAcquireAt attempts a priority-aware non-blocking acquire.
+// Exported for the slot router (SlotChecker interface).
+func (d *DeepThinkerClient) TryAcquireAt(pri engine.Priority) bool {
+	return d.sem.TryAcquireAt(pri)
 }
 
 // Acquire blocks until the Brain's slot is available or ctx is cancelled.
-func (d *DeepThinkerClient) Acquire(ctx context.Context) error {
-	select {
-	case d.sem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func (d *DeepThinkerClient) Acquire(ctx context.Context, pri engine.Priority) error {
+	return d.sem.Acquire(ctx, pri)
 }
 
 // Release frees the Brain's slot. Must be called after TryAcquire/Acquire succeeds.
 func (d *DeepThinkerClient) Release() {
-	<-d.sem
+	d.sem.Release()
+}
+
+// ReleaseReserved frees a slot with a reservation for high-priority reacquire.
+// Exported for the slot router (SlotChecker interface).
+func (d *DeepThinkerClient) ReleaseReserved() {
+	d.sem.ReleaseReserved()
+}
+
+// CancelReservation cancels an outstanding reservation.
+// Exported for the slot router (SlotChecker interface).
+func (d *DeepThinkerClient) CancelReservation() {
+	d.sem.CancelReservation()
 }
 
 // Complete sends a system+user message pair to the deep thinker with thinking
@@ -108,12 +117,10 @@ func (d *DeepThinkerClient) complete(ctx context.Context, systemPrompt, userCont
 	}
 
 	// Acquire the DTC slot before hitting the server.
-	select {
-	case d.sem <- struct{}{}:
-	case <-ctx.Done():
-		return "", ctx.Err()
+	if err := d.sem.Acquire(ctx, engine.PriorityBackground); err != nil {
+		return "", err
 	}
-	defer func() { <-d.sem }()
+	defer d.sem.Release()
 
 	if err := d.ensureLoaded(ctx); err != nil {
 		d.cb.recordFailureIfServer(err)

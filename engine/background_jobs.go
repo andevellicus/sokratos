@@ -18,7 +18,7 @@ type BackgroundJob struct {
 	Tool           string      // triggering tool ("create_skill") or "reason"
 	TaskType       string      // maps to session prompt; "" = general reasoning
 	UserGoal       string      // original user message or problem statement
-	ChatID         int64       // Telegram chat for sending messages
+	ChannelID      string      // platform channel for sending messages
 	InputCh        chan string // user messages flow in here (cap 1)
 	closeOnce      sync.Once   // ensures InputCh is closed exactly once
 	isActive       bool        // true during inference, false when parked
@@ -73,7 +73,7 @@ func (j *BackgroundJob) Cancel() {
 // --- StateManager job management ---
 
 // CreateJob creates a new background job and stores it in the state manager.
-func (sm *StateManager) CreateJob(tool, userGoal string, chatID int64) *BackgroundJob {
+func (sm *StateManager) CreateJob(tool, userGoal, channelID string) *BackgroundJob {
 	b := make([]byte, 3)
 	if _, err := rand.Read(b); err != nil {
 		b = []byte{0x42, 0x42, 0x42} // fallback
@@ -84,7 +84,7 @@ func (sm *StateManager) CreateJob(tool, userGoal string, chatID int64) *Backgrou
 		ID:        id,
 		Tool:      tool,
 		UserGoal:  userGoal,
-		ChatID:    chatID,
+		ChannelID: channelID,
 		InputCh:   make(chan string, 1),
 		CreatedAt: time.Now(),
 	}

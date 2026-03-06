@@ -18,13 +18,21 @@ type ToolIntentParser interface {
 }
 
 // SupervisorParser implements ToolIntentParser for the <TOOL_INTENT> tag
-// format used by the supervisor pattern.
-type SupervisorParser struct{}
+// format used by the supervisor pattern. IsKnownTool, when set, enables
+// recovery of bare <tool_name>content</tool_name> format by validating
+// against the live tool registry.
+type SupervisorParser struct {
+	IsKnownTool func(string) bool
+}
 
 // Parse extracts a tool call from model output using the <TOOL_INTENT> tag
-// format. Composes extractToolIntent + parseToolIntent.
-func (SupervisorParser) Parse(output string) ParseResult {
+// format. Falls back to bare <tool_name>content</tool_name> when IsKnownTool
+// is set. Composes extractToolIntent + parseToolIntent.
+func (p SupervisorParser) Parse(output string) ParseResult {
 	intent, ok := extractToolIntent(output)
+	if !ok && p.IsKnownTool != nil {
+		intent, ok = extractBareToolTag(output, p.IsKnownTool)
+	}
 	if !ok {
 		return ParseResult{}
 	}

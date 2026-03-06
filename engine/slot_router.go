@@ -2,17 +2,20 @@ package engine
 
 import (
 	"context"
+	"time"
 
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/metrics"
 )
 
 // OrchestratorChoice holds the resolved client/model for an orchestrator call.
 type OrchestratorChoice struct {
-	Client    *llm.Client
-	Model     string
-	Release   func()                          // MUST be called when the orchestrator call completes
-	Reacquire func(ctx context.Context) error // re-acquire the same slot type after tool execution
+	Client          *llm.Client
+	Model           string
+	Release         func()                          // MUST be called when the orchestrator call completes
+	ReleaseReserved func()                          // release with reservation for high-priority reacquire
+	Reacquire       func(ctx context.Context) error // re-acquire the same slot type after tool execution
 }
 
 // SlotRouter decides which LLM backend handles an orchestrator call.
@@ -20,7 +23,8 @@ type SlotRouter interface {
 	// AcquireOrFallback resolves the orchestrator. When preferBrain is true,
 	// Brain is tried first (interactive messages need accuracy); when false,
 	// the primary 9B is tried first (routines, heartbeats, scheduler).
-	AcquireOrFallback(ctx context.Context, preferBrain bool) OrchestratorChoice
+	// Priority controls waiter ordering and reservation visibility.
+	AcquireOrFallback(ctx context.Context, preferBrain bool, pri Priority) OrchestratorChoice
 
 	// TryAcquirePrimary attempts to acquire the primary (9B supervisor) slot
 	// without blocking. Returns the choice and true if acquired, or a zero
@@ -29,11 +33,15 @@ type SlotRouter interface {
 	TryAcquirePrimary() (OrchestratorChoice, bool)
 }
 
-// SlotChecker abstracts semaphore access for both DTC and SubagentClient.
+// SlotChecker abstracts priority-aware semaphore access for orchestrator
+// slot routing. Implemented by SubagentClient and DeepThinkerClient.
 type SlotChecker interface {
 	TryAcquire() bool
-	Acquire(ctx context.Context) error
+	TryAcquireAt(Priority) bool
+	Acquire(ctx context.Context, pri Priority) error
 	Release()
+	ReleaseReserved()
+	CancelReservation()
 }
 
 // slotRouter routes orchestrator calls based on priority. In two-model mode:
@@ -47,114 +55,165 @@ type slotRouter struct {
 	fallbackModel string
 	primarySlots  SlotChecker // primary server semaphore
 	fallbackSlots SlotChecker // fallback server semaphore
+	metrics       *metrics.Collector
 }
 
 // NewSlotRouter creates a router that routes orchestrator calls based on
 // priority and slot availability.
 func NewSlotRouter(primary *llm.Client, primaryModel string,
 	fallback *llm.Client, fallbackModel string,
-	primarySlots, fallbackSlots SlotChecker) SlotRouter {
+	primarySlots, fallbackSlots SlotChecker,
+	m *metrics.Collector) SlotRouter {
 	return &slotRouter{
 		primary: primary, primaryModel: primaryModel,
 		fallback: fallback, fallbackModel: fallbackModel,
 		primarySlots: primarySlots, fallbackSlots: fallbackSlots,
+		metrics: m,
 	}
 }
 
 // brainChoice constructs an OrchestratorChoice for the Brain (fallback) slot.
-func (r *slotRouter) brainChoice() OrchestratorChoice {
+// Priority determines the Reacquire urgency after tool-execution gaps.
+func (r *slotRouter) brainChoice(pri Priority) OrchestratorChoice {
 	return OrchestratorChoice{
-		Client:  r.fallback,
-		Model:   r.fallbackModel,
-		Release: r.fallbackSlots.Release,
+		Client:          r.fallback,
+		Model:           r.fallbackModel,
+		Release:         r.fallbackSlots.Release,
+		ReleaseReserved: r.fallbackSlots.ReleaseReserved,
 		Reacquire: func(ctx context.Context) error {
-			return r.fallbackSlots.Acquire(ctx)
+			err := r.fallbackSlots.Acquire(ctx, pri)
+			if err != nil {
+				r.fallbackSlots.CancelReservation()
+			}
+			return err
 		},
 	}
 }
 
 // primaryChoice constructs an OrchestratorChoice for the primary (9B) slot.
-func (r *slotRouter) primaryChoice() OrchestratorChoice {
+// Priority determines the Reacquire urgency after tool-execution gaps.
+func (r *slotRouter) primaryChoice(pri Priority) OrchestratorChoice {
 	return OrchestratorChoice{
-		Client:  r.primary,
-		Model:   r.primaryModel,
-		Release: r.primarySlots.Release,
+		Client:          r.primary,
+		Model:           r.primaryModel,
+		Release:         r.primarySlots.Release,
+		ReleaseReserved: r.primarySlots.ReleaseReserved,
 		Reacquire: func(ctx context.Context) error {
-			return r.primarySlots.Acquire(ctx)
+			err := r.primarySlots.Acquire(ctx, pri)
+			if err != nil {
+				r.primarySlots.CancelReservation()
+			}
+			return err
 		},
 	}
 }
 
 func (r *slotRouter) TryAcquirePrimary() (OrchestratorChoice, bool) {
+	start := time.Now()
 	if r.primarySlots.TryAcquire() {
 		logger.Log.Debug("[router] acquired orchestrator slot (non-blocking)")
-		return r.primaryChoice(), true
+		r.metrics.Since("slot.acquire", start, map[string]string{
+			"backend": "9b", "strategy": "try_primary", "result": "ok",
+		})
+		return r.primaryChoice(PriorityUser), true
 	}
+	r.metrics.Since("slot.acquire", start, map[string]string{
+		"backend": "9b", "strategy": "try_primary", "result": "busy",
+	})
 	return OrchestratorChoice{}, false
 }
 
-func (r *slotRouter) AcquireOrFallback(ctx context.Context, preferBrain bool) OrchestratorChoice {
+func (r *slotRouter) AcquireOrFallback(ctx context.Context, preferBrain bool, pri Priority) OrchestratorChoice {
 	if preferBrain {
-		return r.acquirePreferBrain(ctx)
+		return r.acquirePreferBrain(ctx, pri)
 	}
-	return r.acquirePreferPrimary(ctx)
+	return r.acquirePreferPrimary(ctx, pri)
 }
 
 // acquirePreferBrain implements the interactive strategy:
 // 1. TryAcquire Brain (non-blocking) → use Brain
 // 2. Brain busy → TryAcquire 9B (non-blocking) → use 9B
 // 3. Both busy → block on Brain
-func (r *slotRouter) acquirePreferBrain(ctx context.Context) OrchestratorChoice {
+func (r *slotRouter) acquirePreferBrain(ctx context.Context, pri Priority) OrchestratorChoice {
+	start := time.Now()
+
 	// Try Brain first (non-blocking).
-	if r.fallbackSlots.TryAcquire() {
+	if r.fallbackSlots.TryAcquireAt(pri) {
 		logger.Log.Debug("[router] acquired Brain slot (preferred)")
-		return r.brainChoice()
+		r.metrics.Since("slot.acquire", start, map[string]string{
+			"backend": "brain", "strategy": "prefer_brain", "result": "ok",
+		})
+		return r.brainChoice(pri)
 	}
 
 	// Brain busy — try primary (non-blocking).
-	if r.primarySlots.TryAcquire() {
+	if r.primarySlots.TryAcquireAt(pri) {
 		logger.Log.Debug("[router] Brain busy, acquired orchestrator slot")
-		return r.primaryChoice()
+		r.metrics.Since("slot.acquire", start, map[string]string{
+			"backend": "9b", "strategy": "prefer_brain", "result": "fallback",
+		})
+		return r.primaryChoice(pri)
 	}
 
-	// Both busy — block on Brain.
-	if err := r.fallbackSlots.Acquire(ctx); err != nil {
+	// Both busy — block on Brain at caller's priority.
+	if err := r.fallbackSlots.Acquire(ctx, pri); err != nil {
 		logger.Log.Warnf("[router] Brain acquire cancelled: %v, sending uncoordinated", err)
-		return OrchestratorChoice{
-			Client:    r.fallback,
-			Model:     r.fallbackModel,
-			Release:   func() {},
-			Reacquire: func(context.Context) error { return nil },
-		}
+		r.metrics.Since("slot.acquire", start, map[string]string{
+			"backend": "brain", "strategy": "prefer_brain", "result": "cancelled",
+		})
+		return r.uncoordinatedChoice()
 	}
 
 	logger.Log.Debug("[router] both busy, waited for Brain slot")
-	return r.brainChoice()
+	r.metrics.Since("slot.acquire", start, map[string]string{
+		"backend": "brain", "strategy": "prefer_brain", "result": "ok",
+	})
+	return r.brainChoice(pri)
 }
 
 // acquirePreferPrimary implements the routine/heartbeat strategy:
-// 1. TryAcquire 9B (non-blocking) → use 9B
-// 2. 9B busy → block on Brain
-func (r *slotRouter) acquirePreferPrimary(ctx context.Context) OrchestratorChoice {
-	// Try primary first (non-blocking).
-	if r.primarySlots.TryAcquire() {
+// 1. TryAcquireAt 9B (non-blocking, priority-aware) → use 9B
+// 2. 9B busy/yielding → block on Brain at caller's priority
+func (r *slotRouter) acquirePreferPrimary(ctx context.Context, pri Priority) OrchestratorChoice {
+	start := time.Now()
+
+	// Try primary (non-blocking). At background priority, this fails if a
+	// user reservation exists or a user waiter is queued — preventing
+	// slot stealing during the Release→Reacquire gap.
+	if r.primarySlots.TryAcquireAt(pri) {
 		logger.Log.Debug("[router] acquired orchestrator slot")
-		return r.primaryChoice()
+		r.metrics.Since("slot.acquire", start, map[string]string{
+			"backend": "9b", "strategy": "prefer_primary", "result": "ok",
+		})
+		return r.primaryChoice(pri)
 	}
 
-	// Primary busy — wait for Brain.
-	if err := r.fallbackSlots.Acquire(ctx); err != nil {
+	// Primary busy or yielding — wait for Brain at caller's priority.
+	if err := r.fallbackSlots.Acquire(ctx, pri); err != nil {
 		logger.Log.Warnf("[router] fallback acquire cancelled: %v, sending uncoordinated", err)
-		return OrchestratorChoice{
-			Client:    r.fallback,
-			Model:     r.fallbackModel,
-			Release:   func() {},
-			Reacquire: func(context.Context) error { return nil },
-		}
+		r.metrics.Since("slot.acquire", start, map[string]string{
+			"backend": "brain", "strategy": "prefer_primary", "result": "cancelled",
+		})
+		return r.uncoordinatedChoice()
 	}
 
 	logger.Log.Debug("[router] orchestrator busy, falling back to Brain")
-	return r.brainChoice()
+	r.metrics.Since("slot.acquire", start, map[string]string{
+		"backend": "brain", "strategy": "prefer_primary", "result": "fallback",
+	})
+	return r.brainChoice(pri)
+}
+
+// uncoordinatedChoice returns a fallback choice with no-op release/reacquire
+// for use when context cancellation prevents proper slot acquisition.
+func (r *slotRouter) uncoordinatedChoice() OrchestratorChoice {
+	return OrchestratorChoice{
+		Client:          r.fallback,
+		Model:           r.fallbackModel,
+		Release:         func() {},
+		ReleaseReserved: func() {},
+		Reacquire:       func(context.Context) error { return nil },
+	}
 }
 
 // passthroughRouter always returns the same client/model with a no-op release.
@@ -170,19 +229,19 @@ func NewPassthroughRouter(client *llm.Client, model string) SlotRouter {
 }
 
 func (r *passthroughRouter) TryAcquirePrimary() (OrchestratorChoice, bool) {
-	return OrchestratorChoice{
-		Client:    r.client,
-		Model:     r.model,
-		Release:   func() {},
-		Reacquire: func(context.Context) error { return nil },
-	}, true
+	return r.noopChoice(), true
 }
 
-func (r *passthroughRouter) AcquireOrFallback(_ context.Context, _ bool) OrchestratorChoice {
+func (r *passthroughRouter) AcquireOrFallback(_ context.Context, _ bool, _ Priority) OrchestratorChoice {
+	return r.noopChoice()
+}
+
+func (r *passthroughRouter) noopChoice() OrchestratorChoice {
 	return OrchestratorChoice{
-		Client:    r.client,
-		Model:     r.model,
-		Release:   func() {},
-		Reacquire: func(context.Context) error { return nil },
+		Client:          r.client,
+		Model:           r.model,
+		Release:         func() {},
+		ReleaseReserved: func() {},
+		Reacquire:       func(context.Context) error { return nil },
 	}
 }

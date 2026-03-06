@@ -124,6 +124,20 @@ var closingToolIntentRe = regexp.MustCompile(`</TOOL_INTENT>`)
 // a <CODE> block.
 var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)</TOOL_INTENT>`)
 
+// bareToolTagOpenRe matches the opening <tool_name> of a potential bare tool
+// tag. Content extraction and closing tag validation are done in extractBareToolTag.
+var bareToolTagOpenRe = regexp.MustCompile(`<([a-z][a-z0-9_]*)>`)
+
+// nonToolTags lists XML tags that appear in prompts/context and must not be
+// mistaken for tool calls.
+var nonToolTags = map[string]bool{
+	"think": true, "code": true, "retrieved_context": true, "memory": true,
+	"temporal_context": true, "current_time": true, "recent_system_actions": true,
+	"action": true, "active_objectives": true, "objective": true,
+	"work_items": true, "item": true, "escalation_context": true,
+	"prior_tool_result": true, "recent_failures": true,
+}
+
 // resolveParser returns the parser from opts, defaulting to SupervisorParser.
 func resolveParser(opts *QueryOrchestratorOpts) ToolIntentParser {
 	if opts != nil && opts.ToolAgent != nil && opts.ToolAgent.Parser != nil {
@@ -133,7 +147,9 @@ func resolveParser(opts *QueryOrchestratorOpts) ToolIntentParser {
 }
 
 // extractToolIntent extracts the content of the first <TOOL_INTENT> tag.
-// It tries the CODE-block pattern first, then falls back to the simple one.
+// It tries the CODE-block pattern first, then the simple pattern, and finally
+// a bare <tool_name>content</tool_name> fallback for models that revert to
+// XML tool-call format when the conversation history lacks TOOL_INTENT examples.
 func extractToolIntent(s string) (string, bool) {
 	// Try CODE-block pattern first (greedy enough to include </CODE>).
 	if m := toolIntentCodeRe.FindStringSubmatch(s); len(m) >= 2 && strings.Contains(m[1], "<CODE>") {
@@ -143,6 +159,61 @@ func extractToolIntent(s string) (string, bool) {
 	if m := toolIntentRe.FindStringSubmatch(s); len(m) >= 2 {
 		return strings.TrimSpace(m[1]), true
 	}
+	return "", false
+}
+
+// extractBareToolTag matches <tool_name>content</tool_name> and reconstructs
+// it as a "tool_name: {JSON}" intent string. isKnownTool validates that the
+// tag name is actually a registered tool (not a prompt XML tag like <think>).
+func extractBareToolTag(s string, isKnownTool func(string) bool) (string, bool) {
+	m := bareToolTagOpenRe.FindStringSubmatchIndex(s)
+	if m == nil {
+		return "", false
+	}
+	tagName := s[m[2]:m[3]]
+	afterOpen := m[1] // index right after ">"
+
+	// Require a matching closing tag.
+	closeTag := "</" + tagName + ">"
+	closeIdx := strings.Index(s[afterOpen:], closeTag)
+	if closeIdx < 0 {
+		return "", false
+	}
+	content := strings.TrimSpace(s[afterOpen : afterOpen+closeIdx])
+
+	// Only recover tags that are actually registered tools.
+	if isKnownTool != nil && !isKnownTool(tagName) {
+		return "", false
+	}
+	// Extra safety: reject tags on the known non-tool list even if
+	// isKnownTool is nil (e.g. in tests without a registry).
+	if nonToolTags[tagName] {
+		return "", false
+	}
+
+	// Content is already JSON — pass through directly.
+	if strings.HasPrefix(content, "{") {
+		if logger.Log != nil {
+			logger.Log.Warnf("[llm:supervisor] recovered bare <%s>{...}</%s> as tool intent", tagName, tagName)
+		}
+		return tagName + ": " + content, true
+	}
+
+	// Content is "key: value" format (e.g. "command: ls -t ...").
+	// Reconstruct as JSON: {"key": "value"}.
+	if key, value, ok := strings.Cut(content, ":"); ok {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		escapedValue, err := json.Marshal(value)
+		if err != nil {
+			return "", false
+		}
+		if logger.Log != nil {
+			logger.Log.Warnf("[llm:supervisor] recovered bare <%s>%s: ...</%s> as tool intent", tagName, key, tagName)
+		}
+		return fmt.Sprintf("%s: {\"%s\": %s}", tagName, key, string(escapedValue)), true
+	}
+
 	return "", false
 }
 
@@ -313,12 +384,16 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 	historyLen := len(messages)
 	messages = append(messages, userMsg)
 
-	// callTool wraps toolExec with slot release/reacquire callbacks.
+	// callTool wraps toolExec with slot release/reacquire callbacks and timing.
 	callTool := func(ctx context.Context, toolName string, raw []byte) (string, error) {
 		if opts != nil && opts.OnToolStart != nil {
 			opts.OnToolStart(toolName)
 		}
+		toolStart := time.Now()
 		result, err := toolExec(ctx, raw)
+		if opts != nil && opts.OnToolExec != nil {
+			opts.OnToolExec(toolName, time.Since(toolStart), err)
+		}
 		if opts != nil && opts.OnToolEnd != nil {
 			if reErr := opts.OnToolEnd(ctx); reErr != nil {
 				logger.Log.Warnf("[llm:supervisor] slot reacquire failed: %v", reErr)
@@ -396,6 +471,12 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 							TaskType: taskType,
 						}
 					}
+				}
+
+				// Intercept tools that require inline escalation to a more capable model.
+				if opts != nil && opts.EscalateTools[toolName] {
+					logger.Log.Infof("[llm:supervisor] escalating %s to Brain", toolName)
+					return "", messages[historyLen:], &EscalationRequest{ToolName: toolName}
 				}
 
 				result, execErr := callTool(ctx, toolName, []byte(toolJSON))

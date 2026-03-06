@@ -54,6 +54,7 @@ type AppConfig struct {
 	SkillKVTTLDays            int
 	ReflectionMemoryThreshold int
 	ShellHistoryTTLDays       int
+	MetricsTTLDays            int
 
 	ObjectivePursuitCooldown   time.Duration
 	ObjectiveInferenceCooldown time.Duration
@@ -68,6 +69,7 @@ type AppConfig struct {
 	DBMaxConnLifetime     time.Duration
 	DBMaxConnIdleTime     time.Duration
 	DBHealthCheckPeriod   time.Duration
+	ConfirmTools          []string
 	ConfirmationTimeout   time.Duration
 	MaxSupersededProfiles int
 	EmailDisplayBatch     int
@@ -84,7 +86,7 @@ type AppConfig struct {
 func Load() *AppConfig {
 	return &AppConfig{
 		TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
-		AllowedIDs:    parseAllowedIDs(os.Getenv("ALLOWED_TELEGRAM_IDS")),
+		AllowedIDs:    parseAllowedIDs(envStringSlice("ALLOWED_TELEGRAM_IDS", nil)),
 
 		LLMURL:   EnvString("LLM_URL", "http://localhost:11434"),
 		LLMModel: os.Getenv("LLM_MODEL"),
@@ -126,6 +128,7 @@ func Load() *AppConfig {
 		SkillKVTTLDays:            EnvInt("SKILL_KV_TTL_DAYS", 90),
 		ReflectionMemoryThreshold: EnvInt("REFLECTION_MEMORY_THRESHOLD", 50),
 		ShellHistoryTTLDays:       EnvInt("SHELL_HISTORY_TTL_DAYS", 30),
+		MetricsTTLDays:            EnvInt("METRICS_TTL_DAYS", 14),
 
 		ObjectivePursuitCooldown:   EnvDuration("OBJECTIVE_PURSUIT_COOLDOWN", 4*time.Hour),
 		ObjectiveInferenceCooldown: EnvDuration("OBJECTIVE_INFERENCE_COOLDOWN", 8*time.Hour),
@@ -140,6 +143,7 @@ func Load() *AppConfig {
 		DBMaxConnLifetime:     EnvDuration("DB_MAX_CONN_LIFETIME", 30*time.Minute),
 		DBMaxConnIdleTime:     EnvDuration("DB_MAX_CONN_IDLE_TIME", 5*time.Minute),
 		DBHealthCheckPeriod:   EnvDuration("DB_HEALTH_CHECK_PERIOD", 30*time.Second),
+		ConfirmTools:          envStringSlice("CONFIRM_TOOLS", []string{"send_email", "create_event", "create_skill"}),
 		ConfirmationTimeout:   EnvDuration("CONFIRMATION_TIMEOUT", 2*time.Minute),
 		MaxSupersededProfiles: EnvInt("MAX_SUPERSEDED_PROFILES", 20),
 		EmailDisplayBatch:     EnvInt("EMAIL_DISPLAY_BATCH", 5),
@@ -207,14 +211,27 @@ func EnvDuration(key string, def time.Duration) time.Duration {
 	return d
 }
 
-// parseAllowedIDs parses a comma-separated list of Telegram user IDs.
-func parseAllowedIDs(raw string) map[int64]struct{} {
-	allowed := make(map[int64]struct{})
+// envStringSlice splits a comma-separated env var into a string slice,
+// trimming whitespace from each element. Returns def if the var is unset.
+func envStringSlice(key string, def []string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return def
+	}
+	var result []string
 	for _, s := range strings.Split(raw, ",") {
 		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
+		if s != "" {
+			result = append(result, s)
 		}
+	}
+	return result
+}
+
+// parseAllowedIDs converts pre-split string slices into an int64 set.
+func parseAllowedIDs(parts []string) map[int64]struct{} {
+	allowed := make(map[int64]struct{})
+	for _, s := range parts {
 		id, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
 			continue

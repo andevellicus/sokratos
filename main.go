@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 
 	"sokratos/clients"
@@ -22,7 +22,10 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/metrics"
 	"sokratos/pipelines"
+	"sokratos/platform"
+	"sokratos/platform/telegram"
 	"sokratos/prompts"
 	"sokratos/timeouts"
 	"sokratos/tokens"
@@ -33,10 +36,8 @@ import (
 
 // serviceBundle holds all initialized services and shared closures.
 type serviceBundle struct {
-	Bot              *tgbotapi.BotAPI
-	Updates          tgbotapi.UpdatesChannel
+	Platform         platform.Platform
 	DTC              *clients.DeepThinkerClient
-	SynthesizeFunc   memory.SynthesizeFunc
 	SubagentFunc     memory.SubagentFunc
 	GrammarFunc      memory.GrammarSubagentFunc // blocking + GBNF grammar (save_memory enrichment)
 	BgGrammarFunc    memory.GrammarSubagentFunc // non-blocking + GBNF grammar for entity extraction
@@ -45,6 +46,7 @@ type serviceBundle struct {
 	Subagent         *clients.SubagentClient
 	StateMgr         *engine.StateManager
 	InterruptChan    chan struct{}
+	Metrics          *metrics.Collector
 	TriageRetryQueue *pipelines.RetryQueue
 	AuthErrorOnce    *sync.Once // fires once per token expiry
 }
@@ -65,30 +67,16 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		logger.Log.Warn("DATABASE_URL is not set — running without database")
 	}
 
-	// Telegram bot.
-	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
+	// Telegram platform.
+	plat, err := telegram.New(cfg.TelegramToken, cfg.AllowedIDs)
 	if err != nil {
 		logger.Log.Fatal(err)
 	}
-	logger.Log.Infof("Authorized on account %s", bot.Self.UserName)
-
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
 
 	// Deep thinker client.
 	var dtc *clients.DeepThinkerClient
 	if cfg.DeepThinkerURL != "" {
 		dtc = clients.NewDeepThinkerClient(cfg.DeepThinkerURL, cfg.DeepThinkerModel)
-	}
-
-	// SynthesizeFunc closure.
-	var synthesizeFunc memory.SynthesizeFunc
-	if dtc != nil {
-		capturedDTC := dtc
-		synthesizeFunc = func(ctx context.Context, systemPrompt, content string) (string, error) {
-			return capturedDTC.Complete(ctx, systemPrompt, content, tokens.DTCSynthesis)
-		}
 	}
 
 	// DTC work queue closure.
@@ -148,10 +136,8 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 	triageRetryQueue.Start()
 
 	return &serviceBundle{
-		Bot:              bot,
-		Updates:          updates,
+		Platform:         plat,
 		DTC:              dtc,
-		SynthesizeFunc:   synthesizeFunc,
 		SubagentFunc:     subagentFunc,
 		GrammarFunc:      grammarFunc,
 		BgGrammarFunc:    bgGrammarFunc,
@@ -159,6 +145,7 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 		DTCQueueFunc:     dtcQueueFn,
 		Subagent:         subagent,
 		StateMgr:         stateMgr,
+		Metrics:          metrics.New(db.Pool),
 		InterruptChan:    interruptChan,
 		TriageRetryQueue: triageRetryQueue,
 		AuthErrorOnce:    &sync.Once{},
@@ -193,6 +180,7 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	}
 	toolAgentConfig := &llm.ToolAgentConfig{
 		ToolDescriptions: toolDescs,
+		Parser:           llm.SupervisorParser{IsKnownTool: registry.Has},
 	}
 
 	// Build triage grammar once for conversation triage via subagent.
@@ -261,6 +249,7 @@ func main() {
 
 	svc := initServices(cfg)
 	defer db.Close()
+	defer svc.Metrics.Close()
 
 	// Non-blocking Google auth: load existing tokens silently.
 	if err := google.InitGmailFromToken(context.Background(), cfg.GmailCredsPath, cfg.GoogleTokenPath); err != nil {
@@ -270,20 +259,18 @@ func main() {
 		logger.Log.Warnf("Calendar init failed: %v — Calendar features disabled", err)
 	}
 
-	registry, emailTriageCfg, delegateConfig, shellExec := registerTools(cfg, svc)
+	tb := registerTools(cfg, svc)
+	registry := tb.Registry
 
 	// Wire proactive auth-error notification: when any Google API call fails
-	// due to an expired/revoked token, notify the user once via Telegram.
+	// due to an expired/revoked token, notify the user once via platform.
 	registry.OnAuthError = func(toolName string) {
 		svc.AuthErrorOnce.Do(func() {
 			logger.Log.Warnf("[auth] detected auth expiry via %s — notifying user", toolName)
 			os.Remove(cfg.GoogleTokenPath)
 			google.GmailService = nil
 			google.CalendarService = nil
-			for id := range cfg.AllowedIDs {
-				m := tgbotapi.NewMessage(id, "⚠️ Google authorization expired. Use /google to re-authenticate.")
-				svc.Bot.Send(m)
-			}
+			svc.Platform.Broadcast(context.Background(), "⚠️ Google authorization expired. Use /google to re-authenticate.")
 		})
 	}
 
@@ -291,30 +278,25 @@ func main() {
 
 	// Set the triage grammar now that initLLM has built it. The NewSearchEmail
 	// closure captures the pointer, so it sees the grammar when invoked.
-	if emailTriageCfg != nil {
-		emailTriageCfg.TriageGrammar = lb.TriageGrammar
+	if tb.EmailTriageCfg != nil {
+		tb.EmailTriageCfg.TriageGrammar = lb.TriageGrammar
 	}
 
-	// Register Telegram slash commands so they appear in the input menu.
-	commands := tgbotapi.NewSetMyCommands(
-		tgbotapi.BotCommand{Command: "reload", Description: "Reload skills and routines from disk"},
-		tgbotapi.BotCommand{Command: "bootstrap", Description: "Generate profile from memories"},
-		tgbotapi.BotCommand{Command: "google", Description: "Re-authenticate Google (Gmail + Calendar)"},
-	)
-	if _, err := svc.Bot.Request(commands); err != nil {
-		logger.Log.Warnf("Failed to set Telegram commands: %v", err)
+	// Register platform slash commands.
+	if err := svc.Platform.RegisterCommands([]platform.Command{
+		{Name: "reload", Description: "Reload skills and routines from disk"},
+		{Name: "bootstrap", Description: "Generate profile from memories"},
+		{Name: "google", Description: "Re-authenticate Google (Gmail + Calendar)"},
+		{Name: "metrics", Description: "View system metrics (e.g. /metrics slots 1h)"},
+	}); err != nil {
+		logger.Log.Warnf("Failed to set platform commands: %v", err)
 	}
 
 	// Send startup message to all allowed users.
-	for id := range cfg.AllowedIDs {
-		msg := tgbotapi.NewMessage(id, "Bot started and ready.")
-		if _, err := svc.Bot.Send(msg); err != nil {
-			logger.Log.Warnf("Failed to send startup message to %d: %v", id, err)
-		}
-	}
+	svc.Platform.Broadcast(context.Background(), "Bot started and ready.")
 
 	eng := initEngine(cfg, svc, lb, registry)
-	wired := wireEngine(cfg, svc, lb, eng, registry, emailTriageCfg, delegateConfig, shellExec)
+	wired := wireEngine(cfg, svc, lb, eng, registry, tb)
 
 	runStartupTasks()
 
@@ -323,25 +305,11 @@ func main() {
 	// does not access eng fields, so this is the correct synchronization point.
 	go eng.Run()
 
-	// Split the Telegram updates channel into messages and callback queries.
-	// This allows confirmToolExec (used by both the message loop and the engine
-	// heartbeat) to read callbacks without racing the main message loop.
-	messageChan := make(chan *tgbotapi.Message, 50)
-	callbackChan := make(chan *tgbotapi.CallbackQuery, 10)
-	go func() {
-		for update := range svc.Updates {
-			if update.CallbackQuery != nil {
-				callbackChan <- update.CallbackQuery
-			} else if update.Message != nil {
-				messageChan <- update.Message
-			}
-		}
-		close(messageChan)
-		close(callbackChan)
-	}()
-
-	confirmGate := map[string]bool{"send_email": true, "create_event": true, "create_skill": true}
-	confirmExec := confirmToolExec(registry.Execute, svc.Bot, callbackChan, cfg.AllowedIDs, confirmGate, cfg.ConfirmationTimeout)
+	confirmGate := make(map[string]bool, len(cfg.ConfirmTools))
+	for _, t := range cfg.ConfirmTools {
+		confirmGate[t] = true
+	}
+	confirmExec := confirmToolExec(registry, svc.Platform, confirmGate, cfg.ConfirmationTimeout)
 
 	// Wire the engine with the confirmation-gated executor too, so heartbeat-triggered
 	// tools (e.g. send_email from a routine) also require user approval.
@@ -360,23 +328,21 @@ func main() {
 		eng:            eng,
 		lb:             lb,
 		registry:       registry,
-		emailTriageCfg: emailTriageCfg,
+		emailTriageCfg: tb.EmailTriageCfg,
 		confirmExec:    confirmExec,
 		skillMtimes:    wired.skillMtimes,
 		skillDeps:      wired.skillDeps,
 		rebuildGrammar: wired.rebuildGrammar,
 		router:         router,
-		delegateConfig: delegateConfig,
-		messageChan:    messageChan,
+		delegateConfig: tb.DelegateConfig,
+		platform:       svc.Platform,
 	}
 
-	for msg := range messageChan {
-		from := msg.From
-		tag := senderTag(from)
-
+	for msg := range svc.Platform.Messages() {
 		if len(cfg.AllowedIDs) > 0 {
-			if _, ok := cfg.AllowedIDs[from.ID]; !ok {
-				logger.Log.Warnf("Rejected message from %s: %q", tag, msg.Text)
+			senderID, _ := strconv.ParseInt(msg.SenderID, 10, 64)
+			if _, ok := cfg.AllowedIDs[senderID]; !ok {
+				logger.Log.Warnf("Rejected message from %s: %q", msg.SenderTag, msg.Text)
 				continue
 			}
 		}
@@ -392,19 +358,12 @@ func main() {
 		var visionParts []llm.ContentPart
 		var msgText string
 
-		if photos := msg.Photo; len(photos) > 0 {
-			photo := photos[len(photos)-1]
-			imgData, mimeType, dlErr := downloadTelegramPhoto(svc.Bot, photo.FileID)
-			if dlErr != nil {
-				logger.Log.Errorf("Failed to download photo: %v", dlErr)
-				continue
-			}
-
-			dataURI := fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(imgData))
+		if msg.PhotoData != nil {
+			dataURI := fmt.Sprintf("data:%s;base64,%s", msg.PhotoMIME, base64.StdEncoding.EncodeToString(msg.PhotoData))
 
 			// Generate a text caption via the VL subagent so image context
 			// survives text-only pipelines (triage, memory, archival).
-			caption := msg.Caption
+			caption := msg.Text
 			if caption == "" {
 				caption = "What's in this image?"
 			}
@@ -421,7 +380,7 @@ func main() {
 			}
 
 			msgText = caption
-			logger.Log.Infof("[%s] [photo] %s", tag, caption)
+			logger.Log.Infof("[%s] [photo] %s", msg.SenderTag, caption)
 
 			userPrompt = caption + "\n\n[Current Agent State]\n" + stateCtx
 			visionParts = []llm.ContentPart{
@@ -430,31 +389,27 @@ func main() {
 			}
 		} else if msg.Text != "" {
 			msgText = msg.Text
-			logger.Log.Infof("[%s] %s", tag, msgText)
+			logger.Log.Infof("[%s] %s", msg.SenderTag, msgText)
 
 			userPrompt = msgText + "\n\n[Current Agent State]\n" + stateCtx
 		} else {
 			continue
 		}
 
-		chatID := msg.Chat.ID
-
 		// Direct-dispatch slash commands bypass the orchestrator entirely.
-		switch strings.TrimSpace(msgText) {
-		case "/reload":
-			r := tgbotapi.NewMessage(chatID, handleReload(mc))
-			r.ReplyToMessageID = msg.MessageID
-			svc.Bot.Send(r)
-		case "/bootstrap":
-			r := tgbotapi.NewMessage(chatID, handleBootstrap(mc))
-			r.ReplyToMessageID = msg.MessageID
-			svc.Bot.Send(r)
-		case "/google":
-			r := tgbotapi.NewMessage(chatID, handleGoogle(mc))
-			r.ReplyToMessageID = msg.MessageID
-			svc.Bot.Send(r)
+		trimmed := strings.TrimSpace(msgText)
+		switch {
+		case trimmed == "/reload":
+			svc.Platform.Send(context.Background(), msg.ChannelID, handleReload(mc), msg.ID)
+		case trimmed == "/bootstrap":
+			svc.Platform.Send(context.Background(), msg.ChannelID, handleBootstrap(mc), msg.ID)
+		case trimmed == "/google":
+			svc.Platform.Send(context.Background(), msg.ChannelID, handleGoogle(mc), msg.ID)
+		case trimmed == "/metrics" || strings.HasPrefix(trimmed, "/metrics "):
+			args := strings.TrimPrefix(trimmed, "/metrics")
+			svc.Platform.Send(context.Background(), msg.ChannelID, handleMetrics(mc, strings.TrimSpace(args)), msg.ID)
 		default:
-			processMessage(mc, msg, chatID, msgText, userPrompt, visionParts)
+			processMessage(mc, msg, msgText, userPrompt, visionParts)
 		}
 	}
 }

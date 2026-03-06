@@ -15,6 +15,7 @@ import (
 	"sokratos/google"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/metrics"
 	"sokratos/prompts"
 	"sokratos/textutil"
 	"sokratos/timeouts"
@@ -113,8 +114,9 @@ type TriageConfig struct {
 	QueueFn            memory.WorkQueueFunc       // background work queue for quality enrichment + deferred work
 	BgGrammarFn        memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
 	TriageGrammar      string
-	RetryQueue         *RetryQueue // deferred triage retry queue (nil = drop on failure)
-	ProfileRefreshFunc func()      // called after paradigm shift to refresh engine profile + personality
+	RetryQueue         *RetryQueue         // deferred triage retry queue (nil = drop on failure)
+	ProfileRefreshFunc func()              // called after paradigm shift to refresh engine profile + personality
+	Metrics            *metrics.Collector  // observability metrics (nil = disabled)
 }
 
 // TriageSaveRequest encapsulates all parameters for a triage-then-save operation.
@@ -173,6 +175,9 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 
 	if !req.ShouldSave(result) {
 		logger.Log.Infof("[triage:%s] skipped (score=%.0f): %s", req.DomainTag, result.SalienceScore, result.Summary)
+		cfg.Metrics.Emit("memory.triage", result.SalienceScore, map[string]string{
+			"source": req.Source, "decision": "skipped",
+		})
 		return nil
 	}
 
@@ -204,6 +209,9 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 		memory.SaveToMemoryWithSalienceAsync(cfg.Pool, memReq, nil, cfg.QueueFn)
 	}
 
+	cfg.Metrics.Emit("memory.triage", result.SalienceScore, map[string]string{
+		"source": req.Source, "decision": "saved",
+	})
 	logger.Log.Infof("[triage:%s] saved (score=%.0f, category=%s, tags=%v): %s",
 		req.DomainTag, result.SalienceScore, result.Category, tags, result.Summary)
 

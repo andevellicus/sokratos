@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/url"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -111,6 +113,14 @@ func registerDBTools(registry *tools.Registry, pool *pgxpool.Pool, interruptChan
 			Params:      []tools.ParamSchema{{Name: "natural_language_query", Type: "string", Required: true}},
 		})
 	}
+	registry.Register("query_metrics", tools.NewQueryMetrics(pool), tools.ToolSchema{
+		Name:        "query_metrics",
+		Description: "View system performance metrics (slots, dispatch, latency, tools, routines)",
+		Params: []tools.ParamSchema{
+			{Name: "report", Type: "string", Required: false},
+			{Name: "window", Type: "string", Required: false},
+		},
+	})
 }
 
 // registerAITools registers the deep reasoning tool. With the 9B as the default
@@ -172,6 +182,23 @@ func registerSkillTools(registry *tools.Registry, skillsDir string, rebuildGramm
 			{Name: "code", Type: "string", Required: true},
 			{Name: "language", Type: "string", Required: false},
 			{Name: "test_args", Type: "string", Required: true},
+		},
+		ConfirmFormat: func(args json.RawMessage) string {
+			var a struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			}
+			_ = json.Unmarshal(args, &a)
+			return fmt.Sprintf("⚠️ Create skill %q\n%s", a.Name, a.Description)
+		},
+		ConfirmCacheKey: func(args json.RawMessage) string {
+			var a struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(args, &a) == nil && a.Name != "" {
+				return "create_skill:" + a.Name
+			}
+			return "create_skill"
 		},
 	})
 	registry.Register("manage_skills", tools.NewManageSkills(registry, skillsDir, rebuildGrammar, deps), tools.ToolSchema{
@@ -246,7 +273,16 @@ func collectInternalHosts(cfg *config.AppConfig) []string {
 	return hosts
 }
 
-func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, *pipelines.TriageConfig, *tools.DelegateConfig, *tools.ShellExec) {
+// toolsBundle groups the outputs of registerTools to avoid a growing
+// positional return signature.
+type toolsBundle struct {
+	Registry       *tools.Registry
+	EmailTriageCfg *pipelines.TriageConfig
+	DelegateConfig *tools.DelegateConfig
+	ShellExec      *tools.ShellExec
+}
+
+func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 	registry := tools.NewRegistry()
 
 	registerCoreTools(registry, svc.StateMgr)
@@ -298,6 +334,7 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 			QueueFn:       svc.QueueFunc,
 			BgGrammarFn:   svc.BgGrammarFunc,
 			RetryQueue:    svc.TriageRetryQueue,
+			Metrics:       svc.Metrics,
 		}
 	}
 
@@ -314,7 +351,8 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 	})
 
 	// Register file I/O tools.
-	registerFileTools(registry, cfg.WorkspaceDir)
+	foc := tools.NewFileOpsConfig(cfg.WorkspaceDir, svc.Platform, cfg.ConfirmationTimeout)
+	registerFileTools(registry, foc)
 
 	// Register shell command tool.
 	shellExec := registerShellTool(registry, db.Pool, cfg)
@@ -322,7 +360,12 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) (*tools.Registry, 
 	// Register delegate_task after all delegatable tools are available.
 	delegateConfig := registerDelegateTask(registry, svc.Subagent)
 
-	return registry, emailTriageCfg, delegateConfig, shellExec
+	return &toolsBundle{
+		Registry:       registry,
+		EmailTriageCfg: emailTriageCfg,
+		DelegateConfig: delegateConfig,
+		ShellExec:      shellExec,
+	}
 }
 
 // registerGmailTools registers tools for searching and interacting with Gmail.
@@ -347,6 +390,24 @@ func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg 
 			{Name: "to", Type: "string", Required: true},
 			{Name: "subject", Type: "string", Required: true},
 			{Name: "body", Type: "string", Required: true},
+		},
+		ConfirmFormat: func(args json.RawMessage) string {
+			var a struct {
+				To      string `json:"to"`
+				Subject string `json:"subject"`
+			}
+			_ = json.Unmarshal(args, &a)
+			return fmt.Sprintf("⚠️ Send email to %s\nSubject: %q", a.To, a.Subject)
+		},
+		ConfirmCacheKey: func(args json.RawMessage) string {
+			var a struct {
+				To      string `json:"to"`
+				Subject string `json:"subject"`
+			}
+			if json.Unmarshal(args, &a) == nil {
+				return "send_email:" + a.To + ":" + a.Subject
+			}
+			return "send_email"
 		},
 	})
 }
@@ -376,6 +437,24 @@ func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
 			{Name: "description", Type: "string", Required: false},
 			{Name: "location", Type: "string", Required: false},
 			{Name: "attendees", Type: "array", Required: false},
+		},
+		ConfirmFormat: func(args json.RawMessage) string {
+			var a struct {
+				Title string `json:"title"`
+				Start string `json:"start"`
+			}
+			_ = json.Unmarshal(args, &a)
+			return fmt.Sprintf("⚠️ Create calendar event\n%q at %s", a.Title, a.Start)
+		},
+		ConfirmCacheKey: func(args json.RawMessage) string {
+			var a struct {
+				Title string `json:"title"`
+				Start string `json:"start"`
+			}
+			if json.Unmarshal(args, &a) == nil {
+				return "create_event:" + a.Title + ":" + a.Start
+			}
+			return "create_event"
 		},
 	})
 }
@@ -418,8 +497,8 @@ func registerWebTools(registry *tools.Registry, searxngURL string, sc *clients.S
 	})
 }
 
-func registerFileTools(registry *tools.Registry, workspaceDir string) {
-	registry.Register("read_file", tools.NewReadFile(workspaceDir), tools.ToolSchema{
+func registerFileTools(registry *tools.Registry, foc *tools.FileOpsConfig) {
+	registry.Register("read_file", tools.NewReadFile(foc), tools.ToolSchema{
 		Name:        "read_file",
 		Description: "Read a file from the workspace (returns numbered lines)",
 		Params: []tools.ParamSchema{
@@ -428,7 +507,7 @@ func registerFileTools(registry *tools.Registry, workspaceDir string) {
 			{Name: "limit", Type: "number", Required: false},
 		},
 	})
-	registry.Register("write_file", tools.NewWriteFile(workspaceDir), tools.ToolSchema{
+	registry.Register("write_file", tools.NewWriteFile(foc), tools.ToolSchema{
 		Name:        "write_file",
 		Description: "Create or overwrite a file in the workspace",
 		Params: []tools.ParamSchema{
@@ -436,7 +515,7 @@ func registerFileTools(registry *tools.Registry, workspaceDir string) {
 			{Name: "content", Type: "string", Required: true},
 		},
 	})
-	registry.Register("patch_file", tools.NewPatchFile(workspaceDir), tools.ToolSchema{
+	registry.Register("patch_file", tools.NewPatchFile(foc), tools.ToolSchema{
 		Name:        "patch_file",
 		Description: "Find and replace a unique string in a workspace file",
 		Params: []tools.ParamSchema{
@@ -445,7 +524,7 @@ func registerFileTools(registry *tools.Registry, workspaceDir string) {
 			{Name: "new_string", Type: "string", Required: true},
 		},
 	})
-	registry.Register("list_files", tools.NewListFiles(workspaceDir), tools.ToolSchema{
+	registry.Register("list_files", tools.NewListFiles(foc), tools.ToolSchema{
 		Name:        "list_files",
 		Description: "List files in a workspace directory with optional glob pattern",
 		Params: []tools.ParamSchema{

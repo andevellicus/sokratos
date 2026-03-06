@@ -43,6 +43,7 @@ type heartbeatContext struct {
 // independent scheduler (see runRoutineScheduler). The heartbeat focuses on
 // contextual orchestrator reasoning, maintenance, and cognitive processing.
 func (e *Engine) heartbeatTick() {
+	tickStart := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Log.Errorf("heartbeat: panic recovered: %v", r)
@@ -119,6 +120,18 @@ func (e *Engine) heartbeatTick() {
 
 	// Phase 4: Event-driven cognitive processing.
 	e.runCognitiveIfTriggered()
+
+	gatekeeper := "none"
+	if e.Gatekeeper != nil {
+		gatekeeper = "present"
+	}
+	staleStr := "false"
+	if conversationStale {
+		staleStr = "true"
+	}
+	e.Metrics.Since("heartbeat.tick", tickStart, map[string]string{
+		"gatekeeper": gatekeeper, "stale": staleStr,
+	})
 
 	logger.Log.Info("heartbeat: tick complete")
 }

@@ -19,6 +19,7 @@ import (
 	"sokratos/routines"
 	"sokratos/textutil"
 	"sokratos/timeouts"
+	"sokratos/tokens"
 	"sokratos/tools"
 )
 
@@ -61,8 +62,10 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 			FailedOpsTTLDays:       cfg.FailedOpsTTLDays,
 			SkillKVTTLDays:         cfg.SkillKVTTLDays,
 			ShellHistoryTTLDays:    cfg.ShellHistoryTTLDays,
+			MetricsTTLDays:         cfg.MetricsTTLDays,
 		},
-		Notifier: &notifierAdapter{bot: svc.Bot, allowedIDs: cfg.AllowedIDs},
+		Metrics:  svc.Metrics,
+		Notifier: &notifierAdapter{sender: svc.Platform},
 		InterruptChan: svc.InterruptChan,
 		Gatekeeper:    svc.Subagent,
 		Memory: engine.MemoryFuncs{
@@ -116,10 +119,12 @@ func wireEngine(
 	lb *llmBundle,
 	eng *engine.Engine,
 	registry *tools.Registry,
-	emailTriageCfg *pipelines.TriageConfig,
-	delegateConfig *tools.DelegateConfig,
-	shellExec *tools.ShellExec,
+	tb *toolsBundle,
 ) wireResult {
+	emailTriageCfg := tb.EmailTriageCfg
+	delegateConfig := tb.DelegateConfig
+	shellExec := tb.ShellExec
+
 	// Wire paradigm shift fast-path: after a paradigm shift is detected in
 	// triage, run mini-consolidation then refresh the engine's profile state.
 	if emailTriageCfg != nil {
@@ -139,6 +144,7 @@ func wireEngine(
 			brainClient, cfg.BrainModel, // 122B Brain (fallback)
 			svc.Subagent, // 9B slots (cap 3)
 			svc.DTC,      // Brain slots (cap 1)
+			svc.Metrics,
 		)
 		eng.Router = router
 		logger.Log.Infof("[startup] slot router initialized: 9B orchestrator + Brain fallback")
@@ -265,8 +271,11 @@ func wireEngine(
 		}
 		cogAvailable = true
 	}
-	if svc.SynthesizeFunc != nil {
-		cog.synthesize = svc.SynthesizeFunc
+	if svc.DTC != nil {
+		capturedDTC := svc.DTC
+		cog.synthesize = func(ctx context.Context, sp, content string) (string, error) {
+			return capturedDTC.Complete(ctx, sp, content, tokens.DTCSynthesis)
+		}
 		cogAvailable = true
 	}
 	if workTracker != nil && svc.DTC != nil && svc.Subagent != nil && delegateConfig != nil {

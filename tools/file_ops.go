@@ -7,46 +7,114 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"sokratos/logger"
+	"sokratos/platform"
 )
 
 const maxReadFileSize = 50 * 1024 // 50KB
 const maxListEntries = 500
 
-// validatePath resolves a user-supplied path relative to the workspace and
-// ensures it stays within bounds. Returns the resolved absolute path or a
-// soft ToolError on violation.
-func validatePath(workspaceDir, path string) (string, error) {
-	if strings.TrimSpace(path) == "" {
-		return "", Errorf("path is required")
-	}
+// FileOpsConfig configures file I/O tools with optional external path confirmation.
+type FileOpsConfig struct {
+	WorkspaceDir   string             // must be absolute
+	Confirmer      platform.Confirmer // nil = block external paths
+	ConfirmTimeout time.Duration
+	approvals      *ApprovalCache // per-directory approval cache
+}
 
-	var resolved string
-	if filepath.IsAbs(path) {
-		resolved = filepath.Clean(path)
-	} else {
-		resolved = filepath.Join(workspaceDir, path)
-	}
-
-	abs, err := filepath.Abs(resolved)
+// NewFileOpsConfig creates a FileOpsConfig with an absolute workspace path.
+func NewFileOpsConfig(workspaceDir string, confirmer platform.Confirmer, timeout time.Duration) *FileOpsConfig {
+	abs, err := filepath.Abs(workspaceDir)
 	if err != nil {
-		return "", Errorf("failed to resolve path: %v", err)
+		abs = workspaceDir
+	}
+	return &FileOpsConfig{
+		WorkspaceDir:   abs,
+		Confirmer:      confirmer,
+		ConfirmTimeout: timeout,
+		approvals:      NewApprovalCache(5 * time.Minute),
+	}
+}
+
+// expandTilde replaces a leading "~" or "~/" with the user's home directory.
+// Returns the path unchanged if no tilde prefix or home dir lookup fails.
+func expandTilde(path string) string {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[1:])
+		}
+	}
+	return path
+}
+
+// resolvePath resolves a user-supplied path relative to the workspace.
+// Returns the absolute path and whether it falls within the workspace.
+func resolvePath(workspaceDir, path string) (resolved string, inWorkspace bool, err error) {
+	if strings.TrimSpace(path) == "" {
+		return "", false, Errorf("path is required")
 	}
 
-	if !strings.HasPrefix(abs, workspaceDir) {
-		return "", Errorf("path %q is outside the workspace (%s)", path, workspaceDir)
+	path = expandTilde(path)
+
+	var raw string
+	if filepath.IsAbs(path) {
+		raw = filepath.Clean(path)
+	} else {
+		raw = filepath.Join(workspaceDir, path)
 	}
 
-	return abs, nil
+	abs, err := filepath.Abs(raw)
+	if err != nil {
+		return "", false, Errorf("failed to resolve path: %v", err)
+	}
+
+	return abs, strings.HasPrefix(abs, workspaceDir), nil
+}
+
+// checkExternalAccess handles confirmation for paths outside the workspace.
+// Returns resolved path and soft error string (empty if approved).
+func (foc *FileOpsConfig) checkExternalAccess(ctx context.Context, resolved, userPath string) (string, error) {
+	if foc.Confirmer == nil {
+		return "", Errorf("path %q is outside the workspace (%s)", userPath, foc.WorkspaceDir)
+	}
+
+	dir := filepath.Dir(resolved)
+
+	if foc.approvals.Check(dir) {
+		logger.Log.Debugf("[file_ops] auto-approved external dir %s (cached)", dir)
+		return resolved, nil
+	}
+
+	desc := fmt.Sprintf("⚠️ Access file outside workspace\nPath: %s", resolved)
+	approved, err := foc.Confirmer.Confirm(ctx, "", desc, foc.ConfirmTimeout)
+	if err != nil {
+		return "", Errorf("confirmation error for external path: %v", err)
+	}
+	if !approved {
+		return "", Errorf("access to %q denied by user", userPath)
+	}
+
+	foc.approvals.Record(dir)
+	return resolved, nil
+}
+
+// resolvAndCheck resolves a path and checks external access if needed.
+func (foc *FileOpsConfig) resolveAndCheck(ctx context.Context, path string) (string, error) {
+	resolved, inWorkspace, err := resolvePath(foc.WorkspaceDir, path)
+	if err != nil {
+		return "", err
+	}
+	if inWorkspace {
+		return resolved, nil
+	}
+	return foc.checkExternalAccess(ctx, resolved, path)
 }
 
 // NewReadFile returns a ToolFunc that reads a file within the workspace.
 // Supports optional offset (1-based line number) and limit (line count).
-func NewReadFile(workspaceDir string) ToolFunc {
-	absWorkspace, err := filepath.Abs(workspaceDir)
-	if err != nil {
-		absWorkspace = workspaceDir
-	}
-
+func NewReadFile(foc *FileOpsConfig) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
 			Path   string `json:"path"`
@@ -57,7 +125,7 @@ func NewReadFile(workspaceDir string) ToolFunc {
 			return "", Errorf("invalid arguments: %v", err)
 		}
 
-		resolved, err := validatePath(absWorkspace, req.Path)
+		resolved, err := foc.resolveAndCheck(ctx, req.Path)
 		if err != nil {
 			return "", err
 		}
@@ -124,12 +192,7 @@ func NewReadFile(workspaceDir string) ToolFunc {
 // NewWriteFile returns a ToolFunc that writes content to a file within the
 // workspace. Creates parent directories as needed. Writes atomically via
 // temp file + rename.
-func NewWriteFile(workspaceDir string) ToolFunc {
-	absWorkspace, err := filepath.Abs(workspaceDir)
-	if err != nil {
-		absWorkspace = workspaceDir
-	}
-
+func NewWriteFile(foc *FileOpsConfig) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
 			Path    string `json:"path"`
@@ -139,7 +202,7 @@ func NewWriteFile(workspaceDir string) ToolFunc {
 			return "", Errorf("invalid arguments: %v", err)
 		}
 
-		resolved, err := validatePath(absWorkspace, req.Path)
+		resolved, err := foc.resolveAndCheck(ctx, req.Path)
 		if err != nil {
 			return "", err
 		}
@@ -181,12 +244,7 @@ func NewWriteFile(workspaceDir string) ToolFunc {
 
 // NewListFiles returns a ToolFunc that lists files in a workspace directory.
 // Supports optional glob pattern filtering and recursive traversal.
-func NewListFiles(workspaceDir string) ToolFunc {
-	absWorkspace, err := filepath.Abs(workspaceDir)
-	if err != nil {
-		absWorkspace = workspaceDir
-	}
-
+func NewListFiles(foc *FileOpsConfig) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
 			Path      string `json:"path"`
@@ -197,7 +255,7 @@ func NewListFiles(workspaceDir string) ToolFunc {
 			return "", Errorf("invalid arguments: %v", err)
 		}
 
-		resolved, err := validatePath(absWorkspace, req.Path)
+		resolved, err := foc.resolveAndCheck(ctx, req.Path)
 		if err != nil {
 			return "", err
 		}
@@ -319,12 +377,7 @@ func NewListFiles(workspaceDir string) ToolFunc {
 // NewPatchFile returns a ToolFunc that performs a find-and-replace on a file
 // within the workspace. Fails if old_string is not found or matches more
 // than once (ambiguous).
-func NewPatchFile(workspaceDir string) ToolFunc {
-	absWorkspace, err := filepath.Abs(workspaceDir)
-	if err != nil {
-		absWorkspace = workspaceDir
-	}
-
+func NewPatchFile(foc *FileOpsConfig) ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
 			Path      string `json:"path"`
@@ -339,7 +392,7 @@ func NewPatchFile(workspaceDir string) ToolFunc {
 			return "", Errorf("old_string is required")
 		}
 
-		resolved, err := validatePath(absWorkspace, req.Path)
+		resolved, err := foc.resolveAndCheck(ctx, req.Path)
 		if err != nil {
 			return "", err
 		}

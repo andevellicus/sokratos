@@ -1,4 +1,4 @@
-package main
+package telegram
 
 import (
 	"encoding/json"
@@ -6,8 +6,6 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf16"
-
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 var (
@@ -303,49 +301,17 @@ type formattedMessage struct {
 }
 
 // formatReply builds a formattedMessage by converting Markdown to
-// plain text + Telegram entities. Thinking is logged server-side only.
+// plain text + Telegram entities.
 func formatReply(reply string) formattedMessage {
 	text, entities := mdToEntities(reply)
 	return formattedMessage{Text: text, Entities: entities}
 }
 
-// sendFormatted sends a formattedMessage via the Bot API using raw params
-// (bypassing the library's MessageEntity struct which lacks expandable_blockquote).
-// Falls back to plain text on error.
-func sendFormatted(bot *tgbotapi.BotAPI, chatID int64, replyTo int, fm formattedMessage) (tgbotapi.Message, error) {
-	params := tgbotapi.Params{
-		"chat_id": fmt.Sprintf("%d", chatID),
-		"text":    fm.Text,
+// marshalEntities serializes entities to JSON for the Bot API params.
+func marshalEntities(entities []telegramEntity) string {
+	if len(entities) == 0 {
+		return ""
 	}
-	if replyTo != 0 {
-		params["reply_to_message_id"] = fmt.Sprintf("%d", replyTo)
-	}
-	if len(fm.Entities) > 0 {
-		b, _ := json.Marshal(fm.Entities)
-		params["entities"] = string(b)
-	}
-	resp, err := bot.MakeRequest("sendMessage", params)
-	if err != nil {
-		return tgbotapi.Message{}, err
-	}
-	var msg tgbotapi.Message
-	if err := json.Unmarshal(resp.Result, &msg); err != nil {
-		return tgbotapi.Message{}, err
-	}
-	return msg, nil
-}
-
-// editFormatted edits an existing message with a formattedMessage using raw params.
-func editFormatted(bot *tgbotapi.BotAPI, chatID int64, msgID int, fm formattedMessage) error {
-	params := tgbotapi.Params{
-		"chat_id":    fmt.Sprintf("%d", chatID),
-		"message_id": fmt.Sprintf("%d", msgID),
-		"text":       fm.Text,
-	}
-	if len(fm.Entities) > 0 {
-		b, _ := json.Marshal(fm.Entities)
-		params["entities"] = string(b)
-	}
-	_, err := bot.MakeRequest("editMessageText", params)
-	return err
+	b, _ := json.Marshal(entities)
+	return string(b)
 }

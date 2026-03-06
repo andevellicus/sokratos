@@ -4,6 +4,7 @@
 declare const args: { count?: number; feed?: string; max_articles?: number };
 declare const skill_config: Record<string, any[]> | undefined;
 declare function http_request(method: string, url: string, headers: Record<string, string>, body: string): { status: number; body: string; headers: Record<string, string> };
+declare function http_batch(requests: { method: string; url: string; headers?: Record<string, string>; body?: string }[]): { status: number; body: string; headers: Record<string, string>; error?: string }[];
 declare function env(key: string): string | undefined;
 declare function kv_get(key: string): string | undefined;
 declare function kv_set(key: string, value: string): void;
@@ -66,6 +67,17 @@ interface FeedResult {
   error?: string;
 }
 
+// A pending fetch request: the URL to fetch + metadata needed to parse results.
+interface FetchJob {
+  feedName: string;
+  feedType: string;
+  url: string;
+  headers: Record<string, string>;
+  count: number;
+  // twitter-specific
+  twitterHandle?: string;
+}
+
 const cfg = skill_config || {};
 const rsshubBase: string = env("RSSHUB_URL") || "http://localhost:1200";
 const FETCH_MULTIPLIER = 4;
@@ -117,38 +129,18 @@ function saveSeen(feedName: string, seenList: string[]): void {
   kv_set(key, JSON.stringify(trimmed));
 }
 
-// --- RSSHub fetch ---
+// --- Parsing helpers (no HTTP, just parse response bodies) ---
 
-function fetchRsshub(route: string, count: number): RsshubItem[] {
-  let url = rsshubBase + route;
-  const sep = url.indexOf("?") === -1 ? "?" : "&";
-  url += sep + "limit=" + count + "&format=json";
-  const resp = http_request("GET", url, {}, "");
-  if (resp.status !== 200) {
-    console.warn("RSSHub fetch failed for " + route + ": status " + resp.status);
-    return [];
-  }
+function parseRsshubJson(body: string): RsshubItem[] {
   try {
-    const data = JSON.parse(resp.body);
+    const data = JSON.parse(body);
     return data.items || [];
   } catch (e) {
-    console.warn("RSSHub parse failed for " + route + ": " + e);
     return [];
   }
 }
 
-// --- Direct RSS/Atom fetch ---
-
-function fetchDirectRSS(feedUrl: string, count: number): ParsedItem[] {
-  const resp = http_request("GET", feedUrl, {
-    "User-Agent": "sokratos:feeds:v1.0 (personal assistant bot)",
-    "Accept": "application/rss+xml, application/atom+xml, application/xml",
-  }, "");
-  if (resp.status !== 200) {
-    console.warn("Direct RSS fetch failed for " + feedUrl + ": status " + resp.status);
-    return [];
-  }
-  const body = resp.body || "";
+function parseAtomOrRss(body: string, count: number): ParsedItem[] {
   const items: ParsedItem[] = [];
 
   if (body.indexOf("<entry>") !== -1 || body.indexOf("<entry ") !== -1) {
@@ -191,7 +183,27 @@ function fetchDirectRSS(feedUrl: string, count: number): ParsedItem[] {
   return items;
 }
 
-// --- Reddit fetch with backoff on 429 ---
+function parseRedditAtom(body: string, count: number): ParsedItem[] {
+  const entries = body.match(/<entry>[\s\S]*?<\/entry>/g) || [];
+  const items: ParsedItem[] = [];
+  for (let i = 0; i < entries.length && i < count; i++) {
+    const e = entries[i];
+    const titleMatch = e.match(/<title>([\s\S]*?)<\/title>/);
+    const linkMatch = e.match(/<link\s+href="([^"]+)"/);
+    const updatedMatch = e.match(/<updated>([\s\S]*?)<\/updated>/);
+    const contentMatch = e.match(/<content[^>]*>([\s\S]*?)<\/content>/);
+    items.push({
+      url: linkMatch ? linkMatch[1] : "",
+      title: titleMatch ? decodeXmlEntities(titleMatch[1]) : "",
+      summary: contentMatch ? stripHtml(decodeXmlEntities(contentMatch[1])) : "",
+      score: 0,
+      date: updatedMatch ? updatedMatch[1] : "",
+    });
+  }
+  return items;
+}
+
+// --- Reddit backoff ---
 
 const REDDIT_BACKOFF_MIN = 60 * 60 * 1000;
 const REDDIT_BACKOFF_MAX = 6 * 60 * 60 * 1000;
@@ -221,51 +233,10 @@ function clearRedditBackoff(subreddit: string): void {
   kv_delete(redditBackoffKey(subreddit));
 }
 
-function fetchRedditRSS(subreddit: string, sort: string, count: number): ParsedItem[] {
-  const url = "https://www.reddit.com/r/" + subreddit + "/" + sort + ".rss?limit=" + count;
-  const resp = http_request("GET", url, {
-    "User-Agent": "sokratos:feeds:v1.0 (personal assistant bot)",
-    "Accept": "application/atom+xml",
-  }, "");
-  if (resp.status === 429) {
-    setRedditBackoff(subreddit);
-    const bo = getRedditBackoff(subreddit)!;
-    const mins = Math.ceil(bo.wait / 60000);
-    console.warn("Reddit r/" + subreddit + " rate limited (429), backing off for " + mins + "m");
-    return [];
-  }
-  if (resp.status !== 200) {
-    console.warn("Reddit RSS fetch failed for r/" + subreddit + ": status " + resp.status);
-    return [];
-  }
-  clearRedditBackoff(subreddit);
-  const entries = resp.body.match(/<entry>[\s\S]*?<\/entry>/g) || [];
-  const items: ParsedItem[] = [];
-  for (let i = 0; i < entries.length && i < count; i++) {
-    const e = entries[i];
-    const titleMatch = e.match(/<title>([\s\S]*?)<\/title>/);
-    const linkMatch = e.match(/<link\s+href="([^"]+)"/);
-    const updatedMatch = e.match(/<updated>([\s\S]*?)<\/updated>/);
-    const contentMatch = e.match(/<content[^>]*>([\s\S]*?)<\/content>/);
-    items.push({
-      url: linkMatch ? linkMatch[1] : "",
-      title: titleMatch ? decodeXmlEntities(titleMatch[1]) : "",
-      summary: contentMatch ? stripHtml(decodeXmlEntities(contentMatch[1])) : "",
-      score: 0,
-      date: updatedMatch ? updatedMatch[1] : "",
-    });
-  }
-  return items;
-}
-
-function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem[] {
-  const backoff = getRedditBackoff(subreddit);
-  if (backoff && Date.now() < backoff.until) {
-    const minsLeft = Math.ceil((backoff.until - Date.now()) / 60000);
-    console.warn("Reddit r/" + subreddit + " on cooldown (" + minsLeft + "m remaining), skipping");
-    return [];
-  }
-  return fetchRedditRSS(subreddit, sort, count);
+function buildRsshubUrl(route: string, count: number): string {
+  let url = rsshubBase + route;
+  const sep = url.indexOf("?") === -1 ? "?" : "&";
+  return url + sep + "limit=" + count + "&format=json";
 }
 
 // ========================================================================
@@ -316,100 +287,206 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
   }
 
   // ========================================================================
-  // Step 1: Fetch all configured feeds
+  // Step 1: Build fetch jobs — collect all URLs needed across all feeds
   // ========================================================================
 
-  const allItems: FeedItem[] = [];
-  // Track new URLs per feed — deferred until after delegation so items
-  // the LLM never surfaces don't get permanently marked seen.
-  const pendingSeen: Record<string, { seenList: string[]; newUrls: string[] }> = {};
+  const fetchJobs: FetchJob[] = [];
 
   for (const feed of feeds) {
     const count = globalCount || feed.count || 5;
-    const seenList = loadSeen(feed.name);
-    const seenMap: Record<string, boolean> = {};
-    for (const s of seenList) seenMap[s] = true;
-    const newUrls: string[] = [];
-    pendingSeen[feed.name] = { seenList, newUrls };
-
-    function addItem(url: string, title: string, summary: string, source: string, date: string): boolean {
-      if (!url || seenMap[url]) return false;
-      if (isTooOld(date)) return false;
-      seenMap[url] = true;
-      newUrls.push(url);
-      allItems.push({
-        feed: feed.name,
-        category: feed.category || "unknown",
-        title: title || "",
-        link: url,
-        summary: summary || "",
-        source: source || extractDomain(url),
-        date: date || "",
-      });
-      return true;
-    }
 
     if (feed.type === "twitter") {
       const lists = feed.lists || [];
       const accounts = feed.accounts || [];
       const sources = lists.length + accounts.length;
       const perSource = sources > 0 ? Math.ceil(count / sources) : count;
-      let added = 0;
 
       for (const listId of lists) {
-        const items = fetchRsshub("/twitter/list/" + listId, perSource * FETCH_MULTIPLIER);
-        for (const it of items) {
-          if (added >= count) break;
-          const url = it.url || it.id || "";
-          const summary = it.content_text || stripHtml(it.content_html || "");
-          if (addItem(url, it.title || "", summary, "x.com", it.date_published || "")) added++;
-        }
+        fetchJobs.push({
+          feedName: feed.name,
+          feedType: "rsshub",
+          url: buildRsshubUrl("/twitter/list/" + listId, perSource * FETCH_MULTIPLIER),
+          headers: {},
+          count: count,
+          twitterHandle: undefined,
+        });
       }
-
       for (const acct of accounts) {
         const handle = acct.replace(/^@/, "");
-        const items = fetchRsshub("/twitter/user/" + handle, perSource * FETCH_MULTIPLIER);
-        for (const it of items) {
-          if (added >= count) break;
-          const url = it.url || it.id || "";
-          const summary = it.content_text || stripHtml(it.content_html || "");
-          if (addItem(url, "@" + handle + ": " + (it.title || ""), summary, "x.com", it.date_published || "")) added++;
-        }
+        fetchJobs.push({
+          feedName: feed.name,
+          feedType: "rsshub",
+          url: buildRsshubUrl("/twitter/user/" + handle, perSource * FETCH_MULTIPLIER),
+          headers: {},
+          count: count,
+          twitterHandle: handle,
+        });
       }
 
     } else if (feed.type === "reddit") {
-      const items = fetchReddit(feed.subreddit || "", feed.sort || "hot", count * FETCH_MULTIPLIER);
-      let added = 0;
-      for (const it of items) {
-        if (added >= count) break;
-        if (addItem(it.url, it.title, it.summary, "reddit.com", it.date)) added++;
+      const subreddit = feed.subreddit || "";
+      const backoff = getRedditBackoff(subreddit);
+      if (backoff && Date.now() < backoff.until) {
+        const minsLeft = Math.ceil((backoff.until - Date.now()) / 60000);
+        console.warn("Reddit r/" + subreddit + " on cooldown (" + minsLeft + "m remaining), skipping");
+        continue;
       }
+      fetchJobs.push({
+        feedName: feed.name,
+        feedType: "reddit",
+        url: "https://www.reddit.com/r/" + subreddit + "/" + (feed.sort || "hot") + ".rss?limit=" + (count * FETCH_MULTIPLIER),
+        headers: {
+          "User-Agent": "sokratos:feeds:v1.0 (personal assistant bot)",
+          "Accept": "application/atom+xml",
+        },
+        count: count,
+      });
 
     } else if (feed.type === "rsshub") {
-      const items = fetchRsshub(feed.route!, count * FETCH_MULTIPLIER);
-      let added = 0;
-      for (const it of items) {
-        if (added >= count) break;
-        const url = it.url || it.id || "";
-        const summary = it.content_text || stripHtml(it.content_html || "");
-        if (addItem(url, it.title || "", summary, extractDomain(url), it.date_published || "")) added++;
-      }
+      fetchJobs.push({
+        feedName: feed.name,
+        feedType: "rsshub",
+        url: buildRsshubUrl(feed.route!, count * FETCH_MULTIPLIER),
+        headers: {},
+        count: count,
+      });
 
     } else if (feed.type === "rss") {
-      const items = fetchDirectRSS(feed.url!, count * FETCH_MULTIPLIER);
-      let added = 0;
-      for (const it of items) {
-        if (added >= count) break;
-        if (addItem(it.url, it.title, it.summary, extractDomain(it.url), it.date)) added++;
-      }
+      fetchJobs.push({
+        feedName: feed.name,
+        feedType: "rss",
+        url: feed.url!,
+        headers: {
+          "User-Agent": "sokratos:feeds:v1.0 (personal assistant bot)",
+          "Accept": "application/rss+xml, application/atom+xml, application/xml",
+        },
+        count: count * FETCH_MULTIPLIER,
+      });
+    }
+  }
+
+  // ========================================================================
+  // Step 2: Batch-fetch all URLs in parallel
+  // ========================================================================
+
+  const batchRequests = fetchJobs.map(j => ({
+    method: "GET",
+    url: j.url,
+    headers: j.headers,
+  }));
+
+  const batchResponses = batchRequests.length > 0 ? http_batch(batchRequests) : [];
+
+  // ========================================================================
+  // Step 3: Parse responses and build items per feed
+  // ========================================================================
+
+  const allItems: FeedItem[] = [];
+  const pendingSeen: Record<string, { seenList: string[]; newUrls: string[] }> = {};
+
+  // Pre-load seen lists.
+  for (const feed of feeds) {
+    if (!pendingSeen[feed.name]) {
+      const seenList = loadSeen(feed.name);
+      pendingSeen[feed.name] = { seenList, newUrls: [] };
+    }
+  }
+
+  // Track added count per feed name for twitter multi-source feeds.
+  const feedAdded: Record<string, number> = {};
+  const feedMaxCount: Record<string, number> = {};
+  for (const feed of feeds) {
+    feedMaxCount[feed.name] = globalCount || feed.count || 5;
+    feedAdded[feed.name] = 0;
+  }
+
+  for (let i = 0; i < fetchJobs.length; i++) {
+    const job = fetchJobs[i];
+    const resp = batchResponses[i];
+    const maxCount = feedMaxCount[job.feedName] || 5;
+    const ps = pendingSeen[job.feedName];
+    const seenMap: Record<string, boolean> = {};
+    for (const s of ps.seenList) seenMap[s] = true;
+    // Also mark already-added URLs as seen (for multi-source feeds like twitter).
+    for (const u of ps.newUrls) seenMap[u] = true;
+
+    function addItem(url: string, title: string, summary: string, source: string, date: string): boolean {
+      if (feedAdded[job.feedName] >= maxCount) return false;
+      if (!url || seenMap[url]) return false;
+      if (isTooOld(date)) return false;
+      seenMap[url] = true;
+      ps.newUrls.push(url);
+      allItems.push({
+        feed: job.feedName,
+        category: feeds.find(f => f.name === job.feedName)?.category || "unknown",
+        title: title || "",
+        link: url,
+        summary: summary || "",
+        source: source || extractDomain(url),
+        date: date || "",
+      });
+      feedAdded[job.feedName]++;
+      return true;
     }
 
+    if (resp.error) {
+      console.warn("Fetch failed for " + job.url + ": " + resp.error);
+      continue;
+    }
+
+    if (job.feedType === "reddit") {
+      if (resp.status === 429) {
+        // Extract subreddit from URL for backoff.
+        const subMatch = job.url.match(/\/r\/([^\/]+)/);
+        if (subMatch) {
+          setRedditBackoff(subMatch[1]);
+          console.warn("Reddit r/" + subMatch[1] + " rate limited (429), backing off");
+        }
+        continue;
+      }
+      if (resp.status !== 200) {
+        console.warn("Reddit fetch failed: status " + resp.status);
+        continue;
+      }
+      // Clear backoff on success.
+      const subMatch = job.url.match(/\/r\/([^\/]+)/);
+      if (subMatch) clearRedditBackoff(subMatch[1]);
+
+      const items = parseRedditAtom(resp.body, job.count);
+      for (const it of items) {
+        addItem(it.url, it.title, it.summary, "reddit.com", it.date);
+      }
+
+    } else if (job.feedType === "rsshub") {
+      if (resp.status !== 200) {
+        console.warn("RSSHub fetch failed for " + job.url + ": status " + resp.status);
+        continue;
+      }
+      const items = parseRsshubJson(resp.body);
+      for (const it of items) {
+        const url = it.url || it.id || "";
+        const summary = it.content_text || stripHtml(it.content_html || "");
+        const titlePrefix = job.twitterHandle ? "@" + job.twitterHandle + ": " : "";
+        const source = job.twitterHandle ? "x.com" : extractDomain(url);
+        addItem(url, titlePrefix + (it.title || ""), summary, source, it.date_published || "");
+      }
+
+    } else if (job.feedType === "rss") {
+      if (resp.status !== 200) {
+        console.warn("RSS fetch failed for " + job.url + ": status " + resp.status);
+        continue;
+      }
+      const items = parseAtomOrRss(resp.body, job.count);
+      for (const it of items) {
+        addItem(it.url, it.title, it.summary, extractDomain(it.url), it.date);
+      }
+    }
   }
 
   if (allItems.length === 0) return JSON.stringify({ count: 0, sources: [] });
 
   // ========================================================================
-  // Step 2: Group items by feed name
+  // Step 4: Group items by feed name
   // ========================================================================
 
   const groups: Record<string, FeedItem[]> = {};
@@ -424,7 +501,7 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
   }
 
   // ========================================================================
-  // Step 3: Build delegation tasks — one per feed group
+  // Step 5: Build delegation tasks — one per feed group
   // ========================================================================
 
   const tasks: { directive: string; context: string }[] = [];
@@ -445,13 +522,13 @@ function fetchReddit(subreddit: string, sort: string, count: number): ParsedItem
   }
 
   // ========================================================================
-  // Step 4: Fan out with delegate_batch for parallel reading
+  // Step 6: Fan out with delegate_batch for parallel reading
   // ========================================================================
 
   const results = delegate_batch(tasks);
 
   // ========================================================================
-  // Step 5: Collect results
+  // Step 7: Collect results
   // ========================================================================
 
   const feedResults: FeedResult[] = [];

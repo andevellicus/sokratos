@@ -264,3 +264,15 @@ CREATE TABLE IF NOT EXISTS adaptive_params (
     reason TEXT,
     updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Observability metrics: buffered event store for slot contention, latency, dispatch decisions.
+CREATE TABLE IF NOT EXISTS metrics (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+    name VARCHAR(80) NOT NULL,
+    value FLOAT NOT NULL DEFAULT 1,
+    dims JSONB
+);
+CREATE INDEX IF NOT EXISTS metrics_ts_idx ON metrics (ts DESC);
+CREATE INDEX IF NOT EXISTS metrics_name_ts_idx ON metrics (name, ts DESC);
+CREATE INDEX IF NOT EXISTS metrics_dims_idx ON metrics USING gin (dims);

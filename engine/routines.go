@@ -63,6 +63,7 @@ func (e *Engine) executeDueRoutines() {
 // is skipped entirely. Execution is tracked via WorkMonitor and bounded by
 // RoutineTimeout.
 func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
+	routineStart := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Log.Errorf("routine-scheduler: panic, name=%s, err=%v", d.Name, r)
@@ -137,6 +138,7 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 		// If silent_if_empty and ALL actions returned empty, skip orchestrator.
 		if d.SilentIfEmpty && !anyNonEmpty {
 			logger.Log.Infof("routine-scheduler: %s: all actions returned empty, skipping (silent)", d.Name)
+			e.Metrics.Since("routine.exec", routineStart, map[string]string{"name": d.Name, "result": "skipped"})
 			return
 		}
 
@@ -175,6 +177,7 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 
 	if err != nil {
 		logger.Log.Warnf("routine-scheduler: routine failed, name=%s, err=%v", d.Name, err)
+		e.Metrics.Since("routine.exec", routineStart, map[string]string{"name": d.Name, "result": "error"})
 		return
 	}
 
@@ -194,4 +197,5 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 		logger.Log.Infof("routine-scheduler: %q executed (no user-facing output)", d.Name)
 		e.recordAction("routine", fmt.Sprintf("Executed %q (silent)", d.Name))
 	}
+	e.Metrics.Since("routine.exec", routineStart, map[string]string{"name": d.Name, "result": "ok"})
 }

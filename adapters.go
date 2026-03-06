@@ -4,34 +4,21 @@ import (
 	"context"
 	"fmt"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-
 	"sokratos/engine"
 	"sokratos/llm"
-	"sokratos/logger"
+	"sokratos/platform"
 )
 
 // --- Interface Adapters ---
 
-// notifierAdapter implements engine.Notifier by sending messages to all allowed
-// Telegram user IDs with HTML formatting and fallback to plain text.
+// notifierAdapter implements engine.Notifier by broadcasting messages to all
+// allowed recipients via the platform sender.
 type notifierAdapter struct {
-	bot        *tgbotapi.BotAPI
-	allowedIDs map[int64]struct{}
+	sender platform.Sender
 }
 
 func (n *notifierAdapter) Send(text string) {
-	for id := range n.allowedIDs {
-		msg := tgbotapi.NewMessage(id, mdToTelegramHTML(text))
-		msg.ParseMode = tgbotapi.ModeHTML
-		if _, err := n.bot.Send(msg); err != nil {
-			msg.Text = text
-			msg.ParseMode = ""
-			if _, err := n.bot.Send(msg); err != nil {
-				logger.Log.Errorf("Failed to send scheduled message to %d: %v", id, err)
-			}
-		}
-	}
+	n.sender.Broadcast(context.Background(), text)
 }
 
 // hotReloader implements engine.HotReloader.
@@ -87,3 +74,8 @@ func (r *reflectionSinkAdapter) InjectReflection(summary string) {
 		Content: "[REFLECTION] A pattern was identified from recent memories:\n" + summary + "\nUse this if relevant to future interactions.",
 	})
 }
+
+// Compile-time interface checks.
+var _ engine.Notifier           = (*notifierAdapter)(nil)
+var _ engine.CognitiveServices  = (*cognitiveAdapter)(nil)
+var _ engine.ReflectionSink     = (*reflectionSinkAdapter)(nil)

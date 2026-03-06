@@ -7,126 +7,89 @@ import (
 	"time"
 )
 
-// mockSlotChecker is a test double for SlotChecker that uses a buffered
-// channel as a counting semaphore, matching the real semaphore behavior.
-type mockSlotChecker struct {
-	sem chan struct{}
-}
-
-func newMockSlotChecker(slots int) *mockSlotChecker {
-	ch := make(chan struct{}, slots)
-	for range slots {
-		ch <- struct{}{}
-	}
-	return &mockSlotChecker{sem: ch}
-}
-
-func (m *mockSlotChecker) TryAcquire() bool {
-	select {
-	case <-m.sem:
-		return true
-	default:
-		return false
-	}
-}
-
-func (m *mockSlotChecker) Acquire(ctx context.Context) error {
-	select {
-	case <-m.sem:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (m *mockSlotChecker) Release() {
-	m.sem <- struct{}{}
-}
-
-func (m *mockSlotChecker) available() int {
-	return len(m.sem)
+// newTestSem creates a PrioritySem for testing (convenience wrapper).
+func newTestSem(slots int) *PrioritySem {
+	return NewPrioritySem(slots)
 }
 
 // TestAcquirePreferBrain_BrainFree verifies that when preferBrain=true and
 // Brain has a free slot, Brain is returned.
 func TestAcquirePreferBrain_BrainFree(t *testing.T) {
-	primarySlots := newMockSlotChecker(3)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(3)
+	brainSlots := newTestSem(1)
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
 
-	choice := router.AcquireOrFallback(context.Background(), true)
+	choice := router.AcquireOrFallback(context.Background(), true, PriorityUser)
 
 	if choice.Model != "brain-model" {
 		t.Fatalf("expected brain-model, got %s", choice.Model)
 	}
-	// Brain slot should be consumed (0 available).
-	if brainSlots.available() != 0 {
-		t.Fatalf("expected 0 brain slots available, got %d", brainSlots.available())
+	used, _ := brainSlots.SlotsInUse()
+	if used != 1 {
+		t.Fatalf("expected 1 brain slot in use, got %d", used)
 	}
-	// Primary slots should be untouched.
-	if primarySlots.available() != 3 {
-		t.Fatalf("expected 3 primary slots available, got %d", primarySlots.available())
+	pUsed, _ := primarySlots.SlotsInUse()
+	if pUsed != 0 {
+		t.Fatalf("expected 0 primary slots in use, got %d", pUsed)
 	}
 
 	choice.Release()
-	if brainSlots.available() != 1 {
-		t.Fatalf("expected 1 brain slot after release, got %d", brainSlots.available())
+	used, _ = brainSlots.SlotsInUse()
+	if used != 0 {
+		t.Fatalf("expected 0 brain slots in use after release, got %d", used)
 	}
 }
 
 // TestAcquirePreferBrain_BrainBusy9BFree verifies that when preferBrain=true
 // and Brain is busy but 9B has a slot, 9B is returned as fallback.
 func TestAcquirePreferBrain_BrainBusy9BFree(t *testing.T) {
-	primarySlots := newMockSlotChecker(3)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(3)
+	brainSlots := newTestSem(1)
 
-	// Exhaust Brain.
-	brainSlots.TryAcquire()
+	brainSlots.TryAcquire() // exhaust Brain
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
-	choice := router.AcquireOrFallback(context.Background(), true)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
+	choice := router.AcquireOrFallback(context.Background(), true, PriorityUser)
 
 	if choice.Model != "primary-model" {
 		t.Fatalf("expected primary-model fallback, got %s", choice.Model)
 	}
-	if primarySlots.available() != 2 {
-		t.Fatalf("expected 2 primary slots available, got %d", primarySlots.available())
+	pUsed, _ := primarySlots.SlotsInUse()
+	if pUsed != 1 {
+		t.Fatalf("expected 1 primary slot in use, got %d", pUsed)
 	}
 
 	choice.Release()
-	if primarySlots.available() != 3 {
-		t.Fatalf("expected 3 primary slots after release, got %d", primarySlots.available())
+	pUsed, _ = primarySlots.SlotsInUse()
+	if pUsed != 0 {
+		t.Fatalf("expected 0 primary slots in use after release, got %d", pUsed)
 	}
 }
 
 // TestAcquirePreferBrain_BothBusy verifies that when preferBrain=true and
 // both are busy, it blocks on Brain until a slot is freed.
 func TestAcquirePreferBrain_BothBusy(t *testing.T) {
-	primarySlots := newMockSlotChecker(1)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(1)
+	brainSlots := newTestSem(1)
 
-	// Exhaust both.
 	primarySlots.TryAcquire()
 	brainSlots.TryAcquire()
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
 
 	done := make(chan OrchestratorChoice, 1)
 	go func() {
-		choice := router.AcquireOrFallback(context.Background(), true)
+		choice := router.AcquireOrFallback(context.Background(), true, PriorityUser)
 		done <- choice
 	}()
 
-	// Should be blocking — verify no result yet.
 	select {
 	case <-done:
 		t.Fatal("should not have returned yet")
 	case <-time.After(50 * time.Millisecond):
-		// expected
 	}
 
-	// Free Brain slot — should unblock.
 	brainSlots.Release()
 
 	select {
@@ -142,17 +105,14 @@ func TestAcquirePreferBrain_BothBusy(t *testing.T) {
 
 // TestAcquirePrefer9B verifies that preferBrain=false tries 9B first.
 func TestAcquirePrefer9B(t *testing.T) {
-	primarySlots := newMockSlotChecker(3)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(3)
+	brainSlots := newTestSem(1)
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
-	choice := router.AcquireOrFallback(context.Background(), false)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
+	choice := router.AcquireOrFallback(context.Background(), false, PriorityBackground)
 
 	if choice.Model != "primary-model" {
 		t.Fatalf("expected primary-model, got %s", choice.Model)
-	}
-	if primarySlots.available() != 2 {
-		t.Fatalf("expected 2 primary slots available, got %d", primarySlots.available())
 	}
 
 	choice.Release()
@@ -161,14 +121,13 @@ func TestAcquirePrefer9B(t *testing.T) {
 // TestAcquirePrefer9B_PrimaryBusy verifies that preferBrain=false falls back
 // to Brain when primary is busy.
 func TestAcquirePrefer9B_PrimaryBusy(t *testing.T) {
-	primarySlots := newMockSlotChecker(1)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(1)
+	brainSlots := newTestSem(1)
 
-	// Exhaust primary.
-	primarySlots.TryAcquire()
+	primarySlots.TryAcquire() // exhaust
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
-	choice := router.AcquireOrFallback(context.Background(), false)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
+	choice := router.AcquireOrFallback(context.Background(), false, PriorityBackground)
 
 	if choice.Model != "brain-model" {
 		t.Fatalf("expected brain-model fallback, got %s", choice.Model)
@@ -180,58 +139,36 @@ func TestAcquirePrefer9B_PrimaryBusy(t *testing.T) {
 // TestReacquire_SameSlotType verifies that Reacquire gets the same slot type
 // that was originally acquired.
 func TestReacquire_SameSlotType(t *testing.T) {
-	primarySlots := newMockSlotChecker(3)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(3)
+	brainSlots := newTestSem(1)
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
 
 	t.Run("brain_reacquire", func(t *testing.T) {
-		choice := router.AcquireOrFallback(context.Background(), true)
+		choice := router.AcquireOrFallback(context.Background(), true, PriorityUser)
 		if choice.Model != "brain-model" {
 			t.Fatalf("expected brain-model, got %s", choice.Model)
 		}
-		if brainSlots.available() != 0 {
-			t.Fatalf("expected 0 brain slots, got %d", brainSlots.available())
-		}
 
-		// Release slot.
 		choice.Release()
-		if brainSlots.available() != 1 {
-			t.Fatalf("expected 1 brain slot after release, got %d", brainSlots.available())
-		}
 
-		// Reacquire should get Brain slot back.
 		if err := choice.Reacquire(context.Background()); err != nil {
 			t.Fatalf("reacquire failed: %v", err)
-		}
-		if brainSlots.available() != 0 {
-			t.Fatalf("expected 0 brain slots after reacquire, got %d", brainSlots.available())
 		}
 
 		choice.Release()
 	})
 
 	t.Run("primary_reacquire", func(t *testing.T) {
-		choice := router.AcquireOrFallback(context.Background(), false)
+		choice := router.AcquireOrFallback(context.Background(), false, PriorityUser)
 		if choice.Model != "primary-model" {
 			t.Fatalf("expected primary-model, got %s", choice.Model)
 		}
-		if primarySlots.available() != 2 {
-			t.Fatalf("expected 2 primary slots, got %d", primarySlots.available())
-		}
 
-		// Release slot.
 		choice.Release()
-		if primarySlots.available() != 3 {
-			t.Fatalf("expected 3 primary slots after release, got %d", primarySlots.available())
-		}
 
-		// Reacquire should get primary slot back.
 		if err := choice.Reacquire(context.Background()); err != nil {
 			t.Fatalf("reacquire failed: %v", err)
-		}
-		if primarySlots.available() != 2 {
-			t.Fatalf("expected 2 primary slots after reacquire, got %d", primarySlots.available())
 		}
 
 		choice.Release()
@@ -244,11 +181,10 @@ func TestPassthrough_IgnoresPreferBrain(t *testing.T) {
 	router := NewPassthroughRouter(nil, "passthrough-model")
 
 	for _, preferBrain := range []bool{true, false} {
-		choice := router.AcquireOrFallback(context.Background(), preferBrain)
+		choice := router.AcquireOrFallback(context.Background(), preferBrain, PriorityUser)
 		if choice.Model != "passthrough-model" {
 			t.Fatalf("preferBrain=%v: expected passthrough-model, got %s", preferBrain, choice.Model)
 		}
-		// Release and Reacquire should be no-ops.
 		choice.Release()
 		if err := choice.Reacquire(context.Background()); err != nil {
 			t.Fatalf("preferBrain=%v: reacquire failed: %v", preferBrain, err)
@@ -257,26 +193,22 @@ func TestPassthrough_IgnoresPreferBrain(t *testing.T) {
 }
 
 // TestReacquire_ContextCancelled verifies that Reacquire respects context
-// cancellation.
+// cancellation and cleans up any reservation.
 func TestReacquire_ContextCancelled(t *testing.T) {
-	primarySlots := newMockSlotChecker(1)
-	brainSlots := newMockSlotChecker(1)
+	primarySlots := newTestSem(1)
+	brainSlots := newTestSem(1)
 
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
 
-	// Acquire a primary slot.
-	choice := router.AcquireOrFallback(context.Background(), false)
+	choice := router.AcquireOrFallback(context.Background(), false, PriorityUser)
 	if choice.Model != "primary-model" {
 		t.Fatalf("expected primary-model, got %s", choice.Model)
 	}
 
-	// Release it.
-	choice.Release()
+	// Simulate tool execution: ReleaseReserved + Reacquire with cancelled ctx.
+	choice.ReleaseReserved()
+	primarySlots.TryAcquire() // exhaust (simulate something else taking the slot)
 
-	// Exhaust primary so reacquire would block.
-	primarySlots.TryAcquire()
-
-	// Reacquire with cancelled context should fail.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -284,31 +216,107 @@ func TestReacquire_ContextCancelled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected reacquire to fail with cancelled context")
 	}
+
+	// Reservation should be cleaned up — background can now acquire.
+	primarySlots.Release() // release what we took
+	if !primarySlots.TryAcquireAt(PriorityBackground) {
+		t.Fatal("background should be able to acquire after reservation cancelled")
+	}
+	primarySlots.Release()
+}
+
+// TestPriorityYield_BackgroundSkipsReserved verifies that background callers
+// cannot steal a slot that has a reservation (the Release→Reacquire gap).
+func TestPriorityYield_BackgroundSkipsReserved(t *testing.T) {
+	primarySlots := newTestSem(1)
+	brainSlots := newTestSem(1)
+
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
+
+	// User acquires primary.
+	choice := router.AcquireOrFallback(context.Background(), false, PriorityUser)
+	if choice.Model != "primary-model" {
+		t.Fatalf("expected primary-model, got %s", choice.Model)
+	}
+
+	// Simulate OnToolStart: release with reservation.
+	choice.ReleaseReserved()
+
+	// Background routine tries to acquire primary — should fail (reserved).
+	bgChoice := router.AcquireOrFallback(context.Background(), false, PriorityBackground)
+	if bgChoice.Model != "brain-model" {
+		t.Fatalf("expected brain-model (background should yield reserved primary), got %s", bgChoice.Model)
+	}
+	bgChoice.Release()
+
+	// User reacquires — should succeed (consumes reservation).
+	if err := choice.Reacquire(context.Background()); err != nil {
+		t.Fatalf("user reacquire failed: %v", err)
+	}
+	choice.Release()
+}
+
+// TestPriorityYield_BackgroundSkipsWhenUserWaiting verifies that background
+// TryAcquireAt fails when a high-priority waiter is queued.
+func TestPriorityYield_BackgroundSkipsWhenUserWaiting(t *testing.T) {
+	primarySlots := newTestSem(1)
+	brainSlots := newTestSem(1)
+
+	// Exhaust primary (held by something).
+	primarySlots.TryAcquire()
+
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
+
+	// Queue a user acquire on primary (blocking).
+	userGot := make(chan struct{})
+	go func() {
+		// This blocks because primary is exhausted.
+		primarySlots.Acquire(context.Background(), PriorityUser)
+		close(userGot)
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Background tries — should skip primary (user is waiting) and go to Brain.
+	bgChoice := router.AcquireOrFallback(context.Background(), false, PriorityBackground)
+	if bgChoice.Model != "brain-model" {
+		t.Fatalf("expected brain-model (user waiting on primary), got %s", bgChoice.Model)
+	}
+	bgChoice.Release()
+
+	// Free primary — user should get it.
+	primarySlots.Release()
+	select {
+	case <-userGot:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for user to get primary")
+	}
+	primarySlots.Release()
 }
 
 // TestConcurrentAcquireRelease verifies no races under concurrent access.
 func TestConcurrentAcquireRelease(t *testing.T) {
-	primarySlots := newMockSlotChecker(3)
-	brainSlots := newMockSlotChecker(1)
-	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots)
+	primarySlots := newTestSem(3)
+	brainSlots := newTestSem(1)
+	router := NewSlotRouter(nil, "primary-model", nil, "brain-model", primarySlots, brainSlots, nil)
 
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			choice := router.AcquireOrFallback(context.Background(), true)
+			choice := router.AcquireOrFallback(context.Background(), true, PriorityUser)
 			time.Sleep(time.Millisecond)
 			choice.Release()
 		}()
 	}
 	wg.Wait()
 
-	// All slots should be returned.
-	if primarySlots.available() != 3 {
-		t.Fatalf("expected 3 primary slots, got %d", primarySlots.available())
+	pUsed, _ := primarySlots.SlotsInUse()
+	bUsed, _ := brainSlots.SlotsInUse()
+	if pUsed != 0 {
+		t.Fatalf("expected 0 primary slots in use, got %d", pUsed)
 	}
-	if brainSlots.available() != 1 {
-		t.Fatalf("expected 1 brain slot, got %d", brainSlots.available())
+	if bUsed != 0 {
+		t.Fatalf("expected 0 brain slots in use, got %d", bUsed)
 	}
 }

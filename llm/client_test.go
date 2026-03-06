@@ -152,6 +152,143 @@ func TestExtractToolIntent(t *testing.T) {
 	}
 }
 
+func TestExtractBareToolTag(t *testing.T) {
+	// Mock tool checker that recognizes common tools.
+	knownTools := map[string]bool{
+		"run_command":     true,
+		"search_web":     true,
+		"search_memory":  true,
+		"save_memory":    true,
+		"search_email":   true,
+		"search_calendar": true,
+		"get_weather":    true,
+	}
+	isKnown := func(name string) bool { return knownTools[name] }
+
+	tests := []struct {
+		name   string
+		input  string
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "run_command with key:value",
+			input:  `<run_command>command: ls -t ~/code/go/tychora/logs | head -n 1</run_command>`,
+			want:   `run_command: {"command": "ls -t ~/code/go/tychora/logs | head -n 1"}`,
+			wantOK: true,
+		},
+		{
+			name:   "search_web with JSON content",
+			input:  `<search_web>{"query": "golang testing"}</search_web>`,
+			want:   `search_web: {"query": "golang testing"}`,
+			wantOK: true,
+		},
+		{
+			name:   "non-tool tag rejected by blocklist",
+			input:  `<think>I should search for this</think>`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "memory tag rejected by blocklist",
+			input:  `<memory>some content</memory>`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "uppercase tag not matched by regex",
+			input:  `<TOOL_INTENT>search_web: {}</TOOL_INTENT>`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "surrounding prose",
+			input:  `Let me check. <run_command>command: ls</run_command> Done.`,
+			want:   `run_command: {"command": "ls"}`,
+			wantOK: true,
+		},
+		{
+			name:   "no content or colon",
+			input:  `<run_command>no colon here</run_command>`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "unknown tool rejected by registry check",
+			input:  `<unknown_tool>arg: value</unknown_tool>`,
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "nil isKnownTool still blocks non-tool tags",
+			input:  `<think>reasoning</think>`,
+			want:   "",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checker := isKnown
+			if tt.name == "nil isKnownTool still blocks non-tool tags" {
+				checker = nil
+			}
+			got, ok := extractBareToolTag(tt.input, checker)
+			if ok != tt.wantOK {
+				t.Fatalf("extractBareToolTag() ok = %v, wantOK %v (got %q)", ok, tt.wantOK, got)
+			}
+			if got != tt.want {
+				t.Errorf("extractBareToolTag() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSupervisorParser_BareTag(t *testing.T) {
+	// End-to-end: SupervisorParser with IsKnownTool should parse a bare tool tag.
+	isKnown := func(name string) bool { return name == "run_command" }
+	p := SupervisorParser{IsKnownTool: isKnown}
+	pr := p.Parse(`<run_command>command: echo hello</run_command>`)
+	if !pr.Found {
+		t.Fatal("expected Found=true")
+	}
+	if pr.Error != "" {
+		t.Fatalf("unexpected error: %s", pr.Error)
+	}
+	if pr.ToolCallJSON == "" {
+		t.Fatal("expected non-empty ToolCallJSON")
+	}
+
+	var tc struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal([]byte(pr.ToolCallJSON), &tc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if tc.Name != "run_command" {
+		t.Errorf("expected name=run_command, got %q", tc.Name)
+	}
+	var args struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(tc.Arguments, &args); err != nil {
+		t.Fatalf("unmarshal args: %v", err)
+	}
+	if args.Command != "echo hello" {
+		t.Errorf("expected command='echo hello', got %q", args.Command)
+	}
+}
+
+func TestSupervisorParser_BareTagIgnoredWithoutChecker(t *testing.T) {
+	// Without IsKnownTool, bare tags should NOT be recovered.
+	p := SupervisorParser{}
+	pr := p.Parse(`<run_command>command: echo hello</run_command>`)
+	if pr.Found {
+		t.Error("expected Found=false without IsKnownTool")
+	}
+}
+
 func TestParseToolIntent_PreservesArgumentTypes(t *testing.T) {
 	// The key property: parseToolIntent uses json.RawMessage so it
 	// never deserializes/re-serializes the args. Whatever JSON the

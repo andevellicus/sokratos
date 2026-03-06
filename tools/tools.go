@@ -64,6 +64,13 @@ type ToolSchema struct {
 	Params      []ParamSchema
 	Description string
 	IsSkill     bool // true for user-created JS skills
+
+	// ConfirmFormat builds a human-readable confirmation prompt for this tool.
+	// nil → generic "Execute <name>?" fallback.
+	ConfirmFormat func(args json.RawMessage) string
+	// ConfirmCacheKey builds a cache key that identifies the specific action
+	// being approved (e.g. recipient+subject for send_email). nil → tool name only.
+	ConfirmCacheKey func(args json.RawMessage) string
 }
 
 // Registry maps tool names to their implementations and optional schemas.

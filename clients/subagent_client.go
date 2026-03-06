@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"sokratos/engine"
 	"sokratos/httputil"
 	"sokratos/memory"
 	"sokratos/timeouts"
@@ -18,7 +19,7 @@ import (
 // into inference time.
 type SubagentClient struct {
 	baseClient
-	sem chan struct{}
+	sem *engine.PrioritySem
 	wq  *WorkQueue
 }
 
@@ -38,7 +39,7 @@ func NewSubagentClientNamed(name, url, model string, slots int) *SubagentClient 
 			cb:     newCircuitBreaker(name),
 			logTag: "[" + name + "]",
 		},
-		sem: make(chan struct{}, slots),
+		sem: engine.NewPrioritySem(slots),
 	}
 	sc.wq = NewWorkQueue(64, slots, sc.logTag, func(ctx context.Context, req memory.WorkRequest) (string, error) {
 		return sc.exec(ctx, requestOpts{
@@ -50,52 +51,61 @@ func NewSubagentClientNamed(name, url, model string, slots int) *SubagentClient 
 }
 
 // acquire blocks until a semaphore slot is available or ctx is cancelled.
+// Internal methods always use PriorityBackground.
 func (sc *SubagentClient) acquire(ctx context.Context) error {
-	select {
-	case sc.sem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return sc.sem.Acquire(ctx, engine.PriorityBackground)
 }
 
 // release frees a semaphore slot.
 func (sc *SubagentClient) release() {
-	<-sc.sem
+	sc.sem.Release()
 }
 
 // tryAcquire attempts to acquire a semaphore slot without blocking. Returns
 // false immediately if all slots are occupied.
 func (sc *SubagentClient) tryAcquire() bool {
-	select {
-	case sc.sem <- struct{}{}:
-		return true
-	default:
-		return false
-	}
+	return sc.sem.TryAcquireAt(engine.PriorityBackground)
 }
 
 // SlotsInUse returns the number of currently occupied semaphore slots and the
 // total capacity. Useful for logging and diagnostics.
 func (sc *SubagentClient) SlotsInUse() (used, total int) {
-	return len(sc.sem), cap(sc.sem)
+	return sc.sem.SlotsInUse()
 }
 
 // Acquire blocks until a semaphore slot is available or ctx is cancelled.
-// Exported for the slot router to reserve a slot for orchestrator fallback.
-func (sc *SubagentClient) Acquire(ctx context.Context) error {
-	return sc.acquire(ctx)
+// Exported for the slot router (SlotChecker interface).
+func (sc *SubagentClient) Acquire(ctx context.Context, pri engine.Priority) error {
+	return sc.sem.Acquire(ctx, pri)
 }
 
 // TryAcquire attempts to acquire a semaphore slot without blocking.
-// Exported for the slot router.
+// Exported for the slot router (SlotChecker interface).
 func (sc *SubagentClient) TryAcquire() bool {
-	return sc.tryAcquire()
+	return sc.sem.TryAcquire()
 }
 
-// Release frees a semaphore slot. Exported for the slot router.
+// TryAcquireAt attempts a priority-aware non-blocking acquire.
+// Exported for the slot router (SlotChecker interface).
+func (sc *SubagentClient) TryAcquireAt(pri engine.Priority) bool {
+	return sc.sem.TryAcquireAt(pri)
+}
+
+// Release frees a semaphore slot. Exported for the slot router (SlotChecker interface).
 func (sc *SubagentClient) Release() {
-	sc.release()
+	sc.sem.Release()
+}
+
+// ReleaseReserved frees a slot with a reservation for high-priority reacquire.
+// Exported for the slot router (SlotChecker interface).
+func (sc *SubagentClient) ReleaseReserved() {
+	sc.sem.ReleaseReserved()
+}
+
+// CancelReservation cancels an outstanding reservation.
+// Exported for the slot router (SlotChecker interface).
+func (sc *SubagentClient) CancelReservation() {
+	sc.sem.CancelReservation()
 }
 
 // requestOpts captures the variation axes for exec(): blocking vs non-blocking

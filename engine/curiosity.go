@@ -119,6 +119,7 @@ ws ::= [ \t\n]*`
 	}
 
 	e.lastCuriosityRun = time.Now()
+	e.Metrics.Emit("curiosity.signal", 1, map[string]string{"source": "cognitive", "result": "emitted"})
 	logger.Log.Infof("[curiosity] launched task #%d: %s (reason: %s)", taskID, result.Directive, result.Reasoning)
 }
 
@@ -169,9 +170,11 @@ done:
 	taskID, err := e.CogServices.LaunchCuriosity(directive, best.Priority, best.ObjectiveID)
 	if err != nil {
 		logger.Log.Warnf("[curiosity-signal] failed to launch: %v", err)
+		e.Metrics.Emit("curiosity.signal", 1, map[string]string{"source": best.Source, "result": "dropped"})
 		return
 	}
 
 	e.lastCuriosityRun = time.Now()
+	e.Metrics.Emit("curiosity.signal", 1, map[string]string{"source": best.Source, "result": "emitted"})
 	logger.Log.Infof("[curiosity-signal] launched task #%d from %s: %s", taskID, best.Source, best.Query)
 }

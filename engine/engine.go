@@ -14,6 +14,7 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/metrics"
 	"sokratos/timeouts"
 	"sokratos/timefmt"
 )
@@ -73,6 +74,7 @@ type TTLConfig struct {
 	FailedOpsTTLDays       int
 	SkillKVTTLDays         int
 	ShellHistoryTTLDays    int
+	MetricsTTLDays         int
 }
 
 // CuriositySignal is an event-driven trigger for proactive research.
@@ -113,6 +115,7 @@ type Engine struct {
 	Reloader       HotReloader        // hot-reload skills + routines from disk (nil = skip)
 	ReflectionSink ReflectionSink     // inject reflection insights into conversation context (nil = skip)
 	CogServices    CognitiveServices  // LLM-dependent cognitive operations (nil = disabled)
+	Metrics        *metrics.Collector // observability metrics (nil = disabled)
 	OnFirstTick       func()                    // deferred startup work (e.g. consolidation) — runs after first heartbeat, nil = skip
 	CuriositySignals  chan CuriositySignal      // buffered channel for event-driven curiosity (nil = disabled)
 
@@ -260,13 +263,14 @@ func (e *Engine) sendDeduped(text, logLabel string) bool {
 // When Router is nil, always uses the primary orchestrator.
 func (e *Engine) resolveOrchestrator(ctx context.Context, preferBrain bool) OrchestratorChoice {
 	if e.Router != nil {
-		return e.Router.AcquireOrFallback(ctx, preferBrain)
+		return e.Router.AcquireOrFallback(ctx, preferBrain, PriorityBackground)
 	}
 	return OrchestratorChoice{
-		Client:    e.LLM.Client,
-		Model:     e.LLM.Model,
-		Release:   func() {},
-		Reacquire: func(context.Context) error { return nil },
+		Client:          e.LLM.Client,
+		Model:           e.LLM.Model,
+		Release:         func() {},
+		ReleaseReserved: func() {},
+		Reacquire:       func(context.Context) error { return nil },
 	}
 }
 

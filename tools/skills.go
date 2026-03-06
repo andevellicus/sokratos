@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -354,9 +355,12 @@ func ExecuteSkill(ctx context.Context, name, source, dir string, args json.RawMe
 	}
 	vm.Set("skill_config", skillConfig)
 
-	// Bind the HTTP bridge.
+	// Bind the HTTP bridges.
 	vm.Set("http_request", func(call goja.FunctionCall) goja.Value {
 		return httpBridge(vm, call)
+	})
+	vm.Set("http_batch", func(call goja.FunctionCall) goja.Value {
+		return httpBatchBridge(vm, ctx, call)
 	})
 
 	// Register VM globals via helpers (skill_vm.go).
@@ -508,6 +512,123 @@ func httpBridge(vm *goja.Runtime, call goja.FunctionCall) goja.Value {
 	result.Set("headers", respHeaders)
 
 	return result
+}
+
+// httpBatchBridge implements the JS http_batch(requests) function.
+// Takes an array of {method, url, headers?, body?} objects, executes them
+// concurrently in Go goroutines, and returns an array of {status, body, headers, error?}
+// results in the same order. Capped at 10 concurrent requests.
+func httpBatchBridge(vm *goja.Runtime, ctx context.Context, call goja.FunctionCall) goja.Value {
+	if len(call.Arguments) < 1 {
+		panic(vm.NewTypeError("http_batch requires 1 argument: array of requests"))
+	}
+
+	exported := call.Arguments[0].Export()
+	items, ok := exported.([]any)
+	if !ok {
+		panic(vm.NewTypeError("http_batch: argument must be an array"))
+	}
+	if len(items) == 0 {
+		return vm.NewArray()
+	}
+	if len(items) > 10 {
+		panic(vm.NewTypeError("http_batch: maximum 10 requests per batch"))
+	}
+
+	type batchResult struct {
+		status  int
+		body    string
+		headers map[string]any
+		err     string
+	}
+
+	results := make([]batchResult, len(items))
+	var wg sync.WaitGroup
+	client := httputil.NewClient(TimeoutSkillHTTP)
+
+	for i, item := range items {
+		reqMap, ok := item.(map[string]any)
+		if !ok {
+			results[i] = batchResult{err: "invalid request object at index " + fmt.Sprint(i)}
+			continue
+		}
+
+		method, _ := reqMap["method"].(string)
+		rawURL, _ := reqMap["url"].(string)
+		if method == "" || rawURL == "" {
+			results[i] = batchResult{err: "missing method or url at index " + fmt.Sprint(i)}
+			continue
+		}
+
+		if err := validateURL(rawURL); err != nil {
+			results[i] = batchResult{err: "blocked: " + err.Error()}
+			continue
+		}
+
+		wg.Add(1)
+		go func(idx int, method, rawURL string, reqMap map[string]any) {
+			defer wg.Done()
+
+			var bodyReader io.Reader
+			if bodyStr, _ := reqMap["body"].(string); bodyStr != "" {
+				bodyReader = strings.NewReader(bodyStr)
+			}
+
+			req, err := http.NewRequestWithContext(ctx, method, rawURL, bodyReader)
+			if err != nil {
+				results[idx] = batchResult{err: err.Error()}
+				return
+			}
+
+			if headers, ok := reqMap["headers"].(map[string]any); ok {
+				for k, v := range headers {
+					req.Header.Set(k, fmt.Sprint(v))
+				}
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				results[idx] = batchResult{err: err.Error()}
+				return
+			}
+			defer resp.Body.Close()
+
+			limited := io.LimitReader(resp.Body, 1<<20)
+			respBody, err := io.ReadAll(limited)
+			if err != nil {
+				results[idx] = batchResult{err: err.Error()}
+				return
+			}
+
+			respHeaders := make(map[string]any)
+			for k := range resp.Header {
+				respHeaders[k] = resp.Header.Get(k)
+			}
+
+			results[idx] = batchResult{
+				status:  resp.StatusCode,
+				body:    string(respBody),
+				headers: respHeaders,
+			}
+		}(i, method, rawURL, reqMap)
+	}
+
+	wg.Wait()
+
+	// Convert to JS array of objects.
+	arr := make([]any, len(results))
+	for i, r := range results {
+		m := map[string]any{
+			"status":  r.status,
+			"body":    r.body,
+			"headers": r.headers,
+		}
+		if r.err != "" {
+			m["error"] = r.err
+		}
+		arr[i] = m
+	}
+	return vm.ToValue(arr)
 }
 
 // validateURL checks that a URL is safe to request: only http/https, no private

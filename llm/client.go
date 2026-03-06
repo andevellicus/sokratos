@@ -220,6 +220,17 @@ func (e *BackgroundJobRequest) Error() string {
 	return "background job requested for " + e.Tool
 }
 
+// EscalationRequest is a sentinel error returned when the supervisor detects a
+// tool call that requires a more capable model (e.g. Brain). The caller should
+// release the current slot, acquire the target model, and replay the request.
+type EscalationRequest struct {
+	ToolName string // the tool that triggered escalation
+}
+
+func (e *EscalationRequest) Error() string {
+	return "escalation requested for tool: " + e.ToolName
+}
+
 // QueryOrchestratorOpts holds optional parameters for QueryOrchestrator.
 type QueryOrchestratorOpts struct {
 	Parts              []ContentPart    // vision content parts for the user message
@@ -233,8 +244,10 @@ type QueryOrchestratorOpts struct {
 	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
 	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
 	MandatedBrainTools map[string]string // tools that trigger a background Brain job (key=tool, value=task_type)
-	OnToolStart func(toolName string)            // called before tool execution with tool name (nil = no-op)
-	OnToolEnd   func(ctx context.Context) error // reacquire slot after tool execution (nil = no-op)
+	EscalateTools      map[string]bool   // tools that trigger inline escalation to a more capable model
+	OnToolStart func(toolName string)                           // called before tool execution with tool name (nil = no-op)
+	OnToolEnd   func(ctx context.Context) error                // reacquire slot after tool execution (nil = no-op)
+	OnToolExec  func(toolName string, dur time.Duration, err error) // called after tool execution with timing (nil = no-op)
 }
 
 // QueryOrchestrator sends a prompt to the given model, executing tool calls as

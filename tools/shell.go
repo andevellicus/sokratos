@@ -176,8 +176,9 @@ func (se *ShellExec) execute(ctx context.Context, command, workingDir string) (s
 			return fmt.Sprintf("Command timed out after %s (killed).\n\n--- stderr ---\n%s",
 				timeout, truncateOutput(stderr.String(), 500)), nil
 		} else {
-			// exec.Command creation failure — hard error.
-			return "", fmt.Errorf("exec failed: %w", runErr)
+			// exec.Command creation failure — soft error so the LLM can retry
+			// with corrected parameters (e.g. invalid working_dir).
+			return fmt.Sprintf("Command execution failed: %v", runErr), nil
 		}
 	}
 
@@ -235,6 +236,7 @@ func (se *ShellExec) resolveWorkDir(wsOnly bool, workingDir string) (string, err
 	if workingDir == "" {
 		return se.workspaceDir, nil
 	}
+	workingDir = expandTilde(workingDir)
 	if filepath.IsAbs(workingDir) {
 		return workingDir, nil
 	}

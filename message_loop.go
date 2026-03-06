@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-
 	"sokratos/config"
 	"sokratos/db"
 	"sokratos/engine"
@@ -20,6 +18,7 @@ import (
 	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/pipelines"
+	"sokratos/platform"
 	"sokratos/routines"
 	"sokratos/textutil"
 	"sokratos/tools"
@@ -41,7 +40,7 @@ type messageContext struct {
 	rebuildGrammar func()
 	router         engine.SlotRouter
 	delegateConfig *tools.DelegateConfig
-	messageChan    <-chan *tgbotapi.Message // for /google auth code reads
+	platform       platform.Platform
 }
 
 // handleReload forces a full re-sync of routines.toml and skills from disk.
@@ -62,6 +61,26 @@ func handleReload(mc messageContext) string {
 	return "Everything up to date."
 }
 
+// handleMetrics runs a pre-built metrics report. Accepts optional args:
+// "/metrics" (overview, 1h), "/metrics slots", "/metrics dispatch 24h".
+func handleMetrics(_ messageContext, args string) string {
+	parts := strings.Fields(args)
+	var report, window string
+	if len(parts) >= 1 {
+		report = parts[0]
+	}
+	if len(parts) >= 2 {
+		window = parts[1]
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := tools.QueryMetricsReport(ctx, db.Pool, report, window)
+	if err != nil {
+		return "Metrics query failed: " + err.Error()
+	}
+	return result
+}
+
 // handleBootstrap launches a profile generation run in the background.
 // Returns an immediate acknowledgement string.
 func handleBootstrap(mc messageContext) string {
@@ -69,10 +88,7 @@ func handleBootstrap(mc messageContext) string {
 		return "Bootstrap requires database, deep thinker, and embedding service."
 	}
 	bootstrapSend := func(text string) {
-		for id := range mc.cfg.AllowedIDs {
-			m := tgbotapi.NewMessage(id, text)
-			mc.svc.Bot.Send(m)
-		}
+		mc.platform.Broadcast(context.Background(), text)
 	}
 	go pipelines.RunBootstrap(pipelines.BootstrapConfig{
 		PipelineDeps: pipelines.PipelineDeps{
@@ -93,7 +109,7 @@ func handleBootstrap(mc messageContext) string {
 	return "Profile generation started in the background. I'll notify you when it's ready."
 }
 
-// handleGoogle triggers Google OAuth re-authentication via Telegram.
+// handleGoogle triggers Google OAuth re-authentication via the platform.
 // Uses a single OAuth flow with combined Gmail+Calendar scopes so only
 // one auth URL + code paste is needed. Re-initializes both services and
 // registers tools that were previously disabled.
@@ -104,22 +120,13 @@ func handleGoogle(mc messageContext) string {
 	// Delete existing token to force a fresh OAuth flow.
 	os.Remove(mc.cfg.GoogleTokenPath)
 
-	// Build auth IO that reads from the split message channel (not the raw
-	// updates channel which is drained by the splitter goroutine).
+	// Build auth IO that reads replies from the platform.
 	authIO := &google.AuthIO{
 		Send: func(msg string) {
-			for id := range mc.cfg.AllowedIDs {
-				m := tgbotapi.NewMessage(id, msg)
-				mc.svc.Bot.Send(m)
-			}
+			mc.platform.Broadcast(context.Background(), msg)
 		},
 		Receive: func() (string, error) {
-			for msg := range mc.messageChan {
-				if msg.Text != "" {
-					return strings.TrimSpace(msg.Text), nil
-				}
-			}
-			return "", fmt.Errorf("message channel closed")
+			return mc.platform.ReadReply()
 		},
 	}
 
@@ -180,12 +187,12 @@ func handleGoogle(mc messageContext) string {
 
 // processMessage runs the full orchestrator pipeline for a regular user message:
 // prefetch → temporal context → orchestrator → slide/archive → triage → reply.
-func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgText, userPrompt string, visionParts []llm.ContentPart) {
-	typingCtx, typingCancel := context.WithCancel(context.Background())
-	go sendTypingPeriodically(mc.svc.Bot, chatID, typingCtx)
+func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, userPrompt string, visionParts []llm.ContentPart) {
+	messageStart := time.Now()
+	typingCancel := mc.platform.StartTyping(context.Background(), msg.ChannelID)
 
 	// Phase 0: Pipeline isolation — tag this message and exclude prior pipeline's memories.
-	pipelineID := int64(msg.MessageID)
+	pipelineID := msg.PipelineID()
 	excludePipelineID := mc.svc.StateMgr.LastPipelineID()
 
 	// Phase 1: Snapshot history (StateManager has its own RWMutex).
@@ -213,19 +220,25 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 	}
 	pfCh := make(chan prefetchData, 1)
 	go func() {
+		pfStart := time.Now()
 		var pd prefetchData
+		var memoriesFound int
 		if db.Pool != nil && mc.cfg.EmbedURL != "" && strings.TrimSpace(msgText) != "" {
 			pfCtx, pfCancel := context.WithTimeout(context.Background(), tools.TimeoutPrefetch)
 			if pf := subconsciousPrefetch(pfCtx, db.Pool, mc.cfg.EmbedURL, mc.cfg.EmbedModel, msgText, history, excludePipelineID); pf != nil {
 				pd.content = pf.Summaries
 				pd.ids = pf.IDs
 				pd.summaries = pf.Summaries
+				memoriesFound = len(pf.IDs)
 			}
 			pfCancel()
 		}
 		if db.Pool != nil {
 			pd.temporal = engine.BuildTemporalContext(context.Background(), db.Pool)
 		}
+		mc.svc.Metrics.Since("prefetch.duration", pfStart, map[string]string{
+			"memories_found": fmt.Sprintf("%d", memoriesFound),
+		})
 		pfCh <- pd
 	}()
 
@@ -276,8 +289,9 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 
 	// Phase 3.7: Execute dispatch decision (needs prefetch for synthesis).
 	if triageResult != nil && triageResult.Dispatch {
-		handled, escalation := executeDispatch(mc, msg, chatID, msgText, dctx, triageResult)
+		handled, escalation := executeDispatch(mc, msg, msgText, dctx, triageResult)
 		if handled {
+			mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": "dispatch"})
 			if gotSupervisor {
 				choice.Release()
 			}
@@ -296,7 +310,7 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 
 	// Phase 4: Acquire orchestrator slot if we don't already have one.
 	if !gotSupervisor {
-		choice = mc.router.AcquireOrFallback(context.Background(), false)
+		choice = mc.router.AcquireOrFallback(context.Background(), false, engine.PriorityUser)
 	}
 	acquired := true
 	defer func() {
@@ -316,11 +330,12 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		MaxWebSources:      mc.cfg.MaxWebSources,
 		ToolAgent:          mc.lb.ToolAgent,
 		MandatedBrainTools: mandatedBrainTools,
+		EscalateTools:      escalateTools,
 		OnToolStart: func(toolName string) {
-			choice.Release()
+			choice.ReleaseReserved()
 			acquired = false
 			if toolName == "reason" {
-				sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply("Thinking..."))
+				mc.platform.Send(context.Background(), msg.ChannelID, "Thinking...", msg.ID)
 			}
 		},
 		OnToolEnd: func(reCtx context.Context) error {
@@ -330,7 +345,59 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 			acquired = true
 			return nil
 		},
+		OnToolExec: func(tool string, dur time.Duration, toolErr error) {
+			result := "ok"
+			if toolErr != nil {
+				result = "hard_error"
+			}
+			mc.svc.Metrics.EmitDuration("tool.exec", dur, map[string]string{"tool": tool, "result": result})
+		},
 	})
+
+	// Check for EscalationRequest — replay on Brain inline.
+	var esc *llm.EscalationRequest
+	if errors.As(err, &esc) {
+		logger.Log.Infof("[escalation] %s triggered escalation to Brain", esc.ToolName)
+		mc.platform.Send(context.Background(), msg.ChannelID, "Thinking...", msg.ID)
+		choice.Release()
+		acquired = false
+
+		// Acquire Brain (preferBrain=true) at user priority.
+		choice = mc.router.AcquireOrFallback(context.Background(), true, engine.PriorityUser)
+		acquired = true
+
+		// Replay on Brain without EscalateTools (Brain handles everything directly).
+		reply, msgs, err = llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, mc.confirmExec, mc.lb.TrimFn, &llm.QueryOrchestratorOpts{
+			Parts:              visionParts,
+			History:            history,
+			PersonalityContent: personalityContent,
+			ProfileContent:     profileContent,
+			TemporalContext:    pf.temporal,
+			PrefetchContent:    pf.content,
+			MaxToolResultLen:   mc.cfg.MaxToolResultLen,
+			MaxWebSources:      mc.cfg.MaxWebSources,
+			ToolAgent:          mc.lb.ToolAgent,
+			OnToolStart: func(toolName string) {
+				choice.ReleaseReserved()
+				acquired = false
+			},
+			OnToolEnd: func(reCtx context.Context) error {
+				if reErr := choice.Reacquire(reCtx); reErr != nil {
+					return reErr
+				}
+				acquired = true
+				return nil
+			},
+			OnToolExec: func(tool string, dur time.Duration, toolErr error) {
+				result := "ok"
+				if toolErr != nil {
+					result = "hard_error"
+				}
+				mc.svc.Metrics.EmitDuration("tool.exec", dur, map[string]string{"tool": tool, "result": result})
+			},
+		})
+		mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": "escalated"})
+	}
 
 	// Check for BackgroundJobRequest — spawn a background Brain job.
 	var bjr *llm.BackgroundJobRequest
@@ -343,14 +410,14 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 		if bjr.ProblemStatement != "" {
 			userGoal = bjr.ProblemStatement
 		}
-		job := mc.svc.StateMgr.CreateJob(bjr.Tool, userGoal, chatID)
+		job := mc.svc.StateMgr.CreateJob(bjr.Tool, userGoal, msg.ChannelID)
 		job.TaskType = bjr.TaskType
 
 		ack := brainSessionAcks[bjr.Tool]
 		if ack == "" {
 			ack = "Working on that in the background..."
 		}
-		sendFormatted(mc.svc.Bot, chatID, msg.MessageID, formatReply(ack))
+		mc.platform.Send(context.Background(), msg.ChannelID, ack, msg.ID)
 
 		// Store the user message in conversation state.
 		mc.svc.StateMgr.AppendMessage(llm.Message{Role: "user", Content: msgText})
@@ -362,8 +429,14 @@ func processMessage(mc messageContext, msg *tgbotapi.Message, chatID int64, msgT
 
 	typingCancel()
 
+	msgPath := "brain"
+	if gotSupervisor {
+		msgPath = "direct"
+	}
+	mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": msgPath})
+
 	toolCtx, toolsUsed := summarizeToolContext(msgs)
-	completeMessageHandling(mc, msg, chatID, messageResult{
+	completeMessageHandling(mc, msg, messageResult{
 		Reply:             reply,
 		Messages:          condenseToolResults(msgs),
 		ToolContext:       toolCtx,
@@ -390,14 +463,14 @@ type messageResult struct {
 	MsgText           string        // original user message text
 	PrefetchIDs       []int64       // memory IDs from prefetch
 	PrefetchSummaries string        // memory summaries from prefetch
-	PipelineID        int64         // Telegram message ID for memory isolation
+	PipelineID        int64         // message ID for memory isolation
 	Err               error         // LLM/execution error (nil on success)
 }
 
 // completeMessageHandling runs shared post-processing after both the Brain
 // and dispatch paths: append to state, slide/archive, triage, memory
 // usefulness evaluation, error fallback, and send reply.
-func completeMessageHandling(mc messageContext, msg *tgbotapi.Message, chatID int64, mr messageResult) {
+func completeMessageHandling(mc messageContext, msg *platform.IncomingMessage, mr messageResult) {
 	// Append messages to conversation state.
 	for _, m := range mr.Messages {
 		mc.svc.StateMgr.AppendMessage(m)
@@ -445,15 +518,9 @@ func completeMessageHandling(mc messageContext, msg *tgbotapi.Message, chatID in
 		return
 	}
 
-	// Format and send reply.
-	fm := formatReply(reply)
-	if _, err := sendFormatted(mc.svc.Bot, chatID, msg.MessageID, fm); err != nil {
-		logger.Log.Warnf("Entity send failed, falling back to plain text: %v", err)
-		replyMsg := tgbotapi.NewMessage(chatID, reply)
-		replyMsg.ReplyToMessageID = msg.MessageID
-		if _, err := mc.svc.Bot.Send(replyMsg); err != nil {
-			logger.Log.Errorf("Error sending message: %v", err)
-		}
+	// Send reply via platform (handles formatting + fallback internally).
+	if _, err := mc.platform.Send(context.Background(), msg.ChannelID, reply, msg.ID); err != nil {
+		logger.Log.Errorf("Error sending message: %v", err)
 	}
 
 	// Emit curiosity signal when the orchestrator expressed uncertainty.
@@ -494,4 +561,3 @@ func emitConversationGapSignal(eng *engine.Engine, reply string) {
 		// Channel full, drop.
 	}
 }
-
