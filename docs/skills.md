@@ -23,6 +23,7 @@ If both `handler.ts` and `handler.js` exist, `.ts` takes priority. TypeScript is
 ---
 name: get_weather
 language: typescript
+progress_label: Checking weather...
 description: |
   Fetch current weather and forecast for a configured location.
   Returns JSON with current conditions and 3-day forecast.
@@ -35,7 +36,7 @@ description: |
 | location | string | no |
 ```
 
-The YAML frontmatter defines `name`, `description`, optionally `language` (`"javascript"` default, `"typescript"`), and documents parameters. The description is used in the tool's schema and in dynamic tool descriptions injected into the orchestrator's prompt.
+The YAML frontmatter defines `name`, `description`, optionally `language` (`"javascript"` default, `"typescript"`), and optionally `progress_label` (shown in Telegram progress indicators). If `progress_label` is omitted, it auto-derives from the description (e.g. `"Fetch current weather..."` → `"Fetch current weather..."`). The description is used in the tool's schema and in dynamic tool descriptions injected into the orchestrator's prompt.
 
 ### config.toml
 

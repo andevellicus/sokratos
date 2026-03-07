@@ -15,7 +15,7 @@ import (
 type BackgroundJob struct {
 	mu             sync.RWMutex
 	ID             string
-	Tool           string      // triggering tool ("create_skill") or "reason"
+	Tool           string      // triggering tool ("create_skill") or "deep_think"
 	TaskType       string      // maps to session prompt; "" = general reasoning
 	UserGoal       string      // original user message or problem statement
 	ChannelID      string      // platform channel for sending messages

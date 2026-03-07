@@ -87,7 +87,7 @@ func NewDelegateTask(sc *clients.SubagentClient, registry *Registry, dc *Delegat
 
 		toolExec := NewScopedToolExec(registry, dc)
 
-		result, err := clients.SubagentSupervisor(ctx, sc, dc.Grammar(), delegateSystemPrompt, directive, toolExec, 10)
+		result, err := clients.SubagentSupervisor(ctx, sc, dc.Grammar(), delegateSystemPrompt, directive, toolExec, 10, nil)
 		if err != nil {
 			return fmt.Sprintf("delegate_task failed: %v", err), nil
 		}

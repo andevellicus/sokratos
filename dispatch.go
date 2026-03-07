@@ -55,23 +55,29 @@ type dispatchEscalation struct {
 var neverDispatchTools = map[string]bool{
 	"send_email":         true,
 	"create_event":       true,
-	"create_skill":       true,
 	"manage_skills":      true,
 	"manage_routines":    true,
 	"manage_personality": true,
 	"save_memory":        true,
 	"forget_topic":       true,
-	"reason":             true,
+	"deep_think":         true,
 	"plan_and_execute":   true,
 	"delegate_task":      true,
-	"ask_database":       true,
 	"manage_objectives":  true,
-	"write_file":         true,
-	"patch_file":         true,
-	"update_skill":       true,
 	"reply_to_job":       true,
 	"cancel_job":         true,
-	"run_command":        true,
+	"prompt_user":        true,
+}
+
+func init() {
+	// Auto-include tools from escalateTools and mandatedBrainTools.
+	// Defense-in-depth: even if triage tries to dispatch these, they're blocked.
+	for tool := range escalateTools {
+		neverDispatchTools[tool] = true
+	}
+	for tool := range mandatedBrainTools {
+		neverDispatchTools[tool] = true
+	}
 }
 
 // brainSessionPrompts maps task types to their Brain session system prompts.
@@ -139,14 +145,17 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 	defer mc.svc.StateMgr.RemoveJob(job.ID)
 
 	// Select session prompt by TaskType, falling back to general reasoning prompt.
+	// Injected as a user message prefix — NOT as a system message — because
+	// querySupervisor prepends its own system message and Qwen3.5's Jinja
+	// template raises "System message must be at the beginning" if a second
+	// system message appears mid-conversation.
 	sessionPrompt := brainSessionPrompts[job.TaskType]
 	if sessionPrompt == "" {
 		sessionPrompt = prompts.SessionReason
 	}
 
 	messages := []llm.Message{
-		{Role: "system", Content: sessionPrompt},
-		{Role: "user", Content: job.UserGoal},
+		{Role: "user", Content: sessionPrompt + "\n\n" + job.UserGoal},
 	}
 
 	const maxRounds = 20
@@ -158,11 +167,15 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 		choice := mc.router.AcquireOrFallback(ctx, true, engine.PriorityUser) // preferBrain
 
 		// Wrap toolExec to detect when the triggering tool succeeds.
+		// Block recursive deep_think calls — the Brain IS the deep thinker.
 		sessionToolExec := func(execCtx context.Context, raw json.RawMessage) (string, error) {
 			var call struct {
 				Name string `json:"name"`
 			}
 			json.Unmarshal(raw, &call)
+			if call.Name == "deep_think" {
+				return "You ARE the deep thinker. Call the tools directly (create_skill, search_web, etc.) instead of deep_think.", nil
+			}
 			result, err := mc.confirmExec(execCtx, raw)
 			if err == nil && call.Name == job.Tool && !llm.IsToolSoftError(result) {
 				job.SetToolSucceeded(true)
@@ -172,17 +185,22 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 
 		reply, newMsgs, qErr := llm.QueryOrchestrator(ctx, choice.Client, choice.Model,
 			messages[len(messages)-1].Content, sessionToolExec, nil, &llm.QueryOrchestratorOpts{
-				ToolAgent: mc.lb.ToolAgent,
-				History:   messages[:len(messages)-1],
+				ToolAgent:      mc.lb.ToolAgent,
+				History:        messages[:len(messages)-1],
+				EnableThinking: true, // Brain should reason deeply
 				// No MandatedBrainTools — Brain should execute tools directly.
 			})
 
 		choice.Release()
+		// Check ctx.Err() BEFORE cancel() — cancel() would set it unconditionally,
+		// masking the real error. A non-nil ctx.Err() here means external cancellation
+		// (e.g. user called cancel_job).
+		ctxCancelled := ctx.Err() != nil
 		cancel()
 		job.SetActive(false, nil)
 
 		if qErr != nil {
-			if ctx.Err() != nil {
+			if ctxCancelled {
 				mc.platform.Send(context.Background(), job.ChannelID, "Background job cancelled.", "")
 			} else {
 				logger.Log.Warnf("[job:%s] error: %v", job.ID, qErr)
@@ -301,20 +319,23 @@ func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
 	used, total := mc.svc.Subagent.SlotsInUse()
 	logger.Log.Infof("[dispatch] dispatching %s (subagent slots: %d/%d used)", dr.Tool, used, total)
 
-	// Send LLM-generated ack if the triage model wrote one.
-	if dr.Ack != "" {
-		if _, ackErr := mc.platform.Send(context.Background(), msg.ChannelID, dr.Ack, msg.ID); ackErr != nil {
-			logger.Log.Warnf("[dispatch] ack send failed: %v", ackErr)
-		} else {
-			logger.Log.Debugf("[dispatch] ack sent for %s: %q", dr.Tool, textutil.Truncate(dr.Ack, 60))
-		}
+	// Send LLM-generated ack as a progress handle (editable in place).
+	ackText := dr.Ack
+	if ackText == "" {
+		ackText = fmt.Sprintf("Running %s...", dr.Tool)
+	}
+	ph, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, ackText, msg.ID)
+	if phErr != nil {
+		logger.Log.Warnf("[dispatch] progress handle creation failed: %v", phErr)
+	} else {
+		logger.Log.Debugf("[dispatch] ack sent for %s: %q", dr.Tool, textutil.Truncate(ackText, 60))
 	}
 
 	// --- Execute tool with periodic progress updates ---
 	toolCall := tools.ToolCall{Name: dr.Tool, Arguments: dr.Args}
 	toolJSON, _ := json.Marshal(toolCall)
 
-	// Progress ticker: sends periodic updates so the user knows it's still alive.
+	// Progress ticker: edits the ack message in place.
 	progressCtx, progressCancel := context.WithCancel(context.Background())
 	defer progressCancel()
 	toolStart := time.Now()
@@ -326,7 +347,9 @@ func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
 			case <-ticker.C:
 				elapsed := int(time.Since(toolStart).Seconds())
 				update := fmt.Sprintf("Still working on %s... (%ds)", dr.Tool, elapsed)
-				mc.platform.Send(context.Background(), msg.ChannelID, update, msg.ID)
+				if ph != nil {
+					ph.Update(context.Background(), update)
+				}
 				logger.Log.Debugf("[dispatch] progress: %s running for %ds", dr.Tool, elapsed)
 			case <-progressCtx.Done():
 				return
@@ -334,7 +357,13 @@ func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
 		}
 	}()
 
+	// Wire progress reporting into tool context so tools can report granular progress.
 	toolCtx, toolCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchToolExec)
+	if ph != nil {
+		toolCtx = tools.WithProgress(toolCtx, func(status string) {
+			ph.Update(context.Background(), status)
+		})
+	}
 	result, execErr := mc.registry.Execute(toolCtx, toolJSON)
 	toolCancel()
 	progressCancel() // stop progress ticker
@@ -416,13 +445,8 @@ func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
 
 // buildTriageSystemPrompt constructs the system prompt for dispatch triage.
 func buildTriageSystemPrompt(registry *tools.Registry, currentTime string) string {
-	toolIndex := registry.CompactIndex()
-	if skills := registry.DynamicSkillDescriptions(); skills != "" {
-		toolIndex += "\n" + skills
-	}
-
 	prompt := strings.Replace(prompts.DispatchTriage, "%CURRENT_TIME%", currentTime, 1)
-	prompt = strings.Replace(prompt, "%TOOL_INDEX%", toolIndex, 1)
+	prompt = strings.Replace(prompt, "%TOOL_INDEX%", registry.FullToolIndex(), 1)
 	return prompt
 }
 
@@ -490,8 +514,11 @@ func tryMultiStepDispatch(mc messageContext, msg *platform.IncomingMessage,
 
 	logger.Log.Infof("[dispatch] multi-step: %q", textutil.Truncate(directive, 80))
 
-	// Ack.
-	mc.platform.Send(context.Background(), msg.ChannelID, "Working on it...", msg.ID)
+	// Ack as editable progress handle.
+	ph, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, "Working on it...", msg.ID)
+	if phErr != nil {
+		logger.Log.Warnf("[dispatch] multi-step progress handle failed: %v", phErr)
+	}
 
 	systemPrompt := buildContextualPrompt(dctx, `You are a research assistant handling a multi-step request. Call the available tools as needed to gather information, then respond naturally to the user.
 
@@ -507,8 +534,16 @@ func tryMultiStepDispatch(mc messageContext, msg *platform.IncomingMessage,
 	ctx, cancel := context.WithTimeout(context.Background(), tools.TimeoutMultiStepDispatch)
 	defer cancel()
 
+	// Wire progress reporting into the supervisor.
+	var progressFn func(string)
+	if ph != nil {
+		progressFn = func(status string) {
+			ph.Update(context.Background(), status)
+		}
+	}
+
 	multiStart := time.Now()
-	reply, err := clients.SubagentSupervisor(ctx, mc.svc.Subagent, g, systemPrompt, directive, toolExec, maxMultiStepRounds)
+	reply, err := clients.SubagentSupervisor(ctx, mc.svc.Subagent, g, systemPrompt, directive, toolExec, maxMultiStepRounds, progressFn)
 	if err != nil {
 		logger.Log.Warnf("[dispatch] multi-step failed: %v — escalating", err)
 		mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "escalated", "phase": "multi_step"})

@@ -52,7 +52,7 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 		DB:                     db.Pool,
 		EmbedEndpoint:          cfg.EmbedURL,
 		EmbedModel:             cfg.EmbedModel,
-		MaxMessages:            40,
+		MaxMessages:            cfg.MaxMessages,
 		MaintenanceInterval: cfg.MaintenanceInterval,
 		TTL: engine.TTLConfig{
 			MemoryStalenessDays:    cfg.MemoryStalenessDays,
@@ -181,8 +181,9 @@ func wireEngine(
 				eng.RefreshPersonality()
 			},
 		), tools.ToolSchema{
-			Name:        "consolidate_memory",
-			Description: "Trigger memory consolidation and profile update",
+			Name:          "consolidate_memory",
+			Description:   "Trigger memory consolidation and profile update",
+			ProgressLabel: "Consolidating memories...",
 		})
 	}
 	if db.Pool != nil {
@@ -203,12 +204,8 @@ func wireEngine(
 
 	// Build grammar rebuild callback capturing registry + lb + eng.
 	rebuildGrammar := func() {
-		// Rebuild tool descriptions: compact index + dynamic skill descriptions.
-		compactIdx := registry.CompactIndex()
-		td := strings.Replace(prompts.Tools, "%TOOL_INDEX%", compactIdx, 1)
-		if dynDescs := registry.DynamicSkillDescriptions(); dynDescs != "" {
-			td += "\n" + dynDescs
-		}
+		// Rebuild tool descriptions.
+		td := strings.Replace(prompts.Tools, "%TOOL_INDEX%", registry.FullToolIndex(), 1)
 		if lb.ToolAgent != nil {
 			lb.ToolAgent.ToolDescriptions = td
 		}
@@ -218,7 +215,7 @@ func wireEngine(
 
 		// Update delegate_task's grammar and allowed-tools to include skills.
 		if delegateConfig != nil {
-			delegatable := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url", "run_command"}
+			delegatable := append([]string{}, coreDelegatableTools...)
 			for _, s := range registry.Schemas() {
 				if s.IsSkill {
 					delegatable = append(delegatable, s.Name)

@@ -18,6 +18,54 @@ type GrammarRebuildFunc func()
 
 var skillNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{1,48}$`)
 
+// normalizeTestArgs unwraps and validates test_args JSON from the LLM.
+// Returns (raw bytes, soft error). Non-empty error means return early.
+func normalizeTestArgs(raw json.RawMessage) ([]byte, string) {
+	if len(raw) == 0 {
+		return []byte("{}"), ""
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, "Invalid JSON in test_args string"
+		}
+		b := []byte(s)
+		if !json.Valid(b) {
+			return nil, "Invalid JSON inside test_args string value"
+		}
+		return b, ""
+	}
+	if !json.Valid(raw) {
+		return nil, "Invalid JSON in test_args"
+	}
+	return raw, ""
+}
+
+// isTestFailure checks if a skill test result indicates failure.
+func isTestFailure(result string) bool {
+	lower := strings.ToLower(strings.TrimSpace(result))
+	return strings.Contains(lower, "execution error") ||
+		strings.HasPrefix(lower, "error") ||
+		strings.HasPrefix(lower, "failed to") ||
+		strings.Contains(lower, "failed to get")
+}
+
+// validateAndCompileSource validates and compiles skill source code.
+// Returns (execSource, soft error string). Non-empty error means return early.
+func validateAndCompileSource(lang, code string) (string, string) {
+	if lang == "typescript" {
+		transpiled, tErr := ValidateTypeScriptSource(code)
+		if tErr != nil {
+			return "", fmt.Sprintf("TypeScript error: %v", tErr)
+		}
+		return transpiled, ""
+	}
+	if err := validateSkillSource(code); err != nil {
+		return "", fmt.Sprintf("JavaScript syntax error: %v", err)
+	}
+	return code, ""
+}
+
 // NewCreateSkill returns a ToolFunc that creates a new JavaScript skill on
 // disk, registers it in the live registry, and rebuilds the grammar.
 func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
@@ -70,51 +118,22 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 		}
 
 		// Compile-check the source (transpile if TypeScript).
-		var execSource string
-		if lang == "typescript" {
-			transpiled, tErr := ValidateTypeScriptSource(a.Code)
-			if tErr != nil {
-				return fmt.Sprintf("TypeScript error: %v", tErr), nil
-			}
-			execSource = transpiled
-		} else {
-			if err := validateSkillSource(a.Code); err != nil {
-				return fmt.Sprintf("JavaScript syntax error: %v", err), nil
-			}
-			execSource = a.Code
+		execSource, compileErr := validateAndCompileSource(lang, a.Code)
+		if compileErr != "" {
+			return compileErr, nil
 		}
 
-		// Normalize test_args: accept both JSON string and JSON object.
-		// If it's a quoted string like "{\"key\":\"val\"}", unwrap it.
-		// If it's an object like {"key":"val"}, use it directly.
-		var testArgsRaw []byte
-		if len(a.TestArgs) == 0 {
-			testArgsRaw = []byte("{}")
-		} else if a.TestArgs[0] == '"' {
-			// It's a JSON string — unwrap to get the inner JSON.
-			var s string
-			if err := json.Unmarshal(a.TestArgs, &s); err != nil {
-				return "Invalid JSON in test_args string", nil
-			}
-			testArgsRaw = []byte(s)
-			if !json.Valid(testArgsRaw) {
-				return "Invalid JSON inside test_args string value", nil
-			}
-		} else {
-			// It's a JSON object — use directly.
-			testArgsRaw = a.TestArgs
-		}
-		if !json.Valid(testArgsRaw) {
-			return "Invalid JSON in test_args", nil
+		// Normalize and validate test args.
+		testArgsRaw, argsErr := normalizeTestArgs(a.TestArgs)
+		if argsErr != "" {
+			return argsErr, nil
 		}
 
 		testResult, err := ExecuteSkill(ctx, a.Name, execSource, "", testArgsRaw, deps)
 		if err != nil {
 			return fmt.Sprintf("Skill failed test execution: %v", err), nil
 		}
-
-		lowerResult := strings.ToLower(strings.TrimSpace(testResult))
-		if strings.Contains(lowerResult, "execution error") || strings.HasPrefix(lowerResult, "error") || strings.HasPrefix(lowerResult, "failed to") || strings.Contains(lowerResult, "failed to get") {
+		if isTestFailure(testResult) {
 			return fmt.Sprintf("Skill failed test execution: %s", testResult), nil
 		}
 
@@ -317,38 +336,15 @@ func NewUpdateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 		}
 
 		// Validate/transpile the new source.
-		var execSource string
-		if lang == "typescript" {
-			transpiled, tErr := ValidateTypeScriptSource(a.Code)
-			if tErr != nil {
-				return fmt.Sprintf("TypeScript error: %v", tErr), nil
-			}
-			execSource = transpiled
-		} else {
-			if err := validateSkillSource(a.Code); err != nil {
-				return fmt.Sprintf("JavaScript syntax error: %v", err), nil
-			}
-			execSource = a.Code
+		execSource, compileErr := validateAndCompileSource(lang, a.Code)
+		if compileErr != "" {
+			return compileErr, nil
 		}
 
-		// Normalize test_args.
-		var testArgsRaw []byte
-		if len(a.TestArgs) == 0 {
-			testArgsRaw = []byte("{}")
-		} else if a.TestArgs[0] == '"' {
-			var s string
-			if err := json.Unmarshal(a.TestArgs, &s); err != nil {
-				return "Invalid JSON in test_args string", nil
-			}
-			testArgsRaw = []byte(s)
-			if !json.Valid(testArgsRaw) {
-				return "Invalid JSON inside test_args string value", nil
-			}
-		} else {
-			testArgsRaw = a.TestArgs
-		}
-		if !json.Valid(testArgsRaw) {
-			return "Invalid JSON in test_args", nil
+		// Normalize and validate test args.
+		testArgsRaw, argsErr := normalizeTestArgs(a.TestArgs)
+		if argsErr != "" {
+			return argsErr, nil
 		}
 
 		// Test execution with the new source.
@@ -356,9 +352,7 @@ func NewUpdateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 		if err != nil {
 			return fmt.Sprintf("Skill failed test execution: %v", err), nil
 		}
-
-		lowerResult := strings.ToLower(strings.TrimSpace(testResult))
-		if strings.Contains(lowerResult, "execution error") || strings.HasPrefix(lowerResult, "error") || strings.HasPrefix(lowerResult, "failed to") || strings.Contains(lowerResult, "failed to get") {
+		if isTestFailure(testResult) {
 			return fmt.Sprintf("Skill failed test execution: %s", testResult), nil
 		}
 

@@ -21,6 +21,7 @@ import (
 	"sokratos/platform"
 	"sokratos/routines"
 	"sokratos/textutil"
+	"sokratos/timeouts"
 	"sokratos/tools"
 )
 
@@ -72,7 +73,7 @@ func handleMetrics(_ messageContext, args string) string {
 	if len(parts) >= 2 {
 		window = parts[1]
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeouts.RoutineDB)
 	defer cancel()
 	result, err := tools.QueryMetricsReport(ctx, db.Pool, report, window)
 	if err != nil {
@@ -319,7 +320,22 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		}
 	}()
 
-	reply, msgs, err := llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, mc.confirmExec, mc.lb.TrimFn, &llm.QueryOrchestratorOpts{
+	// Progress handle for the orchestrator path — created lazily on the
+	// first tool call so messages without tools don't get a stale progress msg.
+	var ph *platform.ProgressHandle
+
+	// Wrap confirmExec to inject progress reporting into the tool context.
+	progressExec := func(ctx context.Context, raw json.RawMessage) (string, error) {
+		if ph != nil {
+			ctx = tools.WithProgress(ctx, func(status string) {
+				ph.Update(context.Background(), status)
+			})
+		}
+		return mc.confirmExec(ctx, raw)
+	}
+
+	// Build shared orchestrator options used by both primary and escalation calls.
+	baseOpts := llm.QueryOrchestratorOpts{
 		Parts:              visionParts,
 		History:            history,
 		PersonalityContent: personalityContent,
@@ -329,15 +345,6 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		MaxToolResultLen:   mc.cfg.MaxToolResultLen,
 		MaxWebSources:      mc.cfg.MaxWebSources,
 		ToolAgent:          mc.lb.ToolAgent,
-		MandatedBrainTools: mandatedBrainTools,
-		EscalateTools:      escalateTools,
-		OnToolStart: func(toolName string) {
-			choice.ReleaseReserved()
-			acquired = false
-			if toolName == "reason" {
-				mc.platform.Send(context.Background(), msg.ChannelID, "Thinking...", msg.ID)
-			}
-		},
 		OnToolEnd: func(reCtx context.Context) error {
 			if reErr := choice.Reacquire(reCtx); reErr != nil {
 				return reErr
@@ -352,13 +359,41 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 			}
 			mc.svc.Metrics.EmitDuration("tool.exec", dur, map[string]string{"tool": tool, "result": result})
 		},
-	})
+	}
+
+	primaryOpts := baseOpts
+	primaryOpts.MandatedBrainTools = mandatedBrainTools
+	primaryOpts.EscalateTools = escalateTools
+	primaryOpts.OnToolStart = func(toolName string) {
+		choice.ReleaseReserved()
+		acquired = false
+		// Create or update progress handle with the tool being called.
+		status := mc.registry.GetProgressLabel(toolName)
+		if ph == nil {
+			handle, err := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, status, msg.ID)
+			if err == nil {
+				ph = handle
+			}
+		} else {
+			ph.Update(context.Background(), status)
+		}
+	}
+
+	reply, msgs, err := llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, progressExec, mc.lb.TrimFn, &primaryOpts)
 
 	// Check for EscalationRequest — replay on Brain inline.
 	var esc *llm.EscalationRequest
 	if errors.As(err, &esc) {
 		logger.Log.Infof("[escalation] %s triggered escalation to Brain", esc.ToolName)
-		mc.platform.Send(context.Background(), msg.ChannelID, "Thinking...", msg.ID)
+		// Update or create progress handle for escalation.
+		if ph != nil {
+			ph.Update(context.Background(), "Escalating to Brain...")
+		} else {
+			handle, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, "Escalating to Brain...", msg.ID)
+			if phErr == nil {
+				ph = handle
+			}
+		}
 		choice.Release()
 		acquired = false
 
@@ -367,35 +402,15 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		acquired = true
 
 		// Replay on Brain without EscalateTools (Brain handles everything directly).
-		reply, msgs, err = llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, mc.confirmExec, mc.lb.TrimFn, &llm.QueryOrchestratorOpts{
-			Parts:              visionParts,
-			History:            history,
-			PersonalityContent: personalityContent,
-			ProfileContent:     profileContent,
-			TemporalContext:    pf.temporal,
-			PrefetchContent:    pf.content,
-			MaxToolResultLen:   mc.cfg.MaxToolResultLen,
-			MaxWebSources:      mc.cfg.MaxWebSources,
-			ToolAgent:          mc.lb.ToolAgent,
-			OnToolStart: func(toolName string) {
-				choice.ReleaseReserved()
-				acquired = false
-			},
-			OnToolEnd: func(reCtx context.Context) error {
-				if reErr := choice.Reacquire(reCtx); reErr != nil {
-					return reErr
-				}
-				acquired = true
-				return nil
-			},
-			OnToolExec: func(tool string, dur time.Duration, toolErr error) {
-				result := "ok"
-				if toolErr != nil {
-					result = "hard_error"
-				}
-				mc.svc.Metrics.EmitDuration("tool.exec", dur, map[string]string{"tool": tool, "result": result})
-			},
-		})
+		escOpts := baseOpts
+		escOpts.OnToolStart = func(toolName string) {
+			choice.ReleaseReserved()
+			acquired = false
+			if ph != nil {
+				ph.Update(context.Background(), mc.registry.GetProgressLabel(toolName))
+			}
+		}
+		reply, msgs, err = llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, progressExec, mc.lb.TrimFn, &escOpts)
 		mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": "escalated"})
 	}
 
@@ -429,11 +444,14 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 
 	typingCancel()
 
-	msgPath := "brain"
-	if gotSupervisor {
-		msgPath = "direct"
+	// Emit message latency (skip if escalation already recorded it).
+	if esc == nil {
+		msgPath := "brain"
+		if gotSupervisor {
+			msgPath = "direct"
+		}
+		mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": msgPath})
 	}
-	mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": msgPath})
 
 	toolCtx, toolsUsed := summarizeToolContext(msgs)
 	completeMessageHandling(mc, msg, messageResult{
@@ -480,8 +498,10 @@ func completeMessageHandling(mc messageContext, msg *platform.IncomingMessage, m
 	if db.Pool != nil && mc.cfg.EmbedURL != "" {
 		engine.SlideAndArchiveContext(context.Background(), mc.svc.StateMgr, mc.eng.MaxMessages, engine.ArchiveDeps{
 			DB: db.Pool, EmbedEndpoint: mc.cfg.EmbedURL, EmbedModel: mc.cfg.EmbedModel,
-			DTCQueueFn: mc.svc.DTCQueueFunc, SubagentFn: mc.svc.SubagentFunc,
-			GrammarFn: mc.svc.GrammarFunc, BgGrammarFn: mc.svc.BgGrammarFunc, QueueFn: mc.svc.QueueFunc,
+			MemoryFuncs: engine.MemoryFuncs{
+				DTCQueueFn: mc.svc.DTCQueueFunc, SubagentFn: mc.svc.SubagentFunc,
+				GrammarFn: mc.svc.GrammarFunc, BgGrammarFn: mc.svc.BgGrammarFunc, QueueFn: mc.svc.QueueFunc,
+			},
 			PipelineID: mr.PipelineID,
 		})
 	}

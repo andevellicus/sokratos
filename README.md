@@ -18,7 +18,7 @@ Every user message goes through the 9B for **grammar-constrained triage**, which
 
 1. **Dispatch (single tool)** — 9B sends an ack, executes the tool, and synthesizes the response. Fully handled by the 9B.
 2. **Dispatch (multi-step)** — 9B sends an ack, then a `SubagentSupervisor` loop runs 2-5 tool rounds with grammar-constrained decisions.
-3. **Escalate to orchestrator** — the 9B orchestrator handles the request directly (including tool calls). For complex reasoning, the orchestrator can invoke the `reason` tool to escalate to the Brain (122B). A "Thinking..." notification is sent to the user during Brain calls.
+3. **Escalate to orchestrator** — the 9B orchestrator handles the request directly (including tool calls). For complex reasoning, the orchestrator can invoke the `deep_think` tool to escalate to the Brain (122B). A "Thinking..." notification is sent to the user during Brain calls.
 
 A **slot router** manages backend allocation — Brain preferred for interactive messages (accuracy), 9B preferred for background work (throughput). During tool execution, slots are released and reacquired after, preventing long-running tools from blocking LLM access. See [docs/dispatch.md](docs/dispatch.md) for the full technical reference.
 
@@ -149,7 +149,7 @@ The orchestrator has access to the following built-in tools:
 | `save_memory` | Persist a fact or preference to long-term memory |
 | `forget_topic` | Delete memories related to a topic by semantic similarity |
 | `consolidate_memory` | Synthesize high-salience memories into the core profile |
-| `reason` | Route complex reasoning to the Brain model with full chain-of-thought. Supports `background=true` to spawn a background Brain session with tool access for complex tasks (skill creation, research, analysis). |
+| `deep_think` | Route complex reasoning to the Brain model with full chain-of-thought. Supports `background=true` to spawn a background Brain session with tool access for complex tasks (skill creation, research, analysis). |
 | `delegate_task` | Delegate structured tasks to subagent with scoped tool access |
 | `plan_and_execute` | Decompose a directive into steps via DTC, execute via subagent (supports background mode) |
 | `check_background_task` | List, check status, or cancel background tasks |
@@ -217,7 +217,7 @@ See [docs/dispatch.md](docs/dispatch.md) for the full technical reference on mes
 Complex tasks (skill creation, research, multi-step analysis) can be offloaded to background Brain sessions that run concurrently while the 9B continues serving the user. Two paths converge:
 
 1. **Mandatory intercept** — `create_skill` and `update_skill` are intercepted at the supervisor level and always routed to a background Brain session.
-2. **Voluntary** — The 9B calls `reason(background=true, task_type="...")` to spawn a background Brain session for any complex task.
+2. **Voluntary** — The 9B calls `deep_think(background=true, task_type="...")` to spawn a background Brain session for any complex task.
 
 Background jobs support multi-round tool execution and can ask the user clarifying questions (the job parks until input arrives via `reply_to_job`). Jobs can be cancelled via `cancel_job`. Session prompts are selected by `task_type` (e.g. `"create_skill"` uses a skill-creation prompt, general tasks use a reasoning prompt).
 
@@ -373,7 +373,7 @@ sokratos/
     create_skill.go    # create_skill tool (TS transpile, test, persist)
     transpile.go       # TypeScript → JS transpilation via esbuild
     skill_vm.go        # Goja VM setup and skill runtime globals
-    deep_thinker.go    # reason tool (deep thinking + background Brain sessions)
+    deep_thinker.go    # deep_think tool (deep thinking + background Brain sessions)
     personality.go     # manage_personality tool
     objectives.go      # manage_objectives tool
     routines.go        # manage_routines tool (uses routines/ package)

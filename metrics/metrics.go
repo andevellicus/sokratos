@@ -30,12 +30,13 @@ const (
 // All public methods are safe for concurrent use and never block the caller.
 // A nil Collector or one with a nil pool is a no-op.
 type Collector struct {
-	pool    *pgxpool.Pool
-	mu      sync.Mutex
-	buf     []Event
-	flushCh chan struct{}
-	stopCh  chan struct{}
-	done    chan struct{}
+	pool     *pgxpool.Pool
+	mu       sync.Mutex
+	buf      []Event
+	flushCh  chan struct{}
+	stopCh   chan struct{}
+	done     chan struct{}
+	closeOnce sync.Once
 }
 
 // New creates a Collector backed by the given pool.
@@ -87,12 +88,15 @@ func (c *Collector) Since(name string, start time.Time, dims map[string]string) 
 }
 
 // Close signals the flusher to stop and waits for it to finish.
+// Safe to call multiple times.
 func (c *Collector) Close() {
 	if c == nil {
 		return
 	}
-	close(c.stopCh)
-	<-c.done
+	c.closeOnce.Do(func() {
+		close(c.stopCh)
+		<-c.done
+	})
 }
 
 func (c *Collector) flusher() {

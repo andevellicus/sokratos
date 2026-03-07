@@ -42,3 +42,4 @@ Skill names use snake_case (e.g., `check_astronomy_events`, `fetch_weather`).
 3. **Error handling** — use try/catch. Return descriptive error strings, don't throw uncaught exceptions.
 4. **TypeScript** — preferred language. Will be transpiled via esbuild (ES2020 target). No type-only imports.
 5. **No Node.js APIs** — no require(), no fs, no process. Only the globals listed above.
+6. **Do NOT call deep_think** — you ARE the deep thinker. Call tools directly (create_skill, search_web, etc.).

@@ -195,7 +195,7 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 			logger.Log.Infof("[plan] executing step %d/%d: %s", i+1, len(steps), step.Description)
 			toolExec := NewScopedToolExec(deps.Registry, deps.DC)
 			result, err = clients.SubagentSupervisor(stepCtx, deps.SC, deps.DC.Grammar(), systemPrompt,
-				step.Description, toolExec, 10)
+				step.Description, toolExec, 10, nil)
 		}
 		stepCancel()
 

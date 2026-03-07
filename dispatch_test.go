@@ -23,7 +23,7 @@ func TestNeverDispatchTools(t *testing.T) {
 	expected := []string{
 		"send_email", "create_event", "create_skill", "manage_skills",
 		"manage_routines", "manage_personality", "save_memory", "forget_topic",
-		"reason", "plan_and_execute", "delegate_task", "ask_database",
+		"deep_think", "plan_and_execute", "delegate_task", "ask_database",
 		"manage_objectives", "write_file", "patch_file", "update_skill",
 		"reply_to_job", "cancel_job", "run_command",
 	}

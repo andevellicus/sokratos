@@ -16,3 +16,4 @@ Complete the user's request using the available tools. This is a background sess
 - If you need clarification from the user, ask a specific question and wait for their reply.
 - When done, present your final results clearly. Summarize key findings and include relevant details.
 - If a tool returns an error, try an alternative approach before giving up.
+- Do NOT call deep_think — you ARE the deep thinker. Call tools directly.

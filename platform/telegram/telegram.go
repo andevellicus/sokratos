@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"path"
 	"strconv"
 	"strings"
@@ -13,9 +12,14 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"sokratos/httputil"
 	"sokratos/logger"
 	"sokratos/platform"
 )
+
+// Compile-time interface checks.
+var _ platform.Platform = (*TelegramPlatform)(nil)
+var _ platform.MenuPrompter = (*TelegramPlatform)(nil)
 
 // TelegramPlatform implements platform.Platform for the Telegram Bot API.
 type TelegramPlatform struct {
@@ -231,6 +235,89 @@ func (tp *TelegramPlatform) Confirm(ctx context.Context, channelID, description 
 	}
 }
 
+// --- MenuPrompter ---
+
+// PromptWithOptions sends an inline keyboard with the given options and blocks
+// until a selection is made, the timeout elapses, or the context is cancelled.
+// Returns the selected index, or -1 on timeout/cancel.
+func (tp *TelegramPlatform) PromptWithOptions(ctx context.Context, channelID, prompt string, options []platform.MenuOption, timeout time.Duration) (int, error) {
+	nonce := fmt.Sprintf("menu_%d", time.Now().UnixNano())
+
+	// Build rows: 2 buttons per row, max 8 options.
+	maxOpts := len(options)
+	if maxOpts > 8 {
+		maxOpts = 8
+	}
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i := 0; i < maxOpts; i += 2 {
+		var row []tgbotapi.InlineKeyboardButton
+		row = append(row, tgbotapi.NewInlineKeyboardButtonData(options[i].Label, fmt.Sprintf("%s_%d", nonce, i)))
+		if i+1 < maxOpts {
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData(options[i+1].Label, fmt.Sprintf("%s_%d", nonce, i+1)))
+		}
+		rows = append(rows, row)
+	}
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	// Send to all allowed users.
+	var sentMsgIDs []int
+	for id := range tp.allowedIDs {
+		msg := tgbotapi.NewMessage(id, prompt)
+		msg.ReplyMarkup = keyboard
+		sent, err := tp.bot.Send(msg)
+		if err == nil {
+			sentMsgIDs = append(sentMsgIDs, sent.MessageID)
+		}
+	}
+
+	removeKeyboard := func(suffix string) {
+		for id := range tp.allowedIDs {
+			for _, msgID := range sentMsgIDs {
+				edit := tgbotapi.NewEditMessageText(id, msgID, prompt+"\n\n"+suffix)
+				tp.bot.Send(edit)
+			}
+		}
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	prefix := nonce + "_"
+	for {
+		select {
+		case cb := <-tp.callbackChan:
+			if cb == nil || cb.Data == "" {
+				continue
+			}
+			if len(tp.allowedIDs) > 0 {
+				if _, ok := tp.allowedIDs[cb.From.ID]; !ok {
+					continue
+				}
+			}
+			if !strings.HasPrefix(cb.Data, prefix) {
+				continue
+			}
+			// Parse index from callback data.
+			idxStr := strings.TrimPrefix(cb.Data, prefix)
+			idx, err := strconv.Atoi(idxStr)
+			if err != nil || idx < 0 || idx >= maxOpts {
+				continue
+			}
+			// Acknowledge.
+			ack := tgbotapi.NewCallback(cb.ID, "")
+			tp.bot.Send(ack)
+			removeKeyboard("Selected: " + options[idx].Label)
+			return idx, nil
+		case <-timer.C:
+			removeKeyboard("⏰ Timed out")
+			return -1, nil
+		case <-ctx.Done():
+			removeKeyboard("⏰ Cancelled")
+			return -1, ctx.Err()
+		}
+	}
+}
+
 // --- Receiver ---
 
 // Messages returns the channel of incoming messages.
@@ -296,7 +383,8 @@ func downloadTelegramPhoto(bot *tgbotapi.BotAPI, fileID string) ([]byte, string,
 		return nil, "", fmt.Errorf("get file: %w", err)
 	}
 
-	resp, err := http.Get(file.Link(bot.Token))
+	client := httputil.NewClient(30 * time.Second)
+	resp, err := client.Get(file.Link(bot.Token))
 	if err != nil {
 		return nil, "", fmt.Errorf("download file: %w", err)
 	}

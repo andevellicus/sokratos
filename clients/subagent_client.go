@@ -164,6 +164,10 @@ func (sc *SubagentClient) exec(ctx context.Context, opts requestOpts) (string, e
 	}
 	if opts.thinking {
 		req.ReasoningFormat = "deepseek"
+	} else {
+		// Explicitly set "none" to prevent llama-server from auto-detecting
+		// reasoning_format:"deepseek" for thinking-capable models like Qwen3.5.
+		req.ReasoningFormat = "none"
 	}
 	body, err := json.Marshal(req)
 	if err != nil {

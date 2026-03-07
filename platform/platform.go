@@ -60,6 +60,48 @@ type Command struct {
 	Description string
 }
 
+// ProgressHandle tracks a single editable progress message. It uses
+// Send to create the initial message and Edit to update it in place.
+type ProgressHandle struct {
+	ChannelID string
+	MessageID string
+	Sender    Sender
+}
+
+// NewProgressHandle sends an initial progress message and returns a handle
+// that can be updated in place via Edit.
+func NewProgressHandle(ctx context.Context, sender Sender, channelID, initial, replyTo string) (*ProgressHandle, error) {
+	msgID, err := sender.Send(ctx, channelID, initial, replyTo)
+	if err != nil {
+		return nil, err
+	}
+	return &ProgressHandle{
+		ChannelID: channelID,
+		MessageID: msgID,
+		Sender:    sender,
+	}, nil
+}
+
+// Update edits the progress message in place.
+func (h *ProgressHandle) Update(ctx context.Context, markdown string) error {
+	return h.Sender.Edit(ctx, h.ChannelID, h.MessageID, markdown)
+}
+
+// MenuOption represents a single selectable option in a structured menu.
+type MenuOption struct {
+	Label string // display text
+	Value string // returned on selection
+}
+
+// MenuPrompter presents interactive menus with clickable options.
+// Platforms that support this should implement it as an optional interface
+// checked via type assertion.
+type MenuPrompter interface {
+	// PromptWithOptions shows a prompt with clickable options.
+	// Returns selected index, or -1 on timeout/cancel.
+	PromptWithOptions(ctx context.Context, channelID, prompt string, options []MenuOption, timeout time.Duration) (int, error)
+}
+
 // Platform bundles all platform capabilities.
 type Platform interface {
 	Sender

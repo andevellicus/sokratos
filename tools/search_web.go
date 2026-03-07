@@ -122,12 +122,15 @@ func NewSearchWeb(searxngURL string, sc *clients.SubagentClient) ToolFunc {
 			}
 			go func() { wg.Wait(); close(results) }()
 
+			fetchedCount := 0
 			for fr := range results {
 				if fr.err != nil {
 					logger.Log.Debugf("[search_web] auto-fetch failed for %s: %v", sr.Results[fr.index].URL, fr.err)
-					continue
+				} else {
+					fetched[fr.index] = fr.content
 				}
-				fetched[fr.index] = fr.content
+				fetchedCount++
+				ReportProgress(ctx, fmt.Sprintf("Fetched %d/%d pages...", fetchedCount, fetchCount))
 			}
 
 			// Try subagent summarization for fetched pages (non-blocking).

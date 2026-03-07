@@ -33,6 +33,9 @@ func (p SupervisorParser) Parse(output string) ParseResult {
 	if !ok && p.IsKnownTool != nil {
 		intent, ok = extractBareToolTag(output, p.IsKnownTool)
 	}
+	if !ok && p.IsKnownTool != nil {
+		intent, ok = extractAngleBracketIntent(output, p.IsKnownTool)
+	}
 	if !ok {
 		return ParseResult{}
 	}

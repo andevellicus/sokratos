@@ -67,7 +67,7 @@ func deepThink(ctx context.Context, args json.RawMessage, dtc *clients.DeepThink
 	// The supervisor will propagate this as an error to spawn a background Brain job.
 	if a.Background {
 		return "", &llm.BackgroundJobRequest{
-			Tool:             "reason",
+			Tool:             "deep_think",
 			UserGoal:         a.ProblemStatement,
 			TaskType:         a.TaskType,
 			ProblemStatement: a.ProblemStatement,

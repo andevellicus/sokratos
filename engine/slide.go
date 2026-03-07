@@ -24,12 +24,8 @@ type ArchiveDeps struct {
 	DB            *pgxpool.Pool
 	EmbedEndpoint string
 	EmbedModel    string
-	DTCQueueFn    memory.WorkQueueFunc       // DTC work queue — preferred for distillation (less hallucination)
-	SubagentFn    memory.SubagentFunc        // blocking, for distillation fallback
-	GrammarFn     memory.GrammarSubagentFunc // blocking, for distillation with grammar
-	BgGrammarFn   memory.GrammarSubagentFunc // non-blocking, for contradiction checks + entity extraction
-	QueueFn       memory.WorkQueueFunc       // subagent work queue for distillation fallback
-	PipelineID    int64                      // Telegram message ID of the originating pipeline; 0 = no tracking
+	MemoryFuncs                // DTCQueueFn, SubagentFn, GrammarFn, BgGrammarFn, QueueFn
+	PipelineID    int64        // Telegram message ID of the originating pipeline; 0 = no tracking
 }
 
 // SlideAndArchiveContext trims old messages from the StateManager's

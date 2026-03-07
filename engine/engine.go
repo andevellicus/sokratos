@@ -97,7 +97,7 @@ type Engine struct {
 	DB                 *pgxpool.Pool // nil when running without database
 	EmbedEndpoint      string        // empty when embeddings unavailable
 	EmbedModel         string        // model name for embedding endpoint
-	MaxMessages        int           // context window cap for slide (e.g. 20)
+	MaxMessages        int           // context window cap for slide (default 40 via MAX_MESSAGES)
 	PersonalityContent string        // personality traits markdown for system prompt injection
 	ProfileContent     string        // identity profile JSON for system prompt injection
 	TemporalContent    string        // temporal context XML for system prompt injection
@@ -276,7 +276,10 @@ func (e *Engine) resolveOrchestrator(ctx context.Context, preferBrain bool) Orch
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.
 func (e *Engine) archiveDeps() ArchiveDeps {
-	return ArchiveDeps{DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel, DTCQueueFn: e.Memory.DTCQueueFn, SubagentFn: e.Memory.SubagentFn, GrammarFn: e.Memory.GrammarFn, BgGrammarFn: e.Memory.BgGrammarFn, QueueFn: e.Memory.QueueFn}
+	return ArchiveDeps{
+		DB: e.DB, EmbedEndpoint: e.EmbedEndpoint, EmbedModel: e.EmbedModel,
+		MemoryFuncs: e.Memory,
+	}
 }
 
 // Run starts the engine's background loops. Three independent loops run

@@ -63,7 +63,7 @@ All three branches include an `ack` field — a brief natural reply shown to the
 2. **Dispatch (multi-step)** when the request needs 2-3 sequential tool calls but no complex reasoning.
 3. **Escalate** when the request needs judgment, creativity, complex reasoning, or involves side effects.
 
-Never dispatched: `send_email`, `create_event`, `create_skill`, `update_skill`, `manage_skills`, `manage_routines`, `manage_personality`, `manage_objectives`, `save_memory`, `forget_topic`, `reason`, `plan_and_execute`, `delegate_task`, `ask_database`, `write_file`, `patch_file`, `reply_to_job`, `cancel_job`, `run_command`.
+Never dispatched: `send_email`, `create_event`, `manage_skills`, `manage_routines`, `manage_personality`, `manage_objectives`, `save_memory`, `forget_topic`, `deep_think`, `plan_and_execute`, `delegate_task`, `reply_to_job`, `cancel_job`, `prompt_user`, plus all tools in `escalateTools` and `mandatedBrainTools` (auto-populated via `init()`).
 
 ---
 
@@ -168,7 +168,7 @@ Brain escalation does **not** use synthesis — the Brain's final response is se
 Complex tasks are offloaded to background Brain sessions (`runBackgroundJob` in `dispatch.go`) that run concurrently. Two paths:
 
 1. **Mandatory intercept** — `create_skill` and `update_skill` are intercepted at the supervisor level via `MandatedBrainTools` and always routed to a background Brain session.
-2. **Voluntary** — The 9B calls `reason(background=true)` which returns a `BackgroundJobRequest` sentinel error, propagated through the supervisor to `processMessage`.
+2. **Voluntary** — The 9B calls `deep_think(background=true)` which returns a `BackgroundJobRequest` sentinel error, propagated through the supervisor to `processMessage`.
 
 Each job selects a session prompt by `TaskType` (`brainSessionPrompts` map), falling back to `prompts.SessionReason` for general tasks. Jobs support multi-round tool execution (max 20 rounds) and can ask the user questions — the goroutine parks waiting for input via `reply_to_job`. The `toolSucceeded` flag provides a completion signal for jobs with a target tool (e.g. `create_skill`).
 

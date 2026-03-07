@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -129,9 +130,10 @@ func registerAITools(registry *tools.Registry, dtc *clients.DeepThinkerClient, p
 	if dtc == nil {
 		return
 	}
-	registry.Register("reason", tools.NewDeepThink(dtc, pool, embedURL, embedModel), tools.ToolSchema{
-		Name:        "reason",
-		Description: "Send a complex problem to the deep reasoning model (122B Brain) for thorough analysis. Use background=true for tasks requiring tool access (skill creation, research, writing).",
+	registry.Register("deep_think", tools.NewDeepThink(dtc, pool, embedURL, embedModel), tools.ToolSchema{
+		Name:          "deep_think",
+		Description:   "Send a complex problem to the deep reasoning model (122B Brain) for thorough analysis. Use background=true for tasks requiring tool access. REQUIRED for skill creation: deep_think(background=true, task_type=\"create_skill\").",
+		ProgressLabel: "Let me think about that....",
 		Params: []tools.ParamSchema{
 			{Name: "problem_statement", Type: "string", Required: true},
 			{Name: "background", Type: "boolean", Required: false},
@@ -140,22 +142,30 @@ func registerAITools(registry *tools.Registry, dtc *clients.DeepThinkerClient, p
 	})
 }
 
+// coreDelegatableTools is the canonical list of built-in tools available
+// for subagent delegation. Skills are appended dynamically by rebuildGrammar.
+var coreDelegatableTools = []string{
+	"search_email", "search_calendar", "search_memory", "save_memory",
+	"search_web", "read_url", "run_command",
+	"read_file", "write_file", "patch_file", "list_files",
+	"create_skill", "manage_skills", "update_skill",
+}
+
 // registerDelegateTask registers delegate_task AFTER all delegatable tools
-// are already registered so the grammar is built with their schemas. Core
-// tools (search_email, search_calendar, search_memory, save_memory) are
-// always available; user-created skills are added dynamically via
-// rebuildGrammar. Returns the DelegateConfig for live updates.
+// are already registered so the grammar is built with their schemas.
+// Returns the DelegateConfig for live updates.
 func registerDelegateTask(registry *tools.Registry, subagent *clients.SubagentClient) *tools.DelegateConfig {
 	if subagent == nil {
 		return nil
 	}
-	coreTools := []string{"search_email", "search_calendar", "search_memory", "save_memory", "search_web", "read_url", "run_command", "read_file", "write_file", "patch_file", "list_files", "create_skill", "manage_skills", "update_skill"}
+	coreTools := coreDelegatableTools
 	schemas := registry.SchemasForTools(coreTools)
 	g := grammar.BuildSubagentToolGrammar(schemas)
 	dc := tools.NewDelegateConfig(coreTools, g)
 	registry.Register("delegate_task", tools.NewDelegateTask(subagent, registry, dc), tools.ToolSchema{
-		Name:        "delegate_task",
-		Description: "Delegate a read-only task to a lightweight subagent",
+		Name:          "delegate_task",
+		Description:   "Delegate a read-only task to a lightweight subagent",
+		ProgressLabel: "Working on it...",
 		Params: []tools.ParamSchema{
 			{Name: "directive", Type: "string", Required: true},
 			{Name: "context", Type: "string", Required: false},
@@ -232,8 +242,9 @@ func registerPlanTools(registry *tools.Registry, dtc *clients.DeepThinkerClient,
 
 	planDeps := tools.PlanExecDeps{SC: subagent, DTC: dtc, DC: dc, Registry: registry}
 	registry.Register("plan_and_execute", tools.NewPlanAndExecute(planDeps, wt), tools.ToolSchema{
-		Name:        "plan_and_execute",
-		Description: "Decompose and execute complex multi-step tasks (background=true for async)",
+		Name:          "plan_and_execute",
+		Description:   "Decompose and execute complex multi-step tasks (background=true for async). NOT for skill creation — use deep_think(background=true, task_type=\"create_skill\") instead.",
+		ProgressLabel: "Working on it...",
 		Params: []tools.ParamSchema{
 			{Name: "directive", Type: "string", Required: true},
 			{Name: "context", Type: "string", Required: false},
@@ -292,8 +303,9 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 
 	if db.Pool != nil && cfg.EmbedURL != "" {
 		registry.Register("search_memory", tools.NewSearchMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.Subagent, cfg.MemorySearchLimit), tools.ToolSchema{
-			Name:        "search_memory",
-			Description: "Search long-term memory by keywords, tags, or date range",
+			Name:          "search_memory",
+			Description:   "Search long-term memory by keywords, tags, or date range",
+			ProgressLabel: "Searching memory...",
 			Params: []tools.ParamSchema{
 				{Name: "query", Type: "string", Required: true},
 				{Name: "tags", Type: "array", Required: false},
@@ -303,8 +315,9 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 			},
 		})
 		registry.Register("save_memory", tools.NewSaveMemory(db.Pool, cfg.EmbedURL, cfg.EmbedModel, svc.BgGrammarFunc, svc.GrammarFunc, svc.QueueFunc), tools.ToolSchema{
-			Name:        "save_memory",
-			Description: "Save to long-term memory with salience scoring",
+			Name:          "save_memory",
+			Description:   "Save to long-term memory with salience scoring",
+			ProgressLabel: "Saving to memory...",
 			Params: []tools.ParamSchema{
 				{Name: "summary", Type: "string", Required: true},
 				{Name: "tags", Type: "array", Required: false},
@@ -354,6 +367,25 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 	foc := tools.NewFileOpsConfig(cfg.WorkspaceDir, svc.Platform, cfg.ConfirmationTimeout)
 	registerFileTools(registry, foc)
 
+	// Register prompt_user for interactive option selection.
+	if svc.Platform != nil {
+		// Derive channel from the first allowed Telegram ID (single-user bot).
+		channelIDFn := func() string {
+			for id := range cfg.AllowedIDs {
+				return strconv.FormatInt(id, 10)
+			}
+			return ""
+		}
+		registry.Register("prompt_user", tools.NewPromptUser(svc.Platform, channelIDFn, cfg.ConfirmationTimeout), tools.ToolSchema{
+			Name:        "prompt_user",
+			Description: "Present a menu of options to the user and wait for their selection",
+			Params: []tools.ParamSchema{
+				{Name: "prompt", Type: "string", Required: true},
+				{Name: "options", Type: "array", Required: true},
+			},
+		})
+	}
+
 	// Register shell command tool.
 	shellExec := registerShellTool(registry, db.Pool, cfg)
 
@@ -374,8 +406,9 @@ func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg 
 		return
 	}
 	registry.Register("search_email", tools.NewSearchEmail(google.GmailService, pool, triageCfg, emailDisplayBatch, sc), tools.ToolSchema{
-		Name:        "search_email",
-		Description: "Search Gmail inbox with optional time bounds",
+		Name:          "search_email",
+		Description:   "Search Gmail inbox with optional time bounds",
+		ProgressLabel: "Checking email...",
 		Params: []tools.ParamSchema{
 			{Name: "query", Type: "string", Required: false},
 			{Name: "time_min", Type: "string", Required: false},
@@ -384,8 +417,9 @@ func registerGmailTools(registry *tools.Registry, pool *pgxpool.Pool, triageCfg 
 		},
 	})
 	registry.Register("send_email", tools.NewSendEmail(google.GmailService), tools.ToolSchema{
-		Name:        "send_email",
-		Description: "Send a plain-text email",
+		Name:          "send_email",
+		Description:   "Send a plain-text email",
+		ProgressLabel: "Sending email...",
 		Params: []tools.ParamSchema{
 			{Name: "to", Type: "string", Required: true},
 			{Name: "subject", Type: "string", Required: true},
@@ -418,8 +452,9 @@ func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
 		return
 	}
 	registry.Register("search_calendar", tools.NewSearchCalendar(google.CalendarService, pool), tools.ToolSchema{
-		Name:        "search_calendar",
-		Description: "Search Google Calendar for events with optional time bounds",
+		Name:          "search_calendar",
+		Description:   "Search Google Calendar for events with optional time bounds",
+		ProgressLabel: "Checking calendar...",
 		Params: []tools.ParamSchema{
 			{Name: "query", Type: "string", Required: false},
 			{Name: "time_min", Type: "string", Required: false},
@@ -428,8 +463,9 @@ func registerCalendarTools(registry *tools.Registry, pool *pgxpool.Pool) {
 		},
 	})
 	registry.Register("create_event", tools.NewCreateEvent(google.CalendarService), tools.ToolSchema{
-		Name:        "create_event",
-		Description: "Create a Google Calendar event. Use the user's local timezone offset in start/end times (e.g. 2026-03-07T19:00:00-05:00), NOT Z/UTC.",
+		Name:          "create_event",
+		Description:   "Create a Google Calendar event. Use the user's local timezone offset in start/end times (e.g. 2026-03-07T19:00:00-05:00), NOT Z/UTC.",
+		ProgressLabel: "Creating event...",
 		Params: []tools.ParamSchema{
 			{Name: "title", Type: "string", Required: true},
 			{Name: "start", Type: "string", Required: true},
@@ -466,8 +502,9 @@ func registerShellTool(registry *tools.Registry, pool *pgxpool.Pool, cfg *config
 		return nil
 	}
 	registry.Register("run_command", se.ToolFunc(), tools.ToolSchema{
-		Name:        "run_command",
-		Description: "Execute an allowlisted shell command (audited). " + se.CommandDescriptions(),
+		Name:          "run_command",
+		Description:   "Execute an allowlisted shell command (audited). " + se.CommandDescriptions(),
+		ProgressLabel: "Running command...",
 		Params: []tools.ParamSchema{
 			{Name: "command", Type: "string", Required: true},
 			{Name: "working_dir", Type: "string", Required: false},
@@ -479,8 +516,9 @@ func registerShellTool(registry *tools.Registry, pool *pgxpool.Pool, cfg *config
 func registerWebTools(registry *tools.Registry, searxngURL string, sc *clients.SubagentClient) {
 	if searxngURL != "" {
 		registry.Register("search_web", tools.NewSearchWeb(searxngURL, sc), tools.ToolSchema{
-			Name:        "search_web",
-			Description: "Search the internet via SearXNG",
+			Name:          "search_web",
+			Description:   "Search the internet via SearXNG",
+			ProgressLabel: "Searching the web...",
 			Params: []tools.ParamSchema{
 				{Name: "query", Type: "string", Required: true},
 				{Name: "max_results", Type: "number", Required: false},
@@ -488,8 +526,9 @@ func registerWebTools(registry *tools.Registry, searxngURL string, sc *clients.S
 		})
 	}
 	registry.Register("read_url", tools.NewReadURL(), tools.ToolSchema{
-		Name:        "read_url",
-		Description: "Fetch and extract text content from a URL",
+		Name:          "read_url",
+		Description:   "Fetch and extract text content from a URL",
+		ProgressLabel: "Reading page...",
 		Params: []tools.ParamSchema{
 			{Name: "url", Type: "string", Required: true},
 			{Name: "max_chars", Type: "number", Required: false},

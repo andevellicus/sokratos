@@ -60,10 +60,11 @@ type ParamSchema struct {
 // Description is optional — when set, the tool is included in dynamic tool
 // descriptions for the tool agent (used by skills and other runtime-registered tools).
 type ToolSchema struct {
-	Name        string
-	Params      []ParamSchema
-	Description string
-	IsSkill     bool // true for user-created JS skills
+	Name          string
+	Params        []ParamSchema
+	Description   string
+	ProgressLabel string // shown in progress indicators (e.g. "Searching the web...")
+	IsSkill       bool   // true for user-created JS skills
 
 	// ConfirmFormat builds a human-readable confirmation prompt for this tool.
 	// nil → generic "Execute <name>?" fallback.
@@ -142,6 +143,24 @@ func (r *Registry) SchemasForTools(names []string) []ToolSchema {
 func (r *Registry) SchemaFor(name string) (ToolSchema, bool) {
 	s, ok := r.schemas[name]
 	return s, ok
+}
+
+// GetProgressLabel returns the progress label for a tool. Falls back to
+// "Working on it..." if no label is set.
+func (r *Registry) GetProgressLabel(name string) string {
+	if s, ok := r.schemas[name]; ok && s.ProgressLabel != "" {
+		return s.ProgressLabel
+	}
+	return "Working on it..."
+}
+
+// FullToolIndex returns CompactIndex + DynamicSkillDescriptions combined.
+func (r *Registry) FullToolIndex() string {
+	idx := r.CompactIndex()
+	if skills := r.DynamicSkillDescriptions(); skills != "" {
+		idx += "\n" + skills
+	}
+	return idx
 }
 
 // CompactIndex returns a compact one-line-per-tool index for the system prompt.
@@ -274,7 +293,11 @@ func (r *Registry) Execute(ctx context.Context, raw json.RawMessage) (string, er
 	}
 
 	if err != nil {
-		logger.Log.Errorf("[tool] %s error: %v", tc.Name, err)
+		if strings.Contains(err.Error(), "background job requested") {
+			logger.Log.Infof("[tool] %s: spawning background job", tc.Name)
+		} else {
+			logger.Log.Errorf("[tool] %s error: %v", tc.Name, err)
+		}
 	} else if looksLikeError(result) {
 		// Fallback for tools still returning errors as (string, nil).
 		logger.Log.Warnf("[tool] %s result: %s", tc.Name, textutil.Truncate(result, 200))

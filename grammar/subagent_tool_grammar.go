@@ -58,9 +58,11 @@ object ::= "{" ws "}" | "{" ws string ws ":" ws value (ws "," ws string ws ":" w
 	}
 
 	// Build per-tool argument rules.
+	// Rule names must use hyphens only — underscores silently break grammar
+	// enforcement in llama-server (grammar compiles but sampling is unconstrained).
 	var argRuleNames []string
 	for _, s := range schemas {
-		ruleName := "args-" + s.Name
+		ruleName := "args-" + strings.ReplaceAll(s.Name, "_", "-")
 		argRuleNames = append(argRuleNames, ruleName)
 
 		if len(s.Params) == 0 {
@@ -82,9 +84,9 @@ object ::= "{" ws "}" | "{" ws string ws ":" ws value (ws "," ws string ws ":" w
 	// Each tool gets its own tool-call variant to pair name with correct args.
 	var toolCallAlts []string
 	for i, s := range schemas {
-		altName := "tool-call-" + s.Name
+		altName := "tool-call-" + strings.ReplaceAll(s.Name, "_", "-")
 		toolCallAlts = append(toolCallAlts, altName)
-		fmt.Fprintf(&b, `%s ::= "{" ws "\"action\"" ws ":" ws "\"tool\"" ws "," ws "\"name\"" ws ":" ws "%s" ws "," ws "\"arguments\"" ws ":" ws %s ws "}"`,
+		fmt.Fprintf(&b, `%s ::= "{" ws "\"action\"" ws ":" ws "\"tool\"" ws "," ws "\"name\"" ws ":" ws "\"%s\"" ws "," ws "\"arguments\"" ws ":" ws %s ws "}"`,
 			altName, s.Name, argRuleNames[i])
 		b.WriteString("\n")
 	}

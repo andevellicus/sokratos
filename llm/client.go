@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -102,6 +103,7 @@ type ChatRequest struct {
 	Messages           []Message      `json:"messages"`
 	MaxTokens          int            `json:"max_tokens,omitempty"`
 	Grammar            string         `json:"grammar,omitempty"`
+	ReasoningFormat    string         `json:"reasoning_format,omitempty"`
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
@@ -151,7 +153,12 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (ChatResult, error) 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return ChatResult{}, fmt.Errorf("llm server returned status %d", resp.StatusCode)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		detail := strings.TrimSpace(string(errBody))
+		if detail == "" {
+			detail = "no response body"
+		}
+		return ChatResult{}, fmt.Errorf("llm server returned status %d: %s", resp.StatusCode, detail)
 	}
 
 	var raw chatResponse
@@ -208,9 +215,9 @@ type ToolAgentConfig struct {
 // BackgroundJobRequest is a sentinel error returned when the supervisor detects
 // a tool call that should be handled by a background Brain session instead.
 // Returned by both mandatory intercepts (create_skill, update_skill) and the
-// reason tool when called with background=true.
+// deep_think tool when called with background=true.
 type BackgroundJobRequest struct {
-	Tool             string // triggering tool ("create_skill") or "reason"
+	Tool             string // triggering tool ("create_skill") or "deep_think"
 	UserGoal         string // original user message (from supervisor's prompt param)
 	TaskType         string // maps to session prompt; "" = general
 	ProblemStatement string // for reason tool: the problem_statement arg
@@ -245,9 +252,10 @@ type QueryOrchestratorOpts struct {
 	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
 	MandatedBrainTools map[string]string // tools that trigger a background Brain job (key=tool, value=task_type)
 	EscalateTools      map[string]bool   // tools that trigger inline escalation to a more capable model
-	OnToolStart func(toolName string)                           // called before tool execution with tool name (nil = no-op)
-	OnToolEnd   func(ctx context.Context) error                // reacquire slot after tool execution (nil = no-op)
-	OnToolExec  func(toolName string, dur time.Duration, err error) // called after tool execution with timing (nil = no-op)
+	OnToolStart    func(toolName string)                           // called before tool execution with tool name (nil = no-op)
+	OnToolEnd      func(ctx context.Context) error                // reacquire slot after tool execution (nil = no-op)
+	OnToolExec     func(toolName string, dur time.Duration, err error) // called after tool execution with timing (nil = no-op)
+	EnableThinking bool // when true, enables chain-of-thought reasoning (for Brain background jobs)
 }
 
 // QueryOrchestrator sends a prompt to the given model, executing tool calls as

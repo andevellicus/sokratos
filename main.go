@@ -173,11 +173,7 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	// the former dedicated tool agent LLM). Start with the compact index; it will
 	// be rebuilt with the full compact index + dynamic skill descriptions by
 	// rebuildGrammar() after all tools are registered.
-	compactIndex := registry.CompactIndex()
-	toolDescs := strings.Replace(prompts.Tools, "%TOOL_INDEX%", compactIndex, 1)
-	if dynDescs := registry.DynamicSkillDescriptions(); dynDescs != "" {
-		toolDescs += "\n" + dynDescs
-	}
+	toolDescs := strings.Replace(prompts.Tools, "%TOOL_INDEX%", registry.FullToolIndex(), 1)
 	toolAgentConfig := &llm.ToolAgentConfig{
 		ToolDescriptions: toolDescs,
 		Parser:           llm.SupervisorParser{IsKnownTool: registry.Has},

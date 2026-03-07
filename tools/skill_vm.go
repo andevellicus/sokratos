@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dop251/goja"
@@ -206,7 +207,7 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 			toolExec := NewScopedToolExec(deps.Registry, deps.DC)
 			dCtx, dCancel := context.WithTimeout(ctx, TimeoutDelegateCall)
 			defer dCancel()
-			result, err := clients.SubagentSupervisor(dCtx, deps.SC, deps.DC.Grammar(), delegateSystemPrompt, directive, toolExec, 10)
+			result, err := clients.SubagentSupervisor(dCtx, deps.SC, deps.DC.Grammar(), delegateSystemPrompt, directive, toolExec, 10, nil)
 			if err != nil {
 				panic(vm.NewTypeError("delegate failed: " + err.Error()))
 			}
@@ -252,6 +253,8 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 				Error  string
 			}
 			results := make([]batchResult, len(inputs))
+			total := len(inputs)
+			var completed atomic.Int32
 			var wg sync.WaitGroup
 			for i, inp := range inputs {
 				wg.Add(1)
@@ -266,12 +269,14 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 						directive = directive + "\n\n## Context\n" + ctxData
 					}
 					toolExec := NewScopedToolExec(deps.Registry, deps.DC)
-					result, err := clients.SubagentSupervisor(batchCtx, deps.SC, deps.DC.Grammar(), delegateSystemPrompt, directive, toolExec, 10)
+					result, err := clients.SubagentSupervisor(batchCtx, deps.SC, deps.DC.Grammar(), delegateSystemPrompt, directive, toolExec, 10, nil)
 					if err != nil {
 						results[idx] = batchResult{Error: err.Error()}
 					} else {
 						results[idx] = batchResult{Result: result}
 					}
+					n := completed.Add(1)
+					ReportProgress(ctx, fmt.Sprintf("Completed %d/%d tasks...", n, total))
 				}(i, inp)
 			}
 			wg.Wait()

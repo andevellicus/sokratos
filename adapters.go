@@ -76,6 +76,7 @@ func (r *reflectionSinkAdapter) InjectReflection(summary string) {
 }
 
 // Compile-time interface checks.
-var _ engine.Notifier           = (*notifierAdapter)(nil)
-var _ engine.CognitiveServices  = (*cognitiveAdapter)(nil)
-var _ engine.ReflectionSink     = (*reflectionSinkAdapter)(nil)
+var _ engine.Notifier          = (*notifierAdapter)(nil)
+var _ engine.HotReloader       = (*hotReloader)(nil)
+var _ engine.CognitiveServices = (*cognitiveAdapter)(nil)
+var _ engine.ReflectionSink    = (*reflectionSinkAdapter)(nil)

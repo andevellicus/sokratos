@@ -13,6 +13,33 @@ import (
 	"sokratos/platform"
 )
 
+// atomicWriteFile writes content to path atomically via temp file + rename.
+func atomicWriteFile(path, content string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".sokratos-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+
+	_, writeErr := tmp.WriteString(content)
+	closeErr := tmp.Close()
+	if writeErr != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("write failed: %w", writeErr)
+	}
+	if closeErr != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("close failed: %w", closeErr)
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
 const maxReadFileSize = 50 * 1024 // 50KB
 const maxListEntries = 500
 
@@ -100,7 +127,7 @@ func (foc *FileOpsConfig) checkExternalAccess(ctx context.Context, resolved, use
 	return resolved, nil
 }
 
-// resolvAndCheck resolves a path and checks external access if needed.
+// resolveAndCheck resolves a path and checks external access if needed.
 func (foc *FileOpsConfig) resolveAndCheck(ctx context.Context, path string) (string, error) {
 	resolved, inWorkspace, err := resolvePath(foc.WorkspaceDir, path)
 	if err != nil {
@@ -215,27 +242,8 @@ func NewWriteFile(foc *FileOpsConfig) ToolFunc {
 			return "", Errorf("mkdir failed: %v", err)
 		}
 
-		// Atomic write: temp file in same directory, then rename.
-		tmp, err := os.CreateTemp(dir, ".sokratos-write-*")
-		if err != nil {
-			return "", Errorf("create temp file: %v", err)
-		}
-		tmpName := tmp.Name()
-
-		_, writeErr := tmp.WriteString(req.Content)
-		closeErr := tmp.Close()
-		if writeErr != nil {
-			os.Remove(tmpName)
-			return "", Errorf("write failed: %v", writeErr)
-		}
-		if closeErr != nil {
-			os.Remove(tmpName)
-			return "", Errorf("close failed: %v", closeErr)
-		}
-
-		if err := os.Rename(tmpName, resolved); err != nil {
-			os.Remove(tmpName)
-			return "", Errorf("rename failed: %v", err)
+		if err := atomicWriteFile(resolved, req.Content); err != nil {
+			return "", Errorf("%v", err)
 		}
 
 		return fmt.Sprintf("Wrote %d bytes to %s", len(req.Content), req.Path), nil
@@ -420,11 +428,11 @@ func NewPatchFile(foc *FileOpsConfig) ToolFunc {
 
 		newContent := strings.Replace(content, req.OldString, req.NewString, 1)
 
-		if err := os.WriteFile(resolved, []byte(newContent), 0o644); err != nil {
+		if err := atomicWriteFile(resolved, newContent); err != nil {
 			if os.IsPermission(err) {
 				return fmt.Sprintf("Permission denied writing: %s", req.Path), nil
 			}
-			return "", Errorf("write failed: %v", err)
+			return "", Errorf("%v", err)
 		}
 
 		return fmt.Sprintf("Patched %s (replaced 1 occurrence)", req.Path), nil

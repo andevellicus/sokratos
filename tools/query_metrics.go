@@ -90,7 +90,7 @@ func runOverview(ctx context.Context, pool *pgxpool.Pool, interval, window strin
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Metrics Overview (last %s)\n", window)
 	sb.WriteString("─────────────────────────────\n")
-	any := false
+	found := false
 	for rows.Next() {
 		var name string
 		var count int64
@@ -99,9 +99,9 @@ func runOverview(ctx context.Context, pool *pgxpool.Pool, interval, window strin
 			continue
 		}
 		fmt.Fprintf(&sb, "%-22s  %5d  avg=%.1f\n", name, count, avg)
-		any = true
+		found = true
 	}
-	if !any {
+	if !found {
 		sb.WriteString("No metrics recorded yet.\n")
 	}
 	return sb.String(), nil
@@ -126,7 +126,7 @@ func runSlots(ctx context.Context, pool *pgxpool.Pool, interval, window string) 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Slot Contention (last %s)\n", window)
 	sb.WriteString("─────────────────────────────\n")
-	any := false
+	found := false
 	for rows.Next() {
 		var backend, strategy, result string
 		var count int64
@@ -136,9 +136,9 @@ func runSlots(ctx context.Context, pool *pgxpool.Pool, interval, window string) 
 		}
 		fmt.Fprintf(&sb, "%s/%s → %s: %d calls, avg=%0.fms, p95=%0.fms\n",
 			backend, strategy, result, count, avg, p95)
-		any = true
+		found = true
 	}
-	if !any {
+	if !found {
 		sb.WriteString("No slot acquisitions recorded.\n")
 	}
 	return sb.String(), nil
@@ -161,7 +161,7 @@ func runDispatch(ctx context.Context, pool *pgxpool.Pool, interval, window strin
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Dispatch Effectiveness (last %s)\n", window)
 	sb.WriteString("─────────────────────────────\n")
-	any := false
+	found := false
 	for rows.Next() {
 		var result, phase string
 		var count int64
@@ -170,9 +170,9 @@ func runDispatch(ctx context.Context, pool *pgxpool.Pool, interval, window strin
 			continue
 		}
 		fmt.Fprintf(&sb, "%s (%s): %d (%.1f%%)\n", result, phase, count, pct)
-		any = true
+		found = true
 	}
-	if !any {
+	if !found {
 		sb.WriteString("No dispatch decisions recorded.\n")
 	}
 
@@ -205,7 +205,7 @@ func runLatency(ctx context.Context, pool *pgxpool.Pool, interval, window string
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Message Latency (last %s)\n", window)
 	sb.WriteString("─────────────────────────────\n")
-	any := false
+	found := false
 	for rows.Next() {
 		var path string
 		var count int64
@@ -215,9 +215,9 @@ func runLatency(ctx context.Context, pool *pgxpool.Pool, interval, window string
 		}
 		fmt.Fprintf(&sb, "%s: %d msgs, p50=%0.fms, p95=%0.fms, max=%0.fms\n",
 			path, count, p50, p95, maxMs)
-		any = true
+		found = true
 	}
-	if !any {
+	if !found {
 		sb.WriteString("No message latency recorded.\n")
 	}
 	return sb.String(), nil
@@ -240,7 +240,7 @@ func runTools(ctx context.Context, pool *pgxpool.Pool, interval, window string) 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Top Tools by Latency (last %s)\n", window)
 	sb.WriteString("─────────────────────────────\n")
-	any := false
+	found := false
 	for rows.Next() {
 		var tool string
 		var count, errors int64
@@ -254,9 +254,9 @@ func runTools(ctx context.Context, pool *pgxpool.Pool, interval, window string) 
 		}
 		fmt.Fprintf(&sb, "%-20s %4d calls, avg=%0.fms, p95=%0.fms%s\n",
 			tool, count, avg, p95, errStr)
-		any = true
+		found = true
 	}
-	if !any {
+	if !found {
 		sb.WriteString("No tool executions recorded.\n")
 	}
 	return sb.String(), nil
@@ -279,7 +279,7 @@ func runRoutines(ctx context.Context, pool *pgxpool.Pool, interval, window strin
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Routine Executions (last %s)\n", window)
 	sb.WriteString("─────────────────────────────\n")
-	any := false
+	found := false
 	for rows.Next() {
 		var name, result string
 		var count int64
@@ -288,9 +288,9 @@ func runRoutines(ctx context.Context, pool *pgxpool.Pool, interval, window strin
 			continue
 		}
 		fmt.Fprintf(&sb, "%-20s %s: %d runs, avg=%0.fms\n", name, result, count, avg)
-		any = true
+		found = true
 	}
-	if !any {
+	if !found {
 		sb.WriteString("No routine executions recorded.\n")
 	}
 	return sb.String(), nil

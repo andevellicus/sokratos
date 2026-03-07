@@ -61,6 +61,7 @@ type AppConfig struct {
 	CuriosityCooldown     time.Duration
 	MaxDailyShares        int
 
+	MaxMessages  int
 	WorkspaceDir string
 
 	MaintenanceInterval   time.Duration
@@ -135,6 +136,7 @@ func Load() *AppConfig {
 		CuriosityCooldown:     EnvDuration("CURIOSITY_COOLDOWN", 2*time.Hour),
 		MaxDailyShares:        EnvInt("MAX_DAILY_SHARES", 3),
 
+		MaxMessages:  EnvInt("MAX_MESSAGES", 40),
 		WorkspaceDir: EnvString("WORKSPACE_DIR", "workspace"),
 
 		MaintenanceInterval:   EnvDuration("MAINTENANCE_INTERVAL", 30*time.Minute),

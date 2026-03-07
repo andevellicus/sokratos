@@ -30,9 +30,10 @@ var AllowedInternalHosts []string
 
 // SkillManifest holds the parsed SKILL.md frontmatter fields.
 type SkillManifest struct {
-	Name        string
-	Description string
-	Language    string // "javascript" (default) or "typescript"
+	Name          string
+	Description   string
+	Language      string // "javascript" (default) or "typescript"
+	ProgressLabel string `yaml:"progress_label"` // shown in progress indicators
 }
 
 // Skill represents a fully loaded skill ready for registration.
@@ -90,35 +91,13 @@ func LoadSkills(dir string) ([]Skill, error) {
 			continue
 		}
 
-		// Try handler.ts first (TypeScript), then fall back to handler.js.
-		var source string
-		tsPath := filepath.Join(skillDir, "scripts", "handler.ts")
-		jsPath := filepath.Join(skillDir, "scripts", "handler.js")
-
-		if tsData, tsErr := os.ReadFile(tsPath); tsErr == nil {
-			// TypeScript: transpile to JS.
-			transpiled, tErr := transpileTS(string(tsData))
-			if tErr != nil {
-				logger.Log.Warnf("[skills] TS transpilation failed for %s: %v", skillName, tErr)
-				continue
-			}
-			if err := validateSkillSource(transpiled); err != nil {
-				logger.Log.Warnf("[skills] invalid transpiled JS in %s: %v", skillName, err)
-				continue
-			}
-			source = transpiled
-			if manifest.Language == "" {
-				manifest.Language = "typescript"
-			}
-		} else if jsData, jsErr := os.ReadFile(jsPath); jsErr == nil {
-			if err := validateSkillSource(string(jsData)); err != nil {
-				logger.Log.Warnf("[skills] invalid JS in %s: %v", skillName, err)
-				continue
-			}
-			source = string(jsData)
-		} else {
-			logger.Log.Warnf("[skills] missing handler.ts/handler.js for %s: %v", skillName, jsErr)
+		source, lang, loadErr := loadSkillSource(skillDir)
+		if loadErr != nil {
+			logger.Log.Warnf("[skills] %s: %v", skillName, loadErr)
 			continue
+		}
+		if manifest.Language == "" {
+			manifest.Language = lang
 		}
 
 		skills = append(skills, Skill{
@@ -131,6 +110,31 @@ func LoadSkills(dir string) ([]Skill, error) {
 	}
 
 	return skills, nil
+}
+
+// loadSkillSource reads and compiles a skill's handler source from disk.
+// Tries handler.ts (transpile) first, then handler.js. Returns (source, lang, error).
+func loadSkillSource(dir string) (string, string, error) {
+	tsPath := filepath.Join(dir, "scripts", "handler.ts")
+	jsPath := filepath.Join(dir, "scripts", "handler.js")
+
+	if tsData, tsErr := os.ReadFile(tsPath); tsErr == nil {
+		transpiled, tErr := transpileTS(string(tsData))
+		if tErr != nil {
+			return "", "", fmt.Errorf("TS transpilation failed: %w", tErr)
+		}
+		if err := validateSkillSource(transpiled); err != nil {
+			return "", "", fmt.Errorf("invalid transpiled JS: %w", err)
+		}
+		return transpiled, "typescript", nil
+	} else if jsData, jsErr := os.ReadFile(jsPath); jsErr == nil {
+		if err := validateSkillSource(string(jsData)); err != nil {
+			return "", "", fmt.Errorf("invalid JS: %w", err)
+		}
+		return string(jsData), "javascript", nil
+	} else {
+		return "", "", fmt.Errorf("missing handler.ts/handler.js: %w", jsErr)
+	}
 }
 
 // parseSkillMD parses a SKILL.md file into manifest fields and parameter schemas.
@@ -286,25 +290,27 @@ func RegisterSkill(registry *Registry, skill Skill, deps SkillDeps) {
 	fn := func(ctx context.Context, args json.RawMessage) (string, error) {
 		currentSource := source
 		if dir != "" {
-			// Try handler.ts first → transpile → fall back to handler.js.
-			if tsData, err := os.ReadFile(filepath.Join(dir, "scripts", "handler.ts")); err == nil {
-				if transpiled, tErr := transpileTS(string(tsData)); tErr == nil {
-					currentSource = transpiled
-				} else {
-					logger.Log.Warnf("[skills] %s: TS transpile failed on live-reload: %v", name, tErr)
-				}
-			} else if jsData, err := os.ReadFile(filepath.Join(dir, "scripts", "handler.js")); err == nil {
-				currentSource = string(jsData)
+			if reloaded, _, err := loadSkillSource(dir); err == nil {
+				currentSource = reloaded
+			} else {
+				logger.Log.Warnf("[skills] %s: live-reload failed, using cached source: %v", name, err)
 			}
 		}
 		return ExecuteSkill(ctx, name, currentSource, dir, args, deps)
 	}
 
+	// Use manifest progress_label if set, otherwise derive from description.
+	progressLabel := skill.Manifest.ProgressLabel
+	if progressLabel == "" && skill.Manifest.Description != "" {
+		progressLabel = skill.Manifest.Description + "..."
+	}
+
 	schema := ToolSchema{
-		Name:        name,
-		Params:      skill.Params,
-		Description: skill.Manifest.Description,
-		IsSkill:     true,
+		Name:          name,
+		Params:        skill.Params,
+		Description:   skill.Manifest.Description,
+		ProgressLabel: progressLabel,
+		IsSkill:       true,
 	}
 
 	registry.Register(name, fn, schema)

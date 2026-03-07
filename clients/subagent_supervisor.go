@@ -27,8 +27,12 @@ const maxSubagentErrorRetries = 3
 // Tool errors don't consume a round (up to maxSubagentErrorRetries free retries).
 // The loop terminates when the subagent produces a "respond" action or
 // usedRounds reaches maxRounds.
+//
+// progressFn, if non-nil, is called at the start of each tool round with a
+// human-readable status (e.g. "Step 2/5: calling search_web").
 func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
-	systemPrompt string, directive string, toolExec SubagentToolExec, maxRounds int) (string, error) {
+	systemPrompt string, directive string, toolExec SubagentToolExec, maxRounds int,
+	progressFn func(string)) (string, error) {
 
 	messages := []chatMessage{
 		{Role: "system", Content: systemPrompt},
@@ -37,6 +41,7 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 
 	usedRounds := 0
 	errorRetries := 0
+	parseRetries := 0
 
 	for usedRounds < maxRounds {
 		raw, err := sc.CompleteMultiTurnWithGrammar(ctx, messages, grammar, tokens.SubagentSupervisor)
@@ -54,9 +59,18 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 			// Try cleaning LLM artifacts (code fences, trailing commas, etc.)
 			cleaned := textutil.CleanLLMJSON(raw)
 			if err2 := json.Unmarshal([]byte(cleaned), &decision); err2 != nil {
+				// Grammar constraint was ignored (intermittent llama-server issue).
+				// Retry the same round without counting against the budget.
+				parseRetries++
+				if parseRetries <= maxSubagentErrorRetries {
+					logger.Log.Warnf("[subagent-supervisor] round %d: grammar ignored, retrying (%d/%d) (raw: %.200s)",
+						usedRounds, parseRetries, maxSubagentErrorRetries, raw)
+					continue
+				}
 				return "", fmt.Errorf("parse subagent decision round %d: %w (raw: %.200s)", usedRounds, err, raw)
 			}
 		}
+		parseRetries = 0 // reset on successful parse
 
 		if decision.Action == "respond" {
 			logger.Log.Infof("[subagent-supervisor] completed in %d round(s)", usedRounds+1)
@@ -70,6 +84,9 @@ func SubagentSupervisor(ctx context.Context, sc *SubagentClient, grammar string,
 		// Build a tool call JSON and execute it.
 		toolJSON, _ := json.Marshal(map[string]any{"name": decision.Name, "arguments": decision.Arguments})
 		logger.Log.Infof("[subagent-supervisor] round %d: calling %s", usedRounds+1, decision.Name)
+		if progressFn != nil {
+			progressFn(fmt.Sprintf("Step %d/%d: calling %s", usedRounds+1, maxRounds, decision.Name))
+		}
 		result, execErr := toolExec(ctx, toolJSON)
 
 		var toolResultMsg string

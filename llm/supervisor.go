@@ -128,6 +128,12 @@ var toolIntentRe = regexp.MustCompile(`(?s)<TOOL_INTENT>(.*?)</TOOL_INTENT>`)
 // tag. Content extraction and closing tag validation are done in extractBareToolTag.
 var bareToolTagOpenRe = regexp.MustCompile(`<([a-z][a-z0-9_]*)>`)
 
+// angleBracketIntentRe matches <tool_name: {json}> or <tool_name: {json}/>
+// — a common model failure mode where it wraps a tool intent in bare angle
+// brackets instead of <TOOL_INTENT> tags.
+var angleBracketIntentRe = regexp.MustCompile(`<([a-z][a-z0-9_]*)\s*:\s*(\{[^>]*\})\s*/?>`)
+
+
 // nonToolTags lists XML tags that appear in prompts/context and must not be
 // mistaken for tool calls.
 var nonToolTags = map[string]bool{
@@ -160,6 +166,28 @@ func extractToolIntent(s string) (string, bool) {
 		return strings.TrimSpace(m[1]), true
 	}
 	return "", false
+}
+
+// extractAngleBracketIntent catches <tool_name: {json}> — a model failure
+// mode where the intent is wrapped in bare angle brackets instead of
+// <TOOL_INTENT> tags. Returns "tool_name: {json}" for parseToolIntent.
+func extractAngleBracketIntent(s string, isKnownTool func(string) bool) (string, bool) {
+	m := angleBracketIntentRe.FindStringSubmatch(s)
+	if len(m) < 3 {
+		return "", false
+	}
+	toolName := m[1]
+	argsJSON := m[2]
+	if nonToolTags[toolName] {
+		return "", false
+	}
+	if isKnownTool != nil && !isKnownTool(toolName) {
+		return "", false
+	}
+	if logger.Log != nil {
+		logger.Log.Warnf("[llm:supervisor] recovered <%s: %s> as tool intent", toolName, textutil.Truncate(argsJSON, 60))
+	}
+	return toolName + ": " + argsJSON, true
 }
 
 // extractBareToolTag matches <tool_name>content</tool_name> and reconstructs
@@ -377,6 +405,21 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 
 	messages := []Message{{Role: "system", Content: sysContent}}
 
+	// Few-shot examples so the model sees the exact TOOL_INTENT format
+	// before any conversation history — critical after restarts when the
+	// restored history has no tool-call examples. Two examples: one with
+	// args, one without, to anchor both patterns.
+	messages = append(messages,
+		Message{Role: "user", Content: "Find recent articles about renewable energy"},
+		Message{Role: "assistant", Content: "Let me look that up.\n<TOOL_INTENT>search_web: {\"query\": \"renewable energy recent articles\"}</TOOL_INTENT>"},
+		Message{Role: "user", Content: "Tool result: 1. Solar panel efficiency hits new record (2026)..."},
+		Message{Role: "assistant", Content: "Here's what I found — solar panel efficiency just hit a new record this year, and there are several other developments worth noting."},
+		Message{Role: "user", Content: "What do I have coming up today?"},
+		Message{Role: "assistant", Content: "<TOOL_INTENT>search_calendar: {}</TOOL_INTENT>"},
+		Message{Role: "user", Content: "Tool result: Found 2 event(s): Team standup at 10am, Lunch with Alex at 12:30pm."},
+		Message{Role: "assistant", Content: "You've got a team standup at 10am and lunch with Alex at 12:30."},
+	)
+
 	if opts != nil && len(opts.History) > 0 {
 		messages = append(messages, opts.History...)
 	}
@@ -415,11 +458,17 @@ func querySupervisor(ctx context.Context, client *Client, model, prompt string, 
 			Content: sent[0].Content + "\n\nCurrent time: " + timefmt.FormatNatural(time.Now()),
 		}
 
+		enableThinking := opts != nil && opts.EnableThinking
+		reasoningFmt := "none"
+		if enableThinking {
+			reasoningFmt = "deepseek"
+		}
 		chatReq := ChatRequest{
 			Model:              model,
 			Messages:           sent,
 			MaxTokens:          supervisorMaxTokens,
-			ChatTemplateKwargs: map[string]any{"enable_thinking": false},
+			ReasoningFormat:    reasoningFmt,
+			ChatTemplateKwargs: map[string]any{"enable_thinking": enableThinking},
 		}
 		resp, cErr := client.Chat(ctx, chatReq)
 		if cErr != nil {
