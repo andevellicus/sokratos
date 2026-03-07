@@ -254,12 +254,23 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 			}
 			results := make([]batchResult, len(inputs))
 			total := len(inputs)
+
+			// Cap concurrent supervisors to available subagent slots.
+			used, total := deps.SC.SlotsInUse()
+			avail := total - used
+			if avail <= 0 {
+				avail = 1 // always allow at least one
+			}
+			concSem := make(chan struct{}, avail)
+
 			var completed atomic.Int32
 			var wg sync.WaitGroup
 			for i, inp := range inputs {
 				wg.Add(1)
 				go func(idx int, inp taskInput) {
 					defer wg.Done()
+					concSem <- struct{}{} // wait for a concurrency slot
+					defer func() { <-concSem }()
 					directive := inp.directive
 					if inp.context != "" {
 						ctxData := inp.context

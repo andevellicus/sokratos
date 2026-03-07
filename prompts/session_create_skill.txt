@@ -23,6 +23,7 @@ Skills execute in a goja (ES2020) sandbox. TypeScript is preferred (set language
 - `hash_hmac_sha256(key, msg)` — HMAC-SHA256 hex digest
 - `call_tool(name, args)` — invoke another registered tool, returns string result
 - `delegate(directive, context)` — single subagent dispatch (60s, 10 rounds)
+- `http_batch(requests)` — parallel HTTP fetch: [{method, url, headers?, body?}, ...] → [{status, body, headers, error?}, ...] (max 10)
 - `delegate_batch(tasks)` — parallel fan-out: [{directive, context}, ...] → [{result, error}, ...]
 
 ### Naming Convention
@@ -35,6 +36,23 @@ Skill names use snake_case (e.g., `check_astronomy_events`, `fetch_weather`).
 - `code` (string, required): the handler source code
 - `language` (string, optional): "typescript" (preferred) or "javascript"
 - `test_args` (string, required): JSON object of test arguments to validate the skill
+
+### Configuration Pattern
+All tunable constants (thresholds, limits, URLs, timeouts) MUST be read from `skill_config` with hardcoded fallback defaults. Never hardcode values that a user might want to change.
+
+```typescript
+const cfg = skill_config || {};
+const settings = (cfg as any).settings || {};
+const MAX_RESULTS = settings.max_results || 10;
+const TIMEOUT_MS = settings.timeout_ms || 5000;
+```
+
+Create a `config.toml` with a `[settings]` section for these values. Group related settings under sub-tables (e.g. `[thresholds]`, `[weights]`). Also create a `config.toml.example` showing all available settings with comments.
+
+### Delegation Pattern
+`delegate_batch` automatically caps concurrency to available subagent slots — pass one task per work item and let the runtime handle parallelism. No need to batch or group tasks manually.
+
+Each delegate directive should explicitly state "Do NOT call save_memory" — memory saving is the orchestrator's responsibility, not the subagent's.
 
 ### Important Rules
 1. **Synchronous only** — the runtime has no event loop. Use `http_request()` for network calls.

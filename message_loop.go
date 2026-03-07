@@ -34,7 +34,7 @@ type messageContext struct {
 	eng            *engine.Engine
 	lb             *llmBundle
 	registry       *tools.Registry
-	emailTriageCfg *pipelines.TriageConfig
+	triageCfg *pipelines.TriageConfig
 	confirmExec    func(context.Context, json.RawMessage) (string, error)
 	skillMtimes    map[string]time.Time
 	skillDeps      tools.SkillDeps
@@ -167,7 +167,7 @@ func handleGoogle(mc messageContext) string {
 
 	// Register tools that were previously disabled.
 	if gmailWasNil && google.GmailService != nil {
-		registerGmailTools(mc.registry, db.Pool, mc.emailTriageCfg, mc.cfg.EmailDisplayBatch, mc.svc.Subagent)
+		registerGmailTools(mc.registry, db.Pool, mc.triageCfg, mc.cfg.EmailDisplayBatch, mc.svc.Subagent)
 		mc.rebuildGrammar()
 		logger.Log.Info("[/google] Gmail tools registered")
 	}
@@ -507,9 +507,9 @@ func completeMessageHandling(mc messageContext, msg *platform.IncomingMessage, m
 	}
 
 	// Triage and save conversation.
-	if mr.Err == nil && db.Pool != nil && mc.cfg.EmbedURL != "" && mc.svc.DTC != nil && mc.emailTriageCfg != nil {
+	if mr.Err == nil && db.Pool != nil && mc.cfg.EmbedURL != "" && mc.svc.DTC != nil && mc.triageCfg != nil {
 		exchange := mr.ToolContext + fmt.Sprintf("user: %s\nassistant: %s", mr.MsgText, mr.Reply)
-		pipelines.TriageAndSaveConversationAsync(*mc.emailTriageCfg, exchange, mr.ToolsUsed, mr.PipelineID)
+		pipelines.TriageAndSaveConversationAsync(*mc.triageCfg, exchange, mr.ToolsUsed, mr.PipelineID)
 	}
 
 	// Record pipeline ID so the next message's prefetch can exclude stale memories.

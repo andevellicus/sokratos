@@ -1,1 +1,9 @@
+# get_weather configuration
+
+[settings]
+# Default location when no location arg is provided
 location = "New York, NY"
+# Number of forecast days (1-7)
+forecast_days = 3
+# Number of geocoding results to consider for disambiguation
+geocode_results = 5

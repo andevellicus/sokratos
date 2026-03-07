@@ -46,7 +46,10 @@ const WMO: Record<number, string> = {
 
 (function main() {
   const cfg = skill_config || {};
-  const loc: string = args.location || cfg.location || "New York";
+  const settings = (cfg as any).settings || cfg;
+  const loc: string = args.location || settings.location || "New York";
+  const FORECAST_DAYS = settings.forecast_days || 3;
+  const GEOCODE_RESULTS = settings.geocode_results || 5;
 
   // Step 1: Geocode the location name to lat/lon.
   // Open-Meteo geocoding fails on "City, State" format — strip qualifier and
@@ -61,7 +64,7 @@ const WMO: Record<number, string> = {
 
   const geoResp = http_request(
     "GET",
-    "https://geocoding-api.open-meteo.com/v1/search?name=" + encodeURIComponent(searchName) + "&count=5&language=en",
+    "https://geocoding-api.open-meteo.com/v1/search?name=" + encodeURIComponent(searchName) + "&count=" + GEOCODE_RESULTS + "&language=en",
     {}, "",
   );
   if (geoResp.status !== 200) return "Geocoding error: HTTP " + geoResp.status;
@@ -98,7 +101,7 @@ const WMO: Record<number, string> = {
     + "?latitude=" + place.latitude + "&longitude=" + place.longitude
     + "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m"
     + "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-    + "&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=3&timezone=auto";
+    + "&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=" + FORECAST_DAYS + "&timezone=auto";
 
   const wxResp = http_request("GET", wxUrl, {}, "");
   if (wxResp.status !== 200) return "Weather API error: HTTP " + wxResp.status;

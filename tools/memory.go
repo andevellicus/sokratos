@@ -414,20 +414,26 @@ type saveMemoryArgs struct {
 	Summary       string              `json:"summary"`
 	Tags          FlexibleStringSlice `json:"tags"`
 	Category      string              `json:"category"`              // prepended to tags
-	SalienceScore *int                `json:"salience_score"`        // 0-10 integer scale
+	SalienceScore *float64            `json:"salience_score"`        // 0-10 scale (accepts int or float)
 	MemoryType    string              `json:"memory_type,omitempty"` // general, fact, preference, event
 }
 
 // effectiveSalience returns the salience on the 0-10 scale, defaulting to 5.
+// Clamps to [0,10] and normalizes values >10 (e.g. 95→9.5) that LLMs
+// sometimes produce when interpreting the scale as a percentage.
 func (a saveMemoryArgs) effectiveSalience() float64 {
 	if a.SalienceScore != nil {
 		s := *a.SalienceScore
+		if s > 10 {
+			s = s / 10 // normalize percentage-style values (95→9.5, 100→10)
+			if s > 10 {
+				s = 10
+			}
+		}
 		if s < 0 {
 			s = 0
-		} else if s > 10 {
-			s = 10
 		}
-		return float64(s)
+		return s
 	}
 	return 5
 }

@@ -289,7 +289,7 @@ func main() {
 	}
 
 	// Send startup message to all allowed users.
-	svc.Platform.Broadcast(context.Background(), "Bot started and ready.")
+	svc.Platform.Broadcast(context.Background(), "Sokratos is online.")
 
 	eng := initEngine(cfg, svc, lb, registry)
 	wired := wireEngine(cfg, svc, lb, eng, registry, tb)
@@ -324,7 +324,7 @@ func main() {
 		eng:            eng,
 		lb:             lb,
 		registry:       registry,
-		emailTriageCfg: tb.EmailTriageCfg,
+		triageCfg: tb.EmailTriageCfg,
 		confirmExec:    confirmExec,
 		skillMtimes:    wired.skillMtimes,
 		skillDeps:      wired.skillDeps,

@@ -42,12 +42,34 @@ The YAML frontmatter defines `name`, `description`, optionally `language` (`"jav
 
 Parsed via TOML into a JS object and injected as the `skill_config` global. Read fresh on each invocation (no restart needed). Falls back to `config.txt` as a raw string if TOML parsing fails.
 
+All tunable constants (thresholds, limits, URLs, timeouts) should be read from `skill_config` with hardcoded fallback defaults. Use a `[settings]` section for top-level values and sub-tables for grouped settings (e.g. `[thresholds]`, `[weights]`):
+
 ```toml
+[settings]
+forecast_days = 3
+geocode_results = 5
 location = "New York, NY"
-units = "imperial"
 ```
 
-Accessed in JS/TS as `skill_config.location`, `skill_config.units`, etc.
+```typescript
+const cfg = skill_config || {};
+const settings = (cfg as any).settings || {};
+const FORECAST_DAYS = settings.forecast_days || 3;
+```
+
+### config.toml.example
+
+Each skill should include a `config.toml.example` documenting all available settings with comments. This serves as the canonical reference for what's configurable:
+
+```toml
+# get_weather configuration
+
+[settings]
+# Default location when no location arg is provided
+location = "New York, NY"
+# Number of forecast days (1-7)
+forecast_days = 3
+```
 
 ---
 
@@ -60,6 +82,7 @@ Skills execute in a **goja** ES2020 sandbox with a 30-second timeout (5 minutes 
 | `args` | Parsed JSON parameters from the tool invocation |
 | `skill_config` | Parsed `config.toml` as a JS object |
 | `http_request(method, url, headers, body)` | Synchronous HTTP bridge (15s timeout, 1MB response cap) |
+| `http_batch(requests)` | Parallel HTTP fetch (`[{method, url, headers?, body?}, ...]` → `[{status, body, headers, error?}, ...]`, max 10) |
 | `console.log(...)` / `console.warn(...)` / `console.error(...)` | Output appended as `[LOG]`/`[WARN]`/`[ERROR]` lines |
 | `btoa(s)` / `atob(s)` | Base64 encode/decode |
 | `sleep(ms)` | Synchronous sleep (capped at 5s per call) |
@@ -69,7 +92,7 @@ Skills execute in a **goja** ES2020 sandbox with a 30-second timeout (5 minutes 
 | `hash_hmac_sha256(key, msg)` | HMAC-SHA256 hex digest |
 | `call_tool(name, args)` | Synchronous tool invocation (self-call prevented) |
 | `delegate(directive, context)` | Single subagent dispatch (60s timeout) |
-| `delegate_batch(tasks)` | Parallel fan-out (3min timeout) |
+| `delegate_batch(tasks)` | Parallel fan-out (3min timeout, concurrency auto-capped to available slots) |
 
 ### TypeScript Support
 
@@ -147,8 +170,10 @@ Skill names use **snake_case** to match built-in tools (`search_web`, `search_me
 
 | Skill | Description | Key Config |
 |-------|-------------|------------|
-| `get_weather` | Current conditions + 3-day forecast via Open-Meteo | `location` |
-| `scan_feeds` | RSS/Atom aggregator with parallel article summarization | `[[category]]` with `type`, `route`/`subreddit`/`lists`/`url` |
+| `get_weather` | Current conditions + 3-day forecast via Open-Meteo | `location`, `forecast_days` |
+| `scan_feeds` | RSS/Atom aggregator with parallel article summarization | `[[category]]` feeds, `max_total_reads`, `max_articles_per_feed` |
+
+| `weekly_review` | Activity summary with goals, memories, and work items | `activity_days`, `goals_days`, `top_memories` |
 
 ### scan_feeds Feed Types
 
@@ -166,3 +191,9 @@ All feed types support `count` (max items) and `name` (identifier for dedup trac
 ## Delegation
 
 Skills are included in the `delegate_task` and `plan_and_execute` tool's allowed tool set. When skills are created or updated, `rebuildGrammar()` adds them to the delegate config's tool list and grammar.
+
+### delegate_batch Concurrency
+
+`delegate_batch` automatically caps concurrent subagent supervisors to available slots at call time (checked via `SubagentClient.SlotsInUse()`). Skills should pass one task per work item — the runtime handles parallelism. If all slots are busy, tasks queue and execute as slots free up. At least one concurrent task is always allowed.
+
+Delegate directives should include "Do NOT call save_memory" — memory saving is the orchestrator's responsibility, not the subagent's.

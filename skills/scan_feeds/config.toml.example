@@ -1,7 +1,15 @@
-# scan_feeds config — categories are TOML array-of-tables headers.
-# Each [[category]] entry defines one feed source.
+# scan_feeds configuration
 #
-# Fields:
+# [settings] controls delegation and reading limits.
+# [[category]] entries define feed sources.
+#
+# Settings:
+#   max_age_hours         — skip items older than this (default: 48)
+#   max_total_reads       — max articles to read via delegate (default: 6)
+#   max_articles_per_feed — max articles to pick per feed (default: 2)
+#   fetch_multiplier      — overfetch ratio for dedup headroom (default: 4)
+#
+# Feed fields:
 #   name      — unique identifier (used in logs and feed filter)
 #   type      — "rss" | "reddit" | "twitter" | "rsshub"
 #   count     — max items to fetch from this source
@@ -15,6 +23,12 @@
 #   rsshub:   route     — RSSHub route path (e.g. "/reuters/world")
 #
 # Twitter sources require SKILL_TWITTER_AUTH_TOKEN in .env.
+
+[settings]
+max_age_hours = 48
+max_total_reads = 6
+max_articles_per_feed = 2
+fetch_multiplier = 4
 
 # --- News ---
 

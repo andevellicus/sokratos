@@ -337,9 +337,9 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 	}
 	// Build email triage config if dependencies are available.
 	// TriageGrammar is left empty here and set after initLLM builds the grammar.
-	var emailTriageCfg *pipelines.TriageConfig
+	var triageCfg *pipelines.TriageConfig
 	if db.Pool != nil && cfg.EmbedURL != "" && svc.DTC != nil {
-		emailTriageCfg = &pipelines.TriageConfig{
+		triageCfg = &pipelines.TriageConfig{
 			Pool:          db.Pool,
 			EmbedEndpoint: cfg.EmbedURL,
 			EmbedModel:    cfg.EmbedModel,
@@ -351,7 +351,7 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 		}
 	}
 
-	registerGmailTools(registry, db.Pool, emailTriageCfg, cfg.EmailDisplayBatch, svc.Subagent)
+	registerGmailTools(registry, db.Pool, triageCfg, cfg.EmailDisplayBatch, svc.Subagent)
 	registerCalendarTools(registry, db.Pool)
 	registerWebTools(registry, cfg.SearxngURL, svc.Subagent)
 
@@ -394,7 +394,7 @@ func registerTools(cfg *config.AppConfig, svc *serviceBundle) *toolsBundle {
 
 	return &toolsBundle{
 		Registry:       registry,
-		EmailTriageCfg: emailTriageCfg,
+		EmailTriageCfg: triageCfg,
 		DelegateConfig: delegateConfig,
 		ShellExec:      shellExec,
 	}

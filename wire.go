@@ -121,14 +121,14 @@ func wireEngine(
 	registry *tools.Registry,
 	tb *toolsBundle,
 ) wireResult {
-	emailTriageCfg := tb.EmailTriageCfg
+	triageCfg := tb.EmailTriageCfg
 	delegateConfig := tb.DelegateConfig
 	shellExec := tb.ShellExec
 
 	// Wire paradigm shift fast-path: after a paradigm shift is detected in
 	// triage, run mini-consolidation then refresh the engine's profile state.
-	if emailTriageCfg != nil {
-		emailTriageCfg.ProfileRefreshFunc = func() {
+	if triageCfg != nil {
+		triageCfg.ProfileRefreshFunc = func() {
 			eng.RefreshProfile()
 			eng.RefreshPersonality()
 		}

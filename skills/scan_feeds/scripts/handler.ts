@@ -79,9 +79,9 @@ interface FetchJob {
 }
 
 const cfg = skill_config || {};
-const rsshubBase: string = env("RSSHUB_URL") || "http://localhost:1200";
-const FETCH_MULTIPLIER = 4;
 const settings = (cfg as any).settings || {};
+const rsshubBase: string = env("RSSHUB_URL") || "http://localhost:1200";
+const FETCH_MULTIPLIER = settings.fetch_multiplier || 4;
 const MAX_AGE_MS = ((settings.max_age_hours as number) || 48) * 60 * 60 * 1000;
 
 // ========================================================================
@@ -245,7 +245,7 @@ function buildRsshubUrl(route: string, count: number): string {
 
 (function main() {
   const globalCount: number = args.count || 0;
-  const maxArticles: number = args.max_articles || 2;
+  const maxArticles: number = args.max_articles || settings.max_articles_per_feed || 2;
 
   // Flatten categorized config into a single array
   const categories = Object.keys(cfg);
@@ -486,9 +486,12 @@ function buildRsshubUrl(route: string, count: number): string {
   if (allItems.length === 0) return JSON.stringify({ count: 0, sources: [] });
 
   // ========================================================================
-  // Step 4: Group items by feed name
+  // Step 4: Pick top articles to read (capped globally, deduped by domain)
   // ========================================================================
 
+  // Max articles to read (configurable via config.toml). Concurrency is
+  // handled by the delegate_batch semaphore in the VM runtime.
+  const MAX_TOTAL_READS = Math.min(maxArticles * feeds.length, settings.max_total_reads || 6);
   const groups: Record<string, FeedItem[]> = {};
   const feedOrder: string[] = [];
   for (const item of allItems) {
@@ -500,60 +503,93 @@ function buildRsshubUrl(route: string, count: number): string {
     groups[feedName].push(item);
   }
 
-  // ========================================================================
-  // Step 5: Build delegation tasks — one per feed group
-  // ========================================================================
+  // Round-robin pick across feeds for balanced coverage, then flatten.
+  const articlesToRead: FeedItem[] = [];
+  const seenUrls = new Set<string>();
+  const cursors: Record<string, number> = {};
+  for (const name of feedOrder) cursors[name] = 0;
 
-  const tasks: { directive: string; context: string }[] = [];
-  for (const name of feedOrder) {
-    const items = groups[name];
-    let directive = "Read up to " + maxArticles + " of the most important articles below "
-      + "using read_url and summarize each in 2-3 sentences. ALWAYS include the article URL "
-      + "with each summary. If read_url fails, note the article was unavailable.\n\n";
-    directive += "Feed: " + name + "\n\n";
-    for (let j = 0; j < items.length; j++) {
-      const it = items[j];
-      directive += (j + 1) + ". " + it.title + "\n   " + it.link + "\n";
-      if (it.summary) {
-        directive += "   Preview: " + it.summary + "\n";
+  for (let round = 0; round < maxArticles && articlesToRead.length < MAX_TOTAL_READS; round++) {
+    for (const name of feedOrder) {
+      if (articlesToRead.length >= MAX_TOTAL_READS) break;
+      const items = groups[name];
+      // Advance cursor past skipped items.
+      while (cursors[name] < items.length) {
+        const it = items[cursors[name]];
+        if (seenUrls.has(it.link)
+          || it.link.indexOf("x.com/") !== -1
+          || it.link.indexOf("twitter.com/") !== -1) {
+          cursors[name]++;
+          continue;
+        }
+        break;
       }
+      if (cursors[name] >= items.length) continue;
+      const it = items[cursors[name]];
+      seenUrls.add(it.link);
+      articlesToRead.push(it);
+      cursors[name]++;
     }
-    tasks.push({ directive, context: "" });
   }
 
-  // ========================================================================
-  // Step 6: Fan out with delegate_batch for parallel reading
-  // ========================================================================
-
-  const results = delegate_batch(tasks);
+  // Cap total reads to prevent slot starvation.
+  const toRead = articlesToRead.slice(0, MAX_TOTAL_READS);
 
   // ========================================================================
-  // Step 7: Collect results
+  // Step 5: Fan out one delegate per article (VM semaphore caps concurrency)
   // ========================================================================
+
+  const readTasks = toRead.map(it => ({
+    directive: "Read this article using read_url and summarize it in 2-3 sentences. "
+      + "Include key facts. Do NOT call save_memory.\n\n"
+      + "Title: " + it.title + "\nURL: " + it.link
+      + (it.summary ? "\nPreview: " + it.summary : ""),
+    context: "",
+  }));
+
+  const readResults = readTasks.length > 0 ? delegate_batch(readTasks) : [];
+
+  // ========================================================================
+  // Step 6: Collect results grouped by feed
+  // ========================================================================
+
+  const feedSummaries: Record<string, string[]> = {};
+  for (let i = 0; i < toRead.length; i++) {
+    const it = toRead[i];
+    const r = readResults[i];
+    if (!feedSummaries[it.feed]) feedSummaries[it.feed] = [];
+    if (r.error) {
+      feedSummaries[it.feed].push("- " + it.title + " — [read failed] " + it.link);
+    } else {
+      feedSummaries[it.feed].push("- " + r.result.trim() + " (" + it.link + ")");
+    }
+  }
+
+  // Include unread headlines (items not selected for reading).
+  const readUrls = new Set(toRead.map(it => it.link));
 
   const feedResults: FeedResult[] = [];
-  for (let ri = 0; ri < feedOrder.length; ri++) {
-    const feedName = feedOrder[ri];
-    const r = results[ri];
-    const category = (groups[feedName][0] || {} as FeedItem).category || "unknown";
-    const entry: FeedResult = { source: feedName, category };
-    if (r.error) {
-      console.warn("delegate_batch failed for " + feedName + ": " + r.error);
-      const fallback = groups[feedName].map(
-        it => "- " + it.title + " — " + (it.summary || "") + " " + it.link
-      );
-      entry.summary = fallback.join("\n");
-      entry.error = r.error;
-      // Don't mark seen — delegate failed, items can be retried next run.
-    } else {
-      entry.summary = r.result;
-      // Delegate succeeded — mark all items from this feed as seen.
-      const ps = pendingSeen[feedName];
-      if (ps && ps.newUrls.length > 0) {
-        saveSeen(feedName, ps.seenList.concat(ps.newUrls));
+  for (const name of feedOrder) {
+    const items = groups[name];
+    const category = items[0]?.category || "unknown";
+    const parts: string[] = feedSummaries[name] || [];
+
+    // Add unread headlines as bullet points.
+    for (const it of items) {
+      if (!readUrls.has(it.link) && it.link.indexOf("x.com/") === -1 && it.link.indexOf("twitter.com/") === -1) {
+        parts.push("- [headline] " + it.title + " — " + (it.summary || "").substring(0, 150) + " " + it.link);
       }
     }
-    feedResults.push(entry);
+
+    if (parts.length > 0) {
+      feedResults.push({ source: name, category, summary: parts.join("\n") });
+    }
+
+    // Mark all items from this feed as seen (both read and unread headlines).
+    const ps = pendingSeen[name];
+    if (ps && ps.newUrls.length > 0) {
+      saveSeen(name, ps.seenList.concat(ps.newUrls));
+    }
   }
 
   return JSON.stringify({ count: feedResults.length, sources: feedResults });

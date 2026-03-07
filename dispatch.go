@@ -319,11 +319,8 @@ func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
 	used, total := mc.svc.Subagent.SlotsInUse()
 	logger.Log.Infof("[dispatch] dispatching %s (subagent slots: %d/%d used)", dr.Tool, used, total)
 
-	// Send LLM-generated ack as a progress handle (editable in place).
-	ackText := dr.Ack
-	if ackText == "" {
-		ackText = fmt.Sprintf("Running %s...", dr.Tool)
-	}
+	// Send progress label as the initial progress handle (editable in place).
+	ackText := mc.registry.GetProgressLabel(dr.Tool)
 	ph, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, ackText, msg.ID)
 	if phErr != nil {
 		logger.Log.Warnf("[dispatch] progress handle creation failed: %v", phErr)

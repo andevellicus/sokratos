@@ -1,0 +1,11 @@
+# weekly_review configuration
+
+[settings]
+# Lookback window for activity, work items, routines, personality
+activity_days = 7
+# Lookback window for active goals
+goals_days = 30
+# Number of top memories to show
+top_memories = 5
+# Number of top completed work items to show
+top_completed = 5
