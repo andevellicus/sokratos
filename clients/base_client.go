@@ -19,8 +19,7 @@ type baseClient struct {
 	URL      string
 	Model    string
 	client   *http.Client
-	OnAccess func() // called on every successful request (VRAM auditor)
-	cb       circuitBreaker
+	cb     circuitBreaker
 	logTag   string // "[dtc]" or "[subagent]"
 }
 
@@ -136,12 +135,6 @@ func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error
 
 	if len(raw.Choices) == 0 {
 		return "", fmt.Errorf("server returned empty choices array")
-	}
-
-	// Notify the VRAM auditor that the model was just used, preventing
-	// idle eviction between frequent triage/consolidation calls.
-	if bc.OnAccess != nil {
-		bc.OnAccess()
 	}
 
 	// When reasoning_format=deepseek is set, thinking goes into

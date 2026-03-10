@@ -47,6 +47,23 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 	// Use the first sub-chunk's embedding for contradiction search.
 	firstEmb := firstEmbedded[0].Embedding
 
+	// Near-duplicate check: skip save if a very similar memory was saved recently.
+	// This catches parallel fan-out saves (e.g. multiple delegates saving the same article).
+	var dupID int64
+	_ = db.QueryRow(ctx,
+		`SELECT id FROM memories
+		 WHERE superseded_by IS NULL
+		   AND memory_type != 'identity'
+		   AND (embedding <=> $1) < 0.05
+		   AND created_at > now() - interval '1 hour'
+		 LIMIT 1`,
+		pgvector.NewVector(firstEmb),
+	).Scan(&dupID)
+	if dupID > 0 {
+		logger.Log.Infof("[memory] near-duplicate of id=%d, skipping save", dupID)
+		return dupID, nil
+	}
+
 	// Find top 3 most similar non-superseded memories.
 	var supersededIDs []int64
 	var candidates []contradictionCandidate
@@ -102,7 +119,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 				raw, gErr := bgGrammarFn(checkCtx, contradictionSystemPrompt, promptBuilder.String(), "")
 				cancel()
 				if gErr != nil {
-					logger.Log.Warnf("[memory] contradiction check deferred (busy): %v", gErr)
+					logger.Log.Debugf("[memory] contradiction check deferred (busy): %v", gErr)
 					contradictionDeferred = true
 					return
 				}
@@ -181,7 +198,7 @@ func CheckAndWriteWithContradiction(ctx context.Context, db *pgxpool.Pool, req M
 				raw, gErr := bgGrammarFn(checkCtx, contradictionSystemPrompt, promptBuilder.String(), "")
 				cancel()
 				if gErr != nil {
-					logger.Log.Warnf("[memory] entity-based contradiction check deferred (busy): %v", gErr)
+					logger.Log.Debugf("[memory] entity-based contradiction check deferred (busy): %v", gErr)
 					// Queue deferred check — entityCandidates will be included via candidates below.
 				} else {
 					for i, c := range entityCandidates {

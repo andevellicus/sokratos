@@ -182,7 +182,13 @@ func (e *Engine) executeSingleRoutine(d routines.DueRoutine) {
 	}
 
 	reply = strings.TrimSpace(reply)
-	if reply != "" && !strings.Contains(reply, "<NO_ACTION_REQUIRED>") {
+	// Strip NO_ACTION_REQUIRED tag. If the remaining text is non-empty,
+	// the orchestrator produced content worth sending (e.g. a recap).
+	stripped := strings.ReplaceAll(reply, "<NO_ACTION_REQUIRED>", "")
+	stripped = strings.TrimSpace(stripped)
+	noAction := strings.Contains(reply, "<NO_ACTION_REQUIRED>") && stripped == ""
+	if reply != "" && !noAction {
+		reply = stripped // use cleaned version (tag removed)
 		if e.sendDeduped(reply, fmt.Sprintf("routine %q", d.Name)) {
 			e.recordAction("routine", fmt.Sprintf("Sent %q output: %s", d.Name, textutil.Truncate(reply, 80)))
 			// Persist condensed output in conversation state so the interactive

@@ -35,7 +35,11 @@ func extractEntitiesLightweight(ctx context.Context, grammarFn GrammarSubagentFu
 	raw, err := grammarFn(extractCtx, entityExtractionPrompt, summary, entityGrammar)
 	cancel()
 	if err != nil {
-		logger.Log.Warnf("[memory] entity extraction failed, skipping: %v", err)
+		if strings.Contains(err.Error(), "busy") {
+			logger.Log.Debugf("[memory] entity extraction deferred (busy): %v", err)
+		} else {
+			logger.Log.Warnf("[memory] entity extraction failed, skipping: %v", err)
+		}
 		return nil
 	}
 

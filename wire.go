@@ -92,7 +92,6 @@ func initEngine(cfg *config.AppConfig, svc *serviceBundle, lb *llmBundle, regist
 			GrammarFn: svc.GrammarFunc,
 		}
 		eng.OnFirstTick = func() {
-			pipelines.CleanupPreTriageMemories(db.Pool)
 			pipelines.RunInitialConsolidation(consolidateDeps, cfg.ConsolidationMemoryLimit)
 			eng.RefreshProfile()
 			eng.RefreshPersonality()
@@ -132,6 +131,7 @@ func wireEngine(
 			eng.RefreshProfile()
 			eng.RefreshPersonality()
 		}
+		triageCfg.ConsolidateNudgeFn = eng.NudgeConsolidate
 	}
 
 	// Slot router: in two-model mode, route orchestrator calls to 9B (primary)
@@ -271,7 +271,7 @@ func wireEngine(
 	if svc.DTC != nil {
 		capturedDTC := svc.DTC
 		cog.synthesize = func(ctx context.Context, sp, content string) (string, error) {
-			return capturedDTC.Complete(ctx, sp, content, tokens.DTCSynthesis)
+			return capturedDTC.CompleteNoThink(ctx, sp, content, tokens.DTCSynthesis)
 		}
 		cogAvailable = true
 	}

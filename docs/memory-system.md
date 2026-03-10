@@ -98,7 +98,7 @@ Synthesis layers are triggered by **event-driven cognitive processing** (`engine
 | Complex plan steps | `Complete` | on | Reasoning/analysis |
 | Bootstrap profile | `Complete` | on | Quality-critical personality extraction |
 | Paradigm shift transition | `Complete` | on | Creative synthesis |
-| Episode synthesis | `Complete` (via SynthesizeFunc) | on | Narrative reasoning |
+| Episode synthesis | `CompleteNoThink` (via SynthesizeFunc) | **off** | Structured JSON output (thinking wasted token budget) |
 | Reflection | `Complete` (via SynthesizeFunc) | on | Analytical meta-cognition |
 
 ---

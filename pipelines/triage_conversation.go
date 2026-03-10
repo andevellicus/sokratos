@@ -59,35 +59,6 @@ func triageViaDTC(ctx context.Context, dtc *clients.DeepThinkerClient, triageGra
 	return &result, nil
 }
 
-// CleanupPreTriageMemories deletes conversation-tagged memories that were
-// saved before the triage system was introduced (identified by lacking
-// "Triage:" metadata in their text). These blind saves include "I don't know"
-// responses that poison search results.
-func CleanupPreTriageMemories(pool *pgxpool.Pool) {
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutMemorySave)
-	defer cancel()
-
-	// First unlink any superseded_by references pointing at the rows
-	// we're about to delete, then delete. Without this, the FK
-	// constraint on superseded_by prevents deletion.
-	_, _ = pool.Exec(ctx,
-		`UPDATE memories SET superseded_by = NULL
-		 WHERE superseded_by IN (
-		   SELECT id FROM memories
-		   WHERE 'conversation' = ANY(tags)
-		     AND summary NOT LIKE '%Triage:%'
-		 )`)
-	result, err := pool.Exec(ctx,
-		`DELETE FROM memories
-		 WHERE 'conversation' = ANY(tags)
-		   AND summary NOT LIKE '%Triage:%'`)
-	if err != nil {
-		logger.Log.Errorf("[cleanup] failed to delete pre-triage conversation memories: %v", err)
-		return
-	}
-	logger.Log.Infof("[cleanup] deleted %d pre-triage conversation memories", result.RowsAffected())
-}
-
 // truncateAssistantReply caps the assistant portion of a "user: ...\nassistant: ..."
 // exchange so the user's statement dominates the triage input. Returns the
 // original exchange unchanged if no assistant prefix is found or if the reply
@@ -115,8 +86,9 @@ type TriageConfig struct {
 	BgGrammarFn        memory.GrammarSubagentFunc // non-blocking variant for contradiction checks + entity extraction
 	TriageGrammar      string
 	RetryQueue         *RetryQueue         // deferred triage retry queue (nil = drop on failure)
-	ProfileRefreshFunc func()              // called after paradigm shift to refresh engine profile + personality
-	Metrics            *metrics.Collector  // observability metrics (nil = disabled)
+	ProfileRefreshFunc   func()              // called after paradigm shift to refresh engine profile + personality
+	ConsolidateNudgeFn   func()              // signals that a high-salience memory warrants near-term consolidation (nil = skip)
+	Metrics              *metrics.Collector  // observability metrics (nil = disabled)
 }
 
 // TriageSaveRequest encapsulates all parameters for a triage-then-save operation.
@@ -217,6 +189,11 @@ func triageAndSave(ctx context.Context, cfg TriageConfig, req TriageSaveRequest)
 
 	if hasPreferenceTags(tags) && cfg.DTC != nil && cfg.Pool != nil {
 		go applyPreferenceFastPath(cfg, result.Summary, req.DomainTag)
+	}
+
+	// Nudge consolidation for high-salience memories that don't hit the paradigm shift bar.
+	if result.SalienceScore >= 7 && !(result.ParadigmShift && result.SalienceScore >= 9) && cfg.ConsolidateNudgeFn != nil {
+		cfg.ConsolidateNudgeFn()
 	}
 
 	if result.ParadigmShift && result.SalienceScore >= 9 && cfg.DTC != nil {

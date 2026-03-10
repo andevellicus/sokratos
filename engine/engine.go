@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -130,7 +131,8 @@ type Engine struct {
 	lastCuriosityRun           time.Time
 	lastObjectiveInferenceRun  time.Time
 	lastObjectivePursuitRun    time.Time
-	lastHeartbeatHash  [32]byte // SHA-256 of last proactive heartbeat reply (dedup guard)
+	consolidateNudge   atomic.Bool // set by triage when a high-salience memory is saved; cleared after consolidation
+	lastHeartbeatHash  [32]byte    // SHA-256 of last proactive heartbeat reply (dedup guard)
 	recentActions      []actionRecord // last ≤5 actions taken (routines + heartbeat); no mutex — sequential callers only
 }
 
@@ -272,6 +274,12 @@ func (e *Engine) resolveOrchestrator(ctx context.Context, preferBrain bool) Orch
 		ReleaseReserved: func() {},
 		Reacquire:       func(context.Context) error { return nil },
 	}
+}
+
+// NudgeConsolidate signals that a high-salience memory was saved and
+// consolidation should run on the next heartbeat tick (regardless of buffer count).
+func (e *Engine) NudgeConsolidate() {
+	e.consolidateNudge.Store(true)
 }
 
 // archiveDeps returns the ArchiveDeps for context sliding/archival.

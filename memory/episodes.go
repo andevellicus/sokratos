@@ -138,6 +138,14 @@ func clusterBySimilarity(memories []EpisodeMemory, distanceThreshold float64) []
 // SynthesizeEpisodes clusters recent memories by semantic similarity and
 // synthesizes each cluster into an episodic memory. Returns the number of
 // episodes created.
+// MaxEpisodeClusters caps the number of clusters synthesized per cognitive run.
+// Remaining clusters are picked up on subsequent runs (memories stay eligible
+// for 72 hours). This spreads synthesis across idle time instead of batching.
+const MaxEpisodeClusters = 3
+
+// perClusterTimeout is the per-cluster timeout for episode synthesis LLM calls.
+const perClusterTimeout = 90 * time.Second
+
 func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, embedModel string, synthesize SynthesizeFunc, grammarFn GrammarSubagentFunc) (int, error) {
 	// Query recent non-episode, non-reflection, non-superseded memories from last 72h.
 	rows, err := db.Query(ctx,
@@ -177,6 +185,11 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 
 	episodeCount := 0
 	for _, cluster := range clusters {
+		if episodeCount >= MaxEpisodeClusters {
+			logger.Log.Infof("[memory] episode synthesis capped at %d clusters, deferring rest", MaxEpisodeClusters)
+			break
+		}
+
 		// Multi-day clusters need at least 3 members to ensure a strong thread.
 		minSize := 2
 		if clusterSpansDays(cluster) {
@@ -186,16 +199,35 @@ func SynthesizeEpisodes(ctx context.Context, db *pgxpool.Pool, embedEndpoint, em
 			continue
 		}
 
+		// Deduplicate identical summaries within the cluster before synthesis.
+		// Multiple copies of the same memory can end up in a cluster (e.g. from
+		// parallel fan-out saves). Collapse them to avoid wasting LLM tokens.
+		seen := make(map[string]struct{})
+		var deduped []EpisodeMemory
+		for _, m := range cluster {
+			norm := strings.TrimSpace(m.Summary)
+			if _, dup := seen[norm]; dup {
+				continue
+			}
+			seen[norm] = struct{}{}
+			deduped = append(deduped, m)
+		}
+
 		// Build numbered list for synthesis.
 		var sb strings.Builder
-		constituentIDs := make([]int64, len(cluster))
+		constituentIDs := make([]int64, len(cluster)) // all IDs, including dupes
 		for i, m := range cluster {
 			constituentIDs[i] = m.ID
+		}
+		for i, m := range deduped {
 			fmt.Fprintf(&sb, "%d. %s\n", i+1, m.Summary)
 		}
 
-		// Synthesize episode narrative.
-		raw, err := synthesize(ctx, episodeSynthesisPrompt, sb.String())
+		// Per-cluster timeout: each cluster gets its own fresh context so one
+		// slow cluster doesn't cascade-fail the rest.
+		clusterCtx, clusterCancel := context.WithTimeout(context.Background(), perClusterTimeout)
+		raw, err := synthesize(clusterCtx, episodeSynthesisPrompt, sb.String())
+		clusterCancel()
 		if err != nil {
 			logger.Log.Warnf("[memory] episode synthesis failed for cluster of %d: %v", len(cluster), err)
 			LogFailedOp(db, "episode_synthesis", fmt.Sprintf("cluster of %d memories", len(cluster)), err, map[string]any{

@@ -1,6 +1,33 @@
 # Sokratos
 
-An autonomous AI assistant with long-term memory, powered by a multi-model architecture running on local llama-server instances. Interacts via Telegram, manages email and calendar through Gmail/Google Calendar OAuth, and maintains a persistent memory system backed by PostgreSQL with pgvector.
+A personal AI agent that runs continuously on local hardware with no cloud dependencies.
+
+Sokratos actively manages its own memory — triaging what to remember, detecting contradictions, synthesizing episodes from scattered facts, and distilling context before it leaves the window. It operates autonomously via routines and a heartbeat loop, heals itself through circuit breakers and retry queues, and reflects on its own patterns to tune its own parameters over time.
+
+It interacts via Telegram, manages email and calendar through Google OAuth, and stores everything in PostgreSQL with pgvector — all backed by local Qwen models running on llama-server.
+
+## How Memory Works
+
+Most AI assistants either forget everything between sessions or dump every interaction into a vector store and hope for the best. Sokratos takes a different approach:
+
+- **Triage before save.** Every conversation and email is scored for salience (0-10) by a grammar-constrained LLM. Low-value noise never enters the database. If similar memories already exist, the bar goes higher.
+- **Contradiction detection.** Before writing, the system embeds the new memory and searches for conflicts. "Changed jobs" supersedes the old entry. Near-duplicates (cosine < 0.05) are caught and skipped.
+- **Episodic synthesis.** A cognitive loop clusters related memories by semantic similarity and entity overlap, then synthesizes them into coherent narratives. Five scattered memories about a project become one episode. Originals get deprioritized, not deleted.
+- **Context sliding without detail loss.** When messages leave the context window, they're distilled into individual facts and saved to memory — not summarized into a lossy blob.
+- **Reflection.** After enough memories accumulate, the system reflects on patterns across its memory — evolving interests, connections, predictions. Reflection can tune the system's own parameters (triage thresholds, curiosity cooldowns) in a closed loop.
+- **Decay and pruning.** Unretrieved memories fade faster (~15-day half-life) than retrieved ones (~30-day). Memories that decay below floor and were never useful get pruned. Memory stays lean over time.
+
+Retrieval combines cosine similarity, BM25 full-text search, salience, usefulness feedback, entity matching, and temporal recency into a single ranking formula. See [docs/memory-system.md](docs/memory-system.md) for the full technical reference.
+
+## Self-Healing
+
+Sokratos is designed to run unattended for days:
+
+- **Circuit breakers** prevent cascading failures when an LLM server goes down
+- **Retry queues** recover failed triage attempts with exponential backoff
+- **Deferred work** (entity extraction, contradiction checks) queues when slots are busy and runs later
+- **A watchdog** kills hung work items past their timeout
+- **Slot routing** manages two LLM backends — if the primary is busy, work routes to the fallback
 
 ## Architecture
 
@@ -112,7 +139,7 @@ go build -o sokratos ./...
 | `COGNITIVE_BUFFER_THRESHOLD` | `20` | Min unreflected memories to trigger cognitive processing |
 | `LULL_DURATION` | `20m` | Min user idle time before cognitive processing |
 | `COGNITIVE_CEILING` | `4h` | Max time between cognitive runs |
-| `REFLECTION_MEMORY_THRESHOLD` | `50` | Trigger reflection after this many new memories |
+| `REFLECTION_MEMORY_THRESHOLD` | `15` | Trigger reflection after this many new memories |
 | `MEMORY_SEARCH_LIMIT` | `10` | Max results from search_memory |
 | `MEMORY_STALENESS_DAYS` | `90` | Prune decayed memories older than this |
 | `CONSOLIDATION_MEMORY_LIMIT` | `50` | Max memories per consolidation pass |
@@ -223,9 +250,7 @@ Background jobs support multi-round tool execution and can ask the user clarifyi
 
 ## Memory System
 
-See [docs/memory-system.md](docs/memory-system.md) for the full technical reference.
-
-In brief: memories are stored as 2560-dim vectors (Qwen3-Embedding-4B) in PostgreSQL with pgvector. At current scale, brute-force scan is used (HNSW/IVFFlat cap at 2000 dims). A composite ranking formula combines cosine similarity, BM25 full-text search, salience, usefulness feedback, confidence, retrieval popularity, entity matching, and temporal recency. Memories decay with a dual-rate system: unretrieved memories (age>14d) use a ~15-day half-life, all others use ~30-day. Episode synthesis clusters related memories and reduces constituent salience by 40% so episodes are preferred in retrieval. Triage includes context-aware coverage checks — if 3+ similar memories already exist, the save bar is raised. Paradigm shifts trigger a fast-path: synchronous transition memory → mini-consolidation → immediate profile refresh. Higher-order synthesis layers (consolidation, episodic synthesis, reflection) are triggered by event-driven cognitive processing based on memory volume and user activity lulls. Reflection insights are routed back into conversation context for the orchestrator.
+See [docs/memory-system.md](docs/memory-system.md) for the full technical reference covering storage schema, ingestion paths, retrieval pipelines, ranking formula, feedback loops, decay rates, and synthesis layers.
 
 ## Routines
 
@@ -427,4 +452,4 @@ Prompts in `prompts/` are embedded at compile time. Any prompt change requires a
 
 ## License
 
-Private repository.
+MIT

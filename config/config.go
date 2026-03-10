@@ -127,7 +127,7 @@ func Load() *AppConfig {
 		ProcessedEventsTTLDays:    EnvInt("PROCESSED_EVENTS_TTL_DAYS", 90),
 		FailedOpsTTLDays:          EnvInt("FAILED_OPS_TTL_DAYS", 30),
 		SkillKVTTLDays:            EnvInt("SKILL_KV_TTL_DAYS", 90),
-		ReflectionMemoryThreshold: EnvInt("REFLECTION_MEMORY_THRESHOLD", 50),
+		ReflectionMemoryThreshold: EnvInt("REFLECTION_MEMORY_THRESHOLD", 15),
 		ShellHistoryTTLDays:       EnvInt("SHELL_HISTORY_TTL_DAYS", 30),
 		MetricsTTLDays:            EnvInt("METRICS_TTL_DAYS", 14),
 

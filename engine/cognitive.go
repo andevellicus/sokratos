@@ -88,14 +88,18 @@ func (e *Engine) runCognitiveIfTriggered() {
 	lastActivity := e.SM.LastUserActivity()
 	lull := lastActivity.IsZero() || time.Since(lastActivity) >= e.Cognitive.LullDuration
 	ceilingHit := time.Since(e.lastCognitiveRun) >= e.Cognitive.Ceiling
+	nudged := e.consolidateNudge.Load() && lull // high-salience memory saved + user idle
 
-	if !((bufferFull && lull) || ceilingHit) {
+	if !((bufferFull && lull) || ceilingHit || nudged) {
 		return
 	}
+	e.consolidateNudge.Store(false) // clear regardless of which trigger fired
 
 	cogStart := time.Now()
 	trigger := "volume"
-	if ceilingHit {
+	if nudged {
+		trigger = "nudge"
+	} else if ceilingHit {
 		trigger = "ceiling"
 	} else if lull {
 		trigger = "lull"
@@ -113,12 +117,15 @@ func (e *Engine) runCognitiveIfTriggered() {
 		if reflErr == nil && reflCount >= e.Cognitive.ReflectionMemoryThreshold {
 			logger.Log.Infof("[engine] reflection threshold reached (%d >= %d)", reflCount, e.Cognitive.ReflectionMemoryThreshold)
 			e.triggerReflection()
+		} else if reflErr == nil {
+			logger.Log.Debugf("[engine] reflection not triggered (count=%d < threshold=%d)", reflCount, e.Cognitive.ReflectionMemoryThreshold)
 		}
 	}
 
-	// 2. Episode synthesis.
+	// 2. Episode synthesis. Per-cluster timeouts are handled internally by
+	// SynthesizeEpisodes; the outer context just bounds DB/embedding work.
 	if e.CogServices != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), timeouts.Synthesis)
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 		n, synthErr := memory.SynthesizeEpisodes(ctx, e.DB, e.EmbedEndpoint, e.EmbedModel, e.CogServices.Synthesize, e.Memory.GrammarFn)
 		cancel()
 		if synthErr != nil {
