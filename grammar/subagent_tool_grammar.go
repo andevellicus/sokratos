@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"sokratos/tools"
+	"sokratos/toolreg"
 )
 
 // BuildSubagentToolGrammar generates a GBNF grammar for a subagent's tool
@@ -15,7 +15,7 @@ import (
 //
 //	{"action":"tool","name":"<tool>","arguments":{...}}
 //	{"action":"respond","text":"<response>"}
-func BuildSubagentToolGrammar(schemas []tools.ToolSchema) string {
+func BuildSubagentToolGrammar(schemas []toolreg.ToolSchema) string {
 	if len(schemas) == 0 {
 		// No tools — grammar only allows respond.
 		return `# Subagent grammar (no tools)

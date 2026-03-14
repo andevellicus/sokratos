@@ -17,10 +17,13 @@ import (
 	"sokratos/pipelines"
 	"sokratos/prompts"
 	"sokratos/routines"
+	"sokratos/skillrt"
 	"sokratos/textutil"
 	"sokratos/timeouts"
 	"sokratos/tokens"
+	"sokratos/toolreg"
 	"sokratos/tools"
+	"sokratos/worktracker"
 )
 
 // --- Engine Initialization ---
@@ -107,6 +110,7 @@ type wireResult struct {
 	rebuildGrammar func()
 	skillMtimes    map[string]time.Time
 	skillDeps      tools.SkillDeps
+	selector       *toolreg.ToolSelector // nil when tool selection is disabled
 }
 
 // wireEngine performs all post-construction wiring of the engine: slot router,
@@ -151,9 +155,9 @@ func wireEngine(
 	}
 
 	// Work tracker: unified tracking for background plans, routines, and scheduled tasks.
-	var workTracker *tools.WorkTracker
+	var workTracker *worktracker.WorkTracker
 	if db.Pool != nil {
-		workTracker = tools.NewWorkTracker(db.Pool, func(text string) {
+		workTracker = worktracker.NewWorkTracker(db.Pool, func(text string) {
 			if eng.Notifier != nil {
 				eng.Notifier.Send(text)
 			}
@@ -202,15 +206,33 @@ func wireEngine(
 		})
 	}
 
+	// Declare selector before the closure so rebuildGrammar can re-embed
+	// tool descriptions on hot-reload. Populated after initial grammar build.
+	var selector *toolreg.ToolSelector
+
 	// Build grammar rebuild callback capturing registry + lb + eng.
 	rebuildGrammar := func() {
 		// Rebuild tool descriptions.
 		td := strings.Replace(prompts.Tools, "%TOOL_INDEX%", registry.FullToolIndex(), 1)
+
+		// Build full-tool grammar for the orchestrator from all registered schemas.
+		// Filter out the built-in "respond" meta-tool — grammar has its own respond rule.
+		allSchemas := registry.Schemas()
+		var toolSchemas []tools.ToolSchema
+		for _, s := range allSchemas {
+			if s.Name != "respond" {
+				toolSchemas = append(toolSchemas, s)
+			}
+		}
+		orchGrammar := grammar.BuildSubagentToolGrammar(toolSchemas)
+
 		if lb.ToolAgent != nil {
 			lb.ToolAgent.ToolDescriptions = td
+			lb.ToolAgent.Grammar = orchGrammar
 		}
 		if eng.LLM.ToolAgent != nil {
 			eng.LLM.ToolAgent.ToolDescriptions = td
+			eng.LLM.ToolAgent.Grammar = orchGrammar
 		}
 
 		// Update delegate_task's grammar and allowed-tools to include skills.
@@ -225,13 +247,36 @@ func wireEngine(
 			dGrammar := grammar.BuildSubagentToolGrammar(dSchemas)
 			delegateConfig.Update(delegatable, dGrammar)
 		}
+
+		// Re-embed tool descriptions for dynamic tool selection on hot-reload.
+		if selector != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), timeouts.ToolSelectionInit)
+				defer cancel()
+				if err := selector.UpdateEmbeddings(ctx, registry); err != nil {
+					logger.Log.Warnf("[tool-selector] re-embedding failed: %v", err)
+				}
+			}()
+		}
 	}
 
-	tools.AllowedInternalHosts = collectInternalHosts(cfg)
+	skillrt.AllowedInternalHosts = collectInternalHosts(cfg)
 	skillDeps := tools.SkillDeps{Pool: db.Pool, Registry: registry, SC: svc.Subagent, DC: delegateConfig}
 	registerSkillTools(registry, "skills", rebuildGrammar, skillDeps)
 	registerPlanTools(registry, svc.DTC, svc.Subagent, delegateConfig, workTracker)
 	rebuildGrammar() // include disk-loaded skills + plan tools in grammar
+
+	// Dynamic tool selection: embed all tool descriptions for per-request
+	// RAG-based tool selection. Only enabled when TOOL_SELECTION_K > 0.
+	if cfg.ToolSelectionK > 0 && cfg.EmbedURL != "" {
+		selector = toolreg.NewToolSelector(cfg.EmbedURL, cfg.EmbedModel, cfg.ToolSelectionK)
+		ctx, cancel := context.WithTimeout(context.Background(), timeouts.ToolSelectionInit)
+		if err := selector.UpdateEmbeddings(ctx, registry); err != nil {
+			logger.Log.Warnf("[startup] tool selector embedding failed: %v", err)
+			selector = nil // fall back to full tool set
+		}
+		cancel()
+	}
 
 	// Wire hot-reload: skills sync on heartbeat tick, routines sync on
 	// the independent routine scheduler tick. Shell config also syncs on heartbeat.
@@ -297,6 +342,7 @@ func wireEngine(
 		rebuildGrammar: rebuildGrammar,
 		skillMtimes:    skillMtimes,
 		skillDeps:      skillDeps,
+		selector:       selector,
 	}
 }
 

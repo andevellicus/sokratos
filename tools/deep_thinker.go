@@ -10,9 +10,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"sokratos/clients"
-	"sokratos/llm"
 	"sokratos/logger"
 	"sokratos/memory"
+	"sokratos/orchestrate"
 	"sokratos/prompts"
 	"sokratos/textutil"
 	"sokratos/tokens"
@@ -66,7 +66,7 @@ func deepThink(ctx context.Context, args json.RawMessage, dtc *clients.DeepThink
 	// When background=true, return a BackgroundJobRequest instead of calling DTC.
 	// The supervisor will propagate this as an error to spawn a background Brain job.
 	if a.Background {
-		return "", &llm.BackgroundJobRequest{
+		return "", &orchestrate.BackgroundJobRequest{
 			Tool:             "deep_think",
 			UserGoal:         a.ProblemStatement,
 			TaskType:         a.TaskType,

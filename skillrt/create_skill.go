@@ -1,4 +1,4 @@
-package tools
+package skillrt
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"sokratos/logger"
+	"sokratos/toolreg"
 )
 
 // GrammarRebuildFunc is called after skill registration/deletion to update
@@ -60,7 +61,7 @@ func validateAndCompileSource(lang, code string) (string, string) {
 		}
 		return transpiled, ""
 	}
-	if err := validateSkillSource(code); err != nil {
+	if err := ValidateSkillSource(code); err != nil {
 		return "", fmt.Sprintf("JavaScript syntax error: %v", err)
 	}
 	return code, ""
@@ -68,7 +69,7 @@ func validateAndCompileSource(lang, code string) (string, string) {
 
 // NewCreateSkill returns a ToolFunc that creates a new JavaScript skill on
 // disk, registers it in the live registry, and rebuilds the grammar.
-func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
+func NewCreateSkill(registry *toolreg.Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) toolreg.ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
 			Name        string          `json:"name"`
@@ -101,7 +102,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 		}
 
 		// Parse params if provided.
-		var params []ParamSchema
+		var params []toolreg.ParamSchema
 		if strings.TrimSpace(a.Params) != "" {
 			if err := json.Unmarshal([]byte(a.Params), &params); err != nil {
 				return fmt.Sprintf("Invalid params JSON: %v", err), nil
@@ -179,7 +180,7 @@ func NewCreateSkill(registry *Registry, skillsDir string, rebuildGrammar Grammar
 }
 
 // NewManageSkills returns a ToolFunc for listing, deleting, and testing skills.
-func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
+func NewManageSkills(registry *toolreg.Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) toolreg.ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
 			Action   string          `json:"action"`
@@ -295,7 +296,7 @@ func NewManageSkills(registry *Registry, skillsDir string, rebuildGrammar Gramma
 // language) and only replaces the handler source. The skill is validated,
 // test-executed, and overwritten on disk on success. No re-register is needed
 // because RegisterSkill closures re-read source from disk on each invocation.
-func NewUpdateSkill(registry *Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) ToolFunc {
+func NewUpdateSkill(registry *toolreg.Registry, skillsDir string, rebuildGrammar GrammarRebuildFunc, deps SkillDeps) toolreg.ToolFunc {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
 			Name     string          `json:"name"`

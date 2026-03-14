@@ -1,6 +1,9 @@
 package textutil
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestStripThinkTags(t *testing.T) {
 	tests := []struct {
@@ -248,6 +251,58 @@ func TestCleanLLMJSON(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("CleanLLMJSON(%q) = %q, want %q", tt.input, got, tt.want)
 			}
+		})
+	}
+}
+
+func TestWrapGrammarWithThinkBlock(t *testing.T) {
+	tests := []struct {
+		name    string
+		grammar string
+		check   func(t *testing.T, result string)
+	}{
+		{
+			name:    "wraps root with think prefix",
+			grammar: "ws ::= [ \\t\\n\\r]*\nroot ::= tool-call | respond\nrespond ::= \"{}\"\n",
+			check: func(t *testing.T, result string) {
+				if !strings.Contains(result, "inner-root ::= tool-call | respond") {
+					t.Error("expected inner-root with original definition")
+				}
+				if !strings.Contains(result, "root ::= think-block ws inner-root") {
+					t.Errorf("expected new root with mandatory think-block, got:\n%s", result)
+				}
+				if !strings.Contains(result, "think-block") {
+					t.Error("expected think-block rule")
+				}
+				if !strings.Contains(result, "think-char") {
+					t.Error("expected think-char rule")
+				}
+			},
+		},
+		{
+			name:    "no root rule returns unchanged",
+			grammar: "ws ::= [ \\t\\n\\r]*\nrespond ::= \"{}\"\n",
+			check: func(t *testing.T, result string) {
+				if strings.Contains(result, "think-block") {
+					t.Error("should not add think rules when no root found")
+				}
+			},
+		},
+		{
+			name:    "preserves other rules",
+			grammar: "ws ::= [ \\t\\n\\r]*\nroot ::= respond\nrespond ::= \"{}\"\n",
+			check: func(t *testing.T, result string) {
+				if !strings.Contains(result, "respond ::= \"{}\"") {
+					t.Error("should preserve existing rules")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := WrapGrammarWithThinkBlock(tt.grammar)
+			tt.check(t, result)
 		})
 	}
 }

@@ -1,4 +1,4 @@
-package tools
+package skillrt
 
 import (
 	"fmt"
@@ -40,10 +40,9 @@ func ValidateTypeScriptSource(source string) (string, error) {
 		return "", err
 	}
 
-	if err := validateSkillSource(js); err != nil {
+	if err := ValidateSkillSource(js); err != nil {
 		return "", fmt.Errorf("transpiled JS validation failed: %w", err)
 	}
 
 	return js, nil
 }
-

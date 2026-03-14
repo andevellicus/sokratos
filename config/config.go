@@ -61,8 +61,9 @@ type AppConfig struct {
 	CuriosityCooldown     time.Duration
 	MaxDailyShares        int
 
-	MaxMessages  int
-	WorkspaceDir string
+	MaxMessages    int
+	WorkspaceDir   string
+	ToolSelectionK int // top-K tools selected via embedding similarity (0 = disabled, all tools injected)
 
 	MaintenanceInterval   time.Duration
 	DBMaxConns            int
@@ -136,8 +137,9 @@ func Load() *AppConfig {
 		CuriosityCooldown:     EnvDuration("CURIOSITY_COOLDOWN", 2*time.Hour),
 		MaxDailyShares:        EnvInt("MAX_DAILY_SHARES", 3),
 
-		MaxMessages:  EnvInt("MAX_MESSAGES", 40),
-		WorkspaceDir: EnvString("WORKSPACE_DIR", "workspace"),
+		MaxMessages:    EnvInt("MAX_MESSAGES", 40),
+		WorkspaceDir:   EnvString("WORKSPACE_DIR", "workspace"),
+		ToolSelectionK: EnvInt("TOOL_SELECTION_K", 0),
 
 		MaintenanceInterval:   EnvDuration("MAINTENANCE_INTERVAL", 30*time.Minute),
 		DBMaxConns:            EnvInt("DB_MAX_CONNS", 20),

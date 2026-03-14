@@ -1,6 +1,7 @@
 ---
 name: scan_feeds
 language: typescript
+progress_label: Scanning the feeds...
 description: |
   Fetch and summarize news from configured RSS, Atom, Reddit, and Twitter sources.
   Fetches headlines, deduplicates, then dispatches parallel subagents to read and

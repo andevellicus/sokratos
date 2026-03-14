@@ -261,7 +261,8 @@ function buildRsshubUrl(route: string, count: number): string {
   let feeds: FeedSource[] = allSources;
 
   // Filter to a specific feed or category if requested (fuzzy match).
-  if (args.feed) {
+  // "all" is a no-op — return all feeds unfiltered.
+  if (args.feed && args.feed.toLowerCase() !== "all") {
     const query = args.feed;
     let matched = feeds.filter(f => f.name === query);
     if (matched.length === 0) {
@@ -541,9 +542,11 @@ function buildRsshubUrl(route: string, count: number): string {
 
   const readTasks = toRead.map(it => ({
     directive: "Read this article using read_url and summarize it in 2-3 sentences. "
-      + "Include key facts. Do NOT call save_memory.\n\n"
+      + "Include key facts.\n\n"
       + "Title: " + it.title + "\nURL: " + it.link
-      + (it.summary ? "\nPreview: " + it.summary : ""),
+      + (it.summary ? "\nPreview: " + it.summary : "")
+      + "\n\nIMPORTANT: After reading and summarizing, respond immediately with your summary. "
+      + "Do NOT call save_memory or any other tool after read_url. Your ONLY job is: read_url → respond.",
     context: "",
   }));
 

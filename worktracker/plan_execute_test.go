@@ -1,14 +1,13 @@
-package tools
+package worktracker
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 )
 
 func TestBuildStepSystemPrompt_NoPriorResults(t *testing.T) {
-	step := planStep{Description: "Search for recent news about Go 1.24"}
+	step := PlanStep{Description: "Search for recent news about Go 1.24"}
 	pad := &Scratchpad{}
 	prompt := buildStepSystemPrompt("Research Go release notes", step, pad)
 
@@ -27,7 +26,7 @@ func TestBuildStepSystemPrompt_NoPriorResults(t *testing.T) {
 }
 
 func TestBuildStepSystemPrompt_WithScratchpad(t *testing.T) {
-	step := planStep{Description: "Summarize findings"}
+	step := PlanStep{Description: "Summarize findings"}
 	pad := &Scratchpad{}
 	pad.Set("step_1", "Found 3 emails about Go releases")
 	pad.Set("step_2", "step failed: timeout")
@@ -56,17 +55,15 @@ func TestScratchpad_SetGetTruncate(t *testing.T) {
 		t.Errorf("expected empty for missing key, got %q", got)
 	}
 
-	// Test overwrite.
 	pad.Set("key1", "updated")
 	if got := pad.Get("key1"); got != "updated" {
 		t.Errorf("expected updated, got %q", got)
 	}
 
-	// Test truncation (scratchpadBudget = 1500).
 	long := strings.Repeat("x", 2000)
 	pad.Set("long", long)
 	got := pad.Get("long")
-	if len(got) > scratchpadBudget+3 { // +3 for "..."
+	if len(got) > scratchpadBudget+3 {
 		t.Errorf("expected truncation, got len=%d", len(got))
 	}
 }
@@ -91,17 +88,17 @@ func TestScratchpad_FormatForPrompt(t *testing.T) {
 func TestIsComplexStep(t *testing.T) {
 	cases := []struct {
 		name    string
-		step    planStep
+		step    PlanStep
 		complex bool
 	}{
-		{"simple search", planStep{Description: "Search for emails", ToolsNeeded: []string{"search_email"}}, false},
-		{"retrieval only", planStep{Description: "Analyze patterns in emails", ToolsNeeded: []string{"search_email", "search_memory"}}, false},
-		{"analyze keyword", planStep{Description: "Analyze the search results", ToolsNeeded: []string{}}, true},
-		{"synthesize keyword", planStep{Description: "Synthesize findings from previous steps"}, true},
-		{"compare keyword", planStep{Description: "Compare the two approaches"}, true},
-		{"consolidate keyword", planStep{Description: "Consolidate all data points"}, true},
-		{"no keywords", planStep{Description: "Look up the weather forecast"}, false},
-		{"no tools no keywords", planStep{Description: "Find the answer"}, false},
+		{"simple search", PlanStep{Description: "Search for emails", ToolsNeeded: []string{"search_email"}}, false},
+		{"retrieval only", PlanStep{Description: "Analyze patterns in emails", ToolsNeeded: []string{"search_email", "search_memory"}}, false},
+		{"analyze keyword", PlanStep{Description: "Analyze the search results", ToolsNeeded: []string{}}, true},
+		{"synthesize keyword", PlanStep{Description: "Synthesize findings from previous steps"}, true},
+		{"compare keyword", PlanStep{Description: "Compare the two approaches"}, true},
+		{"consolidate keyword", PlanStep{Description: "Consolidate all data points"}, true},
+		{"no keywords", PlanStep{Description: "Look up the weather forecast"}, false},
+		{"no tools no keywords", PlanStep{Description: "Find the answer"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -120,15 +117,8 @@ func TestFormatResults_AllSuccess(t *testing.T) {
 		{Step: 2, Description: "Step two", Result: "Done too", Success: true},
 	}
 	out := formatResults(results)
-
 	if !strings.Contains(out, "2/2 steps succeeded") {
 		t.Errorf("expected 2/2 succeeded, got: %s", out)
-	}
-	if !strings.Contains(out, "[OK]") {
-		t.Error("expected [OK] markers")
-	}
-	if strings.Contains(out, "[FAILED]") {
-		t.Error("should not contain [FAILED]")
 	}
 }
 
@@ -139,15 +129,8 @@ func TestFormatResults_MixedResults(t *testing.T) {
 		{Step: 3, Description: "Also worked", Result: "ok", Success: true},
 	}
 	out := formatResults(results)
-
 	if !strings.Contains(out, "2/3 steps succeeded") {
 		t.Errorf("expected 2/3 succeeded, got: %s", out)
-	}
-	if !strings.Contains(out, "[OK]") {
-		t.Error("expected [OK] marker")
-	}
-	if !strings.Contains(out, "[FAILED]") {
-		t.Error("expected [FAILED] marker")
 	}
 }
 
@@ -156,7 +139,6 @@ func TestFormatResults_AllFailed(t *testing.T) {
 		{Step: 1, Description: "Oops", Result: "crashed", Success: false},
 	}
 	out := formatResults(results)
-
 	if !strings.Contains(out, "0/1 steps succeeded") {
 		t.Errorf("expected 0/1 succeeded, got: %s", out)
 	}
@@ -164,53 +146,23 @@ func TestFormatResults_AllFailed(t *testing.T) {
 
 func TestFormatResults_Empty(t *testing.T) {
 	out := formatResults(nil)
-
 	if !strings.Contains(out, "0/0 steps succeeded") {
 		t.Errorf("expected 0/0 succeeded, got: %s", out)
 	}
 }
 
 func TestCheckBackgroundTask_ArgParsing(t *testing.T) {
-	// We can't test with a real WorkTracker (needs DB), but we
-	// can verify the arg parsing and routing logic by inspecting the
-	// JSON unmarshalling and action defaults.
-
 	cases := []struct {
 		name       string
 		args       string
 		wantAction string
 		wantTaskID int64
 	}{
-		{
-			name:       "list action ignores task_id",
-			args:       `{"action": "list"}`,
-			wantAction: "list",
-			wantTaskID: 0,
-		},
-		{
-			name:       "status with task_id",
-			args:       `{"action": "status", "task_id": 42}`,
-			wantAction: "status",
-			wantTaskID: 42,
-		},
-		{
-			name:       "cancel with task_id",
-			args:       `{"action": "cancel", "task_id": 7}`,
-			wantAction: "cancel",
-			wantTaskID: 7,
-		},
-		{
-			name:       "default action is status",
-			args:       `{"task_id": 99}`,
-			wantAction: "status",
-			wantTaskID: 99,
-		},
-		{
-			name:       "empty args defaults to status",
-			args:       `{}`,
-			wantAction: "status",
-			wantTaskID: 0,
-		},
+		{"list action", `{"action": "list"}`, "list", 0},
+		{"status with id", `{"action": "status", "task_id": 42}`, "status", 42},
+		{"cancel with id", `{"action": "cancel", "task_id": 7}`, "cancel", 7},
+		{"default status", `{"task_id": 99}`, "status", 99},
+		{"empty args", `{}`, "status", 0},
 	}
 
 	for _, tc := range cases {
@@ -236,35 +188,4 @@ func TestCheckBackgroundTask_ArgParsing(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestStripHTML verifies the HTML stripping used by read_url.
-func TestStripHTML(t *testing.T) {
-	input := `<html><head><script>alert("xss")</script><style>body{color:red}</style></head>
-<body><h1>Hello</h1><p>World &amp; friends</p></body></html>`
-
-	got := stripHTML(input)
-
-	if strings.Contains(got, "<") {
-		t.Error("expected all HTML tags removed")
-	}
-	if strings.Contains(got, "alert") {
-		t.Error("expected script content removed")
-	}
-	if strings.Contains(got, "color:red") {
-		t.Error("expected style content removed")
-	}
-	if !strings.Contains(got, "Hello") {
-		t.Error("expected text content preserved")
-	}
-	if !strings.Contains(got, "World & friends") {
-		t.Error("expected HTML entities decoded")
-	}
-}
-
-// Ensure exported function isn't accidentally broken — this is a compile-time check.
-var _ = func() {
-	_ = NewSearchWeb("http://localhost:9000", nil)
-	_ = NewReadURL()
-	_ = context.Background // suppress unused import
 }

@@ -1,18 +1,32 @@
 package main
 
 import (
-	"regexp"
+	"encoding/json"
 	"strings"
 
 	"sokratos/llm"
 	"sokratos/textutil"
 )
 
-// toolNameFromIntentRe extracts the tool name from a <TOOL_INTENT>tool_name: ...
-// tag in an assistant message.
-var toolNameFromIntentRe = regexp.MustCompile(`<TOOL_INTENT>\s*(\w+)\s*:`)
-
 const maxCondensedLen = 400
+
+// extractToolName extracts the tool name from a grammar-constrained orchestrator
+// assistant message. The orchestrator produces JSON like:
+//
+//	{"action":"tool","name":"search_web","arguments":{...}}
+//
+// Returns the tool name or "unknown" if extraction fails.
+func extractToolName(content string) string {
+	cleaned := textutil.CleanLLMJSON(content)
+	var dec struct {
+		Name string `json:"name"`
+	}
+	if json.Unmarshal([]byte(cleaned), &dec) == nil && dec.Name != "" {
+		return dec.Name
+	}
+	return "unknown"
+}
+
 // summarizeToolContext extracts tool calls and their results from orchestrator
 // messages for inclusion in the triage exchange. No aggressive truncation — the
 // triage pipeline's MaxTriageLen handles the overall budget, and the subagent
@@ -29,9 +43,7 @@ func summarizeToolContext(msgs []llm.Message) (string, bool) {
 
 		toolName := "tool"
 		if i > 0 && msgs[i-1].Role == "assistant" {
-			if match := toolNameFromIntentRe.FindStringSubmatch(msgs[i-1].Content); len(match) >= 2 {
-				toolName = match[1]
-			}
+			toolName = extractToolName(msgs[i-1].Content)
 		}
 
 		body := strings.TrimPrefix(m.Content, "Tool result: ")
@@ -84,9 +96,7 @@ func condenseToolResults(msgs []llm.Message) []llm.Message {
 		// Extract tool name from the preceding assistant message.
 		toolName := "unknown"
 		if i > 0 && out[i-1].Role == "assistant" {
-			if match := toolNameFromIntentRe.FindStringSubmatch(out[i-1].Content); len(match) >= 2 {
-				toolName = match[1]
-			}
+			toolName = extractToolName(out[i-1].Content)
 		}
 
 		body := strings.TrimPrefix(m.Content, "Tool result: ")

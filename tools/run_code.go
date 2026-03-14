@@ -20,7 +20,7 @@ func NewRunCode() ToolFunc {
 			return "code is required", nil
 		}
 
-		if err := validateSkillSource(a.Code); err != nil {
+		if err := ValidateSkillSource(a.Code); err != nil {
 			return fmt.Sprintf("syntax error: %v", err), nil
 		}
 

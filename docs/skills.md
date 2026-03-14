@@ -36,7 +36,7 @@ description: |
 | location | string | no |
 ```
 
-The YAML frontmatter defines `name`, `description`, optionally `language` (`"javascript"` default, `"typescript"`), and optionally `progress_label` (shown in Telegram progress indicators). If `progress_label` is omitted, it auto-derives from the description (e.g. `"Fetch current weather..."` → `"Fetch current weather..."`). The description is used in the tool's schema and in dynamic tool descriptions injected into the orchestrator's prompt.
+The YAML frontmatter is parsed via `yaml.Unmarshal` into a `SkillManifest` struct (`tools/skills.go`). Fields: `name`, `description`, optionally `language` (`"javascript"` default, `"typescript"`), and optionally `progress_label` (shown in Telegram progress indicators). If `progress_label` is omitted, it auto-derives from the description (e.g. `"Fetch current weather..."` → `"Fetch current weather..."`). The description is used in the tool's schema and in dynamic tool descriptions injected into the orchestrator's prompt. Multiline descriptions use YAML block scalars (`|`).
 
 ### config.toml
 
@@ -194,6 +194,6 @@ Skills are included in the `delegate_task` and `plan_and_execute` tool's allowed
 
 ### delegate_batch Concurrency
 
-`delegate_batch` automatically caps concurrent subagent supervisors to available slots at call time (checked via `SubagentClient.SlotsInUse()`). Skills should pass one task per work item — the runtime handles parallelism. If all slots are busy, tasks queue and execute as slots free up. At least one concurrent task is always allowed.
+`delegate_batch` automatically caps concurrent subagent supervisors to available slots at call time (checked via `SubagentClient.SlotsInUse()`). The core execution logic lives in the `runDelegateBatch()` function (`tools/skill_vm.go`) with `delegateInput`/`batchResult` types. Skills should pass one task per work item — the runtime handles parallelism. If all slots are busy, tasks queue and execute as slots free up. At least one concurrent task is always allowed.
 
 Delegate directives should include "Do NOT call save_memory" — memory saving is the orchestrator's responsibility, not the subagent's.

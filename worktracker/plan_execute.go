@@ -1,4 +1,4 @@
-package tools
+package worktracker
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"sokratos/prompts"
 	"sokratos/textutil"
 	"sokratos/tokens"
+	"sokratos/toolreg"
 )
 
 // PlanExecDeps groups the execution-layer dependencies shared by plan
@@ -19,20 +20,17 @@ import (
 type PlanExecDeps struct {
 	SC       *clients.SubagentClient
 	DTC      *clients.DeepThinkerClient
-	DC       *DelegateConfig
-	Registry *Registry
+	DC       *toolreg.DelegateConfig
+	Registry *toolreg.Registry
 }
 
-// scratchpadBudget is the max characters per scratchpad entry.
 const scratchpadBudget = 1500
 
-// complexKeywords triggers DTC routing when found in step descriptions.
 var complexKeywords = []string{
 	"analyze", "synthesize", "compare", "evaluate",
 	"summarize across", "cross-reference", "identify patterns", "consolidate",
 }
 
-// retrievalTools are tools that indicate a simple retrieval step.
 var retrievalTools = map[string]bool{
 	"search_email":    true,
 	"search_calendar": true,
@@ -42,11 +40,9 @@ var retrievalTools = map[string]bool{
 }
 
 // Scratchpad provides structured key-value context between plan steps.
-// Each entry is truncated to scratchpadBudget characters to prevent context
-// inflation across multi-step plans.
 type Scratchpad struct {
 	mu      sync.RWMutex
-	entries []scratchpadEntry // ordered slice preserves insertion order
+	entries []scratchpadEntry
 }
 
 type scratchpadEntry struct {
@@ -68,7 +64,7 @@ func (s *Scratchpad) Set(key, value string) {
 	s.entries = append(s.entries, scratchpadEntry{Key: key, Value: truncated})
 }
 
-// Get retrieves a value from the scratchpad. Returns "" if not found.
+// Get retrieves a value from the scratchpad.
 func (s *Scratchpad) Get(key string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -80,7 +76,7 @@ func (s *Scratchpad) Get(key string) string {
 	return ""
 }
 
-// FormatForPrompt renders the scratchpad as a bullet list for system prompt injection.
+// FormatForPrompt renders the scratchpad as a bullet list.
 func (s *Scratchpad) FormatForPrompt() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -94,7 +90,6 @@ func (s *Scratchpad) FormatForPrompt() string {
 	return b.String()
 }
 
-// planAndExecuteArgs are the arguments parsed from the orchestrator's tool call.
 type planAndExecuteArgs struct {
 	Directive  string `json:"directive"`
 	Context    string `json:"context"`
@@ -102,18 +97,16 @@ type planAndExecuteArgs struct {
 	Priority   int    `json:"priority"`
 }
 
-// planStep represents a single decomposed step from DTC.
-type planStep struct {
+// PlanStep represents a single decomposed step from DTC.
+type PlanStep struct {
 	Description string   `json:"description"`
 	ToolsNeeded []string `json:"tools_needed"`
 }
 
-// taskPlan is the structured output from DTC decomposition.
 type taskPlan struct {
-	Steps []planStep `json:"steps"`
+	Steps []PlanStep `json:"steps"`
 }
 
-// stepResult records the outcome of executing a single step.
 type stepResult struct {
 	Step        int
 	Description string
@@ -121,7 +114,6 @@ type stepResult struct {
 	Success     bool
 }
 
-// decomposePlan calls DTC to break a directive into concrete steps.
 func decomposePlan(ctx context.Context, dtc *clients.DeepThinkerClient, directive, extraContext string) (*taskPlan, error) {
 	userContent := directive
 	if extraContext != "" {
@@ -153,11 +145,7 @@ func decomposePlan(ctx context.Context, dtc *clients.DeepThinkerClient, directiv
 	return &plan, nil
 }
 
-// executeSteps runs each plan step sequentially. Simple steps go through
-// SubagentSupervisor (Flash); complex synthesis/analysis steps route to DTC
-// directly. A scratchpad carries concise context between steps. When dtc is
-// non-nil, mid-flight replanning is enabled on step failures.
-func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, steps []planStep,
+func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, steps []PlanStep,
 	progressFn func(completed, total int)) []stepResult {
 
 	results := make([]stepResult, 0, len(steps))
@@ -187,13 +175,11 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 		var err error
 
 		if isComplexStep(step) && deps.DTC != nil {
-			// Route complex reasoning steps to DTC directly (no tool access needed).
 			logger.Log.Infof("[plan] step %d/%d routed to DTC (complex): %s", i+1, len(steps), step.Description)
 			result, err = deps.DTC.Complete(stepCtx, systemPrompt, step.Description, tokens.PlanStep)
 		} else {
-			// Simple retrieval steps go through Flash via SubagentSupervisor.
 			logger.Log.Infof("[plan] executing step %d/%d: %s", i+1, len(steps), step.Description)
-			toolExec := NewScopedToolExec(deps.Registry, deps.DC)
+			toolExec := toolreg.NewScopedToolExec(deps.Registry, deps.DC)
 			result, err = clients.SubagentSupervisor(stepCtx, deps.SC, deps.DC.Grammar(), systemPrompt,
 				step.Description, toolExec, 10, nil)
 		}
@@ -209,7 +195,6 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 			logger.Log.Warnf("[plan] step %d failed: %v", i+1, err)
 			consecutiveFailures++
 
-			// Record failure in scratchpad.
 			existing := pad.Get("failures")
 			line := fmt.Sprintf("Step %d failed: %v", i+1, err)
 			if existing != "" {
@@ -223,7 +208,6 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 			consecutiveFailures = 0
 		}
 
-		// Store result in scratchpad.
 		pad.Set(fmt.Sprintf("step_%d", i+1), sr.Result)
 		results = append(results, sr)
 
@@ -231,7 +215,6 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 			progressFn(i+1, len(steps))
 		}
 
-		// Check replan triggers: step failed + more than 1 step remaining + not already replanned.
 		remaining := len(steps) - (i + 1)
 		shouldReplan := !replanned && deps.DTC != nil && remaining > 0 && !sr.Success &&
 			(consecutiveFailures >= 2 || remaining <= 2)
@@ -241,7 +224,6 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 				logger.Log.Warnf("[plan] replanning failed: %v", replanErr)
 			} else {
 				logger.Log.Infof("[plan] replanning after step %d failure: %d remaining steps replaced", i+1, len(newSteps))
-				// Replace the remaining steps with the new plan.
 				steps = append(steps[:i+1], newSteps...)
 				replanned = true
 			}
@@ -251,9 +233,7 @@ func executeSteps(ctx context.Context, deps PlanExecDeps, directive string, step
 	return results
 }
 
-// buildStepSystemPrompt constructs the system prompt for a single step,
-// using the scratchpad for concise accumulated context instead of raw results.
-func buildStepSystemPrompt(directive string, step planStep, pad *Scratchpad) string {
+func buildStepSystemPrompt(directive string, step PlanStep, pad *Scratchpad) string {
 	var b strings.Builder
 	b.WriteString("You are executing one step of a multi-step plan.\n\n")
 	fmt.Fprintf(&b, "## Overall Goal\n%s\n\n", directive)
@@ -274,11 +254,7 @@ func buildStepSystemPrompt(directive string, step planStep, pad *Scratchpad) str
 	return b.String()
 }
 
-// isComplexStep classifies a step as complex (requiring DTC) or simple (Flash).
-// Steps with only retrieval tools are always simple. Otherwise, keyword
-// heuristics on the description determine complexity.
-func isComplexStep(step planStep) bool {
-	// If tools_needed contains only retrieval tools, always simple.
+func isComplexStep(step PlanStep) bool {
 	if len(step.ToolsNeeded) > 0 {
 		allRetrieval := true
 		for _, t := range step.ToolsNeeded {
@@ -301,10 +277,8 @@ func isComplexStep(step planStep) bool {
 	return false
 }
 
-// replanRemaining asks DTC to produce a revised plan for the remaining steps
-// given the current scratchpad state and failures.
 func replanRemaining(ctx context.Context, dtc *clients.DeepThinkerClient, directive string,
-	pad *Scratchpad, remainingSteps []planStep) ([]planStep, error) {
+	pad *Scratchpad, remainingSteps []PlanStep) ([]PlanStep, error) {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "Original goal: %s\n\n", directive)
@@ -339,7 +313,6 @@ func replanRemaining(ctx context.Context, dtc *clients.DeepThinkerClient, direct
 	return plan.Steps, nil
 }
 
-// formatResults formats step results into a human-readable summary.
 func formatResults(results []stepResult) string {
 	var b strings.Builder
 	succeeded := 0
@@ -361,13 +334,12 @@ func formatResults(results []stepResult) string {
 }
 
 // NewPlanAndExecute returns a ToolFunc that decomposes a directive into steps
-// via DTC, then executes them via SubagentSupervisor with accumulated context.
-// When background=true, planning runs synchronously but execution is async.
-func NewPlanAndExecute(deps PlanExecDeps, wt *WorkTracker) ToolFunc {
+// via DTC, then executes them via SubagentSupervisor.
+func NewPlanAndExecute(deps PlanExecDeps, wt *WorkTracker) func(ctx context.Context, args json.RawMessage) (string, error) {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
-		a, err := ParseArgs[planAndExecuteArgs](args)
-		if err != nil {
-			return err.Error(), nil
+		var a planAndExecuteArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return fmt.Sprintf("invalid arguments: %v", err), nil
 		}
 		if strings.TrimSpace(a.Directive) == "" {
 			return "directive is required", nil
@@ -377,11 +349,10 @@ func NewPlanAndExecute(deps PlanExecDeps, wt *WorkTracker) ToolFunc {
 		}
 
 		extraContext := a.Context
-		if len(extraContext) > maxDelegateContextLen {
-			extraContext = extraContext[:maxDelegateContextLen] + "\n... (truncated)"
+		if len(extraContext) > toolreg.MaxDelegateContextLen {
+			extraContext = extraContext[:toolreg.MaxDelegateContextLen] + "\n... (truncated)"
 		}
 
-		// Phase 1: Decompose (always synchronous).
 		plan, err := decomposePlan(ctx, deps.DTC, a.Directive, extraContext)
 		if err != nil {
 			return fmt.Sprintf("Failed to decompose plan: %v", err), nil
@@ -392,7 +363,6 @@ func NewPlanAndExecute(deps PlanExecDeps, wt *WorkTracker) ToolFunc {
 			logger.Log.Infof("[plan]   step %d: %s (tools: %v)", i+1, s.Description, s.ToolsNeeded)
 		}
 
-		// Phase 2: Execute.
 		if a.Background && wt != nil {
 			taskID, err := wt.Start(a.Directive, a.Priority, 0, plan.Steps, deps)
 			if err != nil {
@@ -401,7 +371,6 @@ func NewPlanAndExecute(deps PlanExecDeps, wt *WorkTracker) ToolFunc {
 			return fmt.Sprintf("Background task #%d started with %d steps. Use check_background_task to monitor progress.", taskID, len(plan.Steps)), nil
 		}
 
-		// Foreground mode.
 		fgCtx, cancel := context.WithTimeout(ctx, TimeoutPlanForeground)
 		defer cancel()
 

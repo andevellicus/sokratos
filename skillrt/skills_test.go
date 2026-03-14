@@ -1,4 +1,4 @@
-package tools
+package skillrt
 
 import (
 	"context"
@@ -10,14 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"sokratos/logger"
+	"sokratos/toolreg"
 )
-
-func TestMain(m *testing.M) {
-	// Initialize logger for tests that use LoadSkills/RegisterSkill.
-	_ = logger.Init(os.TempDir())
-	os.Exit(m.Run())
-}
 
 func TestParseSkillMD(t *testing.T) {
 	md := `---
@@ -72,7 +66,7 @@ description: |
 	if manifest.Name != "multi_desc" {
 		t.Errorf("expected name=multi_desc, got %q", manifest.Name)
 	}
-	if manifest.Description != "Line one of the description. Line two of the description." {
+	if manifest.Description != "Line one of the description.\nLine two of the description." {
 		t.Errorf("unexpected description: %q", manifest.Description)
 	}
 }
@@ -106,25 +100,25 @@ description: No name field here.
 	}
 }
 
-func Test_validateSkillSource(t *testing.T) {
+func Test_ValidateSkillSource(t *testing.T) {
 	// Valid JS.
-	if err := validateSkillSource(`var x = 1 + 2; x;`); err != nil {
+	if err := ValidateSkillSource(`var x = 1 + 2; x;`); err != nil {
 		t.Errorf("expected valid JS, got error: %v", err)
 	}
 
 	// Invalid JS.
-	if err := validateSkillSource(`var x = {;`); err == nil {
+	if err := ValidateSkillSource(`var x = {;`); err == nil {
 		t.Error("expected error for invalid JS")
 	}
 
 	// Top-level return (should pass via IIFE wrapping).
-	if err := validateSkillSource(`var x = 1 + 2; return x;`); err != nil {
+	if err := ValidateSkillSource(`var x = 1 + 2; return x;`); err != nil {
 		t.Errorf("expected return-based JS to pass via IIFE, got error: %v", err)
 	}
 
 	// Top-level return with function body.
 	src := `var resp = http_request("GET", "https://example.com"); return resp.body;`
-	if err := validateSkillSource(src); err != nil {
+	if err := ValidateSkillSource(src); err != nil {
 		t.Errorf("expected return-in-function-body to pass via IIFE, got error: %v", err)
 	}
 }
@@ -181,9 +175,9 @@ func TestExecuteSkill_RuntimeError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected ToolError for runtime error")
 	}
-	var te *ToolError
+	var te *toolreg.ToolError
 	if !errors.As(err, &te) {
-		t.Fatalf("expected *ToolError, got %T: %v", err, err)
+		t.Fatalf("expected *toolreg.ToolError, got %T: %v", err, err)
 	}
 	if te.Message == "" {
 		t.Error("expected non-empty error message")
@@ -261,10 +255,10 @@ description: A test skill.
 }
 
 func TestRegisterSkill_AndExecute(t *testing.T) {
-	registry := NewRegistry()
+	registry := toolreg.NewRegistry()
 	skill := Skill{
 		Manifest: SkillManifest{Name: "add_nums", Description: "Adds two numbers"},
-		Params: []ParamSchema{
+		Params: []toolreg.ParamSchema{
 			{Name: "a", Type: "number", Required: true},
 			{Name: "b", Type: "number", Required: true},
 		},
@@ -287,7 +281,7 @@ func TestRegisterSkill_AndExecute(t *testing.T) {
 }
 
 func Test_generateSkillMD(t *testing.T) {
-	md := generateSkillMD("my_skill", "Does something useful.", "", []ParamSchema{
+	md := generateSkillMD("my_skill", "Does something useful.", "", []toolreg.ParamSchema{
 		{Name: "query", Type: "string", Required: true},
 	})
 	if md == "" {
@@ -369,7 +363,7 @@ func Test_generateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 	scriptsDir := filepath.Join(skillDir, "scripts")
 	os.MkdirAll(scriptsDir, 0755)
 
-	md := generateSkillMD("test_generated", "A tool-created skill for testing.", "", []ParamSchema{
+	md := generateSkillMD("test_generated", "A tool-created skill for testing.", "", []toolreg.ParamSchema{
 		{Name: "city", Type: "string", Required: true},
 		{Name: "units", Type: "string", Required: false},
 	})
@@ -412,10 +406,10 @@ func Test_generateSkillMD_RoundTripViaLoadSkills(t *testing.T) {
 }
 
 func TestUnregister(t *testing.T) {
-	registry := NewRegistry()
+	registry := toolreg.NewRegistry()
 	registry.Register("temp_tool", func(ctx context.Context, args json.RawMessage) (string, error) {
 		return "ok", nil
-	}, ToolSchema{Name: "temp_tool"})
+	}, toolreg.ToolSchema{Name: "temp_tool"})
 
 	if !registry.Has("temp_tool") {
 		t.Fatal("expected temp_tool to be registered")
@@ -429,7 +423,7 @@ func TestUnregister(t *testing.T) {
 }
 
 func TestNewCreateSkill_Validation(t *testing.T) {
-	registry := NewRegistry()
+	registry := toolreg.NewRegistry()
 	skillsDir := t.TempDir()
 	var grammarRebuilt bool
 	rebuildGrammar := func() { grammarRebuilt = true }
@@ -609,9 +603,9 @@ func TestExecuteSkill_KV_NilPool(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected ToolError for nil pool")
 	}
-	var te *ToolError
+	var te *toolreg.ToolError
 	if !errors.As(err, &te) {
-		t.Fatalf("expected *ToolError, got %T: %v", err, err)
+		t.Fatalf("expected *toolreg.ToolError, got %T: %v", err, err)
 	}
 	if !strings.Contains(te.Message, "kv store unavailable") {
 		t.Errorf("expected 'kv store unavailable' error, got %q", te.Message)
@@ -714,7 +708,7 @@ func TestExecuteSkill_TypeScript(t *testing.T) {
 }
 
 func Test_generateSkillMD_WithLanguage(t *testing.T) {
-	md := generateSkillMD("ts_skill", "A TypeScript skill.", "typescript", []ParamSchema{
+	md := generateSkillMD("ts_skill", "A TypeScript skill.", "typescript", []toolreg.ParamSchema{
 		{Name: "input", Type: "string", Required: true},
 	})
 	if !strings.Contains(md, "language: typescript") {
@@ -782,7 +776,7 @@ description: Adds two numbers.
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(md), 0644)
 	os.WriteFile(filepath.Join(scriptsDir, "handler.js"), []byte(`"sum=" + (args.a + args.b);`), 0644)
 
-	registry := NewRegistry()
+	registry := toolreg.NewRegistry()
 	rebuildGrammar := func() {}
 	manage := NewManageSkills(registry, dir, rebuildGrammar, SkillDeps{})
 
@@ -823,7 +817,7 @@ description: Adds two numbers (TypeScript).
 	os.WriteFile(filepath.Join(scriptsDir, "handler.ts"),
 		[]byte(`const add = (a: number, b: number): number => a + b; "result=" + add(args.a, args.b);`), 0644)
 
-	registry := NewRegistry()
+	registry := toolreg.NewRegistry()
 	manage := NewManageSkills(registry, dir, func() {}, SkillDeps{})
 
 	args := json.RawMessage(`{"action":"test","name":"ts_adder","test_args":{"a":10,"b":20}}`)
@@ -841,7 +835,7 @@ description: Adds two numbers (TypeScript).
 
 func TestManageSkills_TestAction_NotFound(t *testing.T) {
 	dir := t.TempDir()
-	registry := NewRegistry()
+	registry := toolreg.NewRegistry()
 	manage := NewManageSkills(registry, dir, func() {}, SkillDeps{})
 
 	args := json.RawMessage(`{"action":"test","name":"nonexistent"}`)

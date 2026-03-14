@@ -102,9 +102,6 @@ func isTransientError(err error) bool {
 	return false
 }
 
-// thinkFalse is a reusable pointer to false for the ensureLoaded health probe.
-var thinkFalse = func() *bool { b := false; return &b }()
-
 // doRequest sends a single HTTP request and returns the content or an error.
 func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, bc.URL+"/v1/chat/completions", bytes.NewReader(body))
@@ -148,29 +145,26 @@ func (bc *baseClient) doRequest(ctx context.Context, body []byte) (string, error
 	return content, nil
 }
 
-// ensureLoaded checks whether the server has the model loaded by sending a
-// minimal 1-token probe. If the probe fails with a transient error (model not
-// loaded), it triggers loading and polls /health until ready. For always-on
-// dedicated servers, this serves as a lightweight health check (~10ms).
+// ensureLoaded checks whether the server has the model loaded by hitting
+// /health. Unlike the old 1-token inference probe, this doesn't consume
+// a slot — so it won't return 503 when all slots are busy.
 func (bc *baseClient) ensureLoaded(ctx context.Context) error {
-	probe, _ := json.Marshal(chatRequest{
-		Model:     bc.Model,
-		Messages:  []chatMessage{{Role: "user", Content: "ping"}},
-		MaxTokens: 1,
-		Think:     thinkFalse,
-	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, bc.URL+"/health", nil)
+	if err != nil {
+		return fmt.Errorf("create health request: %w", err)
+	}
+	resp, err := bc.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("health check failed: %w", err)
+	}
+	resp.Body.Close()
 
-	_, err := bc.doRequest(ctx, probe)
-	if err == nil {
-		return nil // model is loaded and responding
+	if resp.StatusCode == http.StatusOK {
+		return nil // model loaded and healthy
 	}
 
-	if !isTransientError(err) {
-		return err // genuine error, not a loading issue
-	}
-
-	// The probe triggered model loading. Wait for it to finish.
-	logger.Log.Infof("%s model %q not loaded, waiting for on-demand load...", bc.logTag, bc.Model)
+	// Non-200 means model is loading or server is starting up.
+	logger.Log.Infof("%s model %q not loaded (health status %d), waiting...", bc.logTag, bc.Model, resp.StatusCode)
 	return bc.waitForReady(ctx)
 }
 

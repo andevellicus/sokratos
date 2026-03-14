@@ -15,13 +15,17 @@ import (
 	"sokratos/db"
 	"sokratos/engine"
 	"sokratos/google"
+	"sokratos/grammar"
 	"sokratos/llm"
 	"sokratos/logger"
+	"sokratos/orchestrate"
 	"sokratos/pipelines"
 	"sokratos/platform"
+	"sokratos/prompts"
 	"sokratos/routines"
 	"sokratos/textutil"
 	"sokratos/timeouts"
+	"sokratos/toolreg"
 	"sokratos/tools"
 )
 
@@ -34,14 +38,14 @@ type messageContext struct {
 	eng            *engine.Engine
 	lb             *llmBundle
 	registry       *tools.Registry
-	triageCfg *pipelines.TriageConfig
+	triageCfg      *pipelines.TriageConfig
 	confirmExec    func(context.Context, json.RawMessage) (string, error)
 	skillMtimes    map[string]time.Time
 	skillDeps      tools.SkillDeps
 	rebuildGrammar func()
 	router         engine.SlotRouter
-	delegateConfig *tools.DelegateConfig
 	platform       platform.Platform
+	selector       *toolreg.ToolSelector // nil = use full tool set (no dynamic selection)
 }
 
 // handleReload forces a full re-sync of routines.toml and skills from disk.
@@ -200,7 +204,7 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 	history := mc.svc.StateMgr.ReadMessages()
 
 	// Phase 1.5: Staleness trim — if there's a long gap since the last
-	// conversation message, old topics are stale and will confuse the Brain.
+	// conversation message, old topics are stale and will confuse the model.
 	// Keep only recent messages for immediate context.
 	const staleGap = 30 * time.Minute
 	if len(history) > 4 {
@@ -210,9 +214,7 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		}
 	}
 
-	// Phase 2: Start prefetch + temporal context in a background goroutine.
-	// These run concurrently with triage (Phase 3.5), which doesn't need
-	// prefetch results — it only uses msgText + history.
+	// Phase 2: Start prefetch + temporal context + tool selection in parallel.
 	type prefetchData struct {
 		content   string
 		ids       []int64
@@ -243,9 +245,43 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		pfCh <- pd
 	}()
 
+	// Tool selection: embed query and select relevant tools (parallel with prefetch).
+	type toolSelectionData struct {
+		agent *llm.ToolAgentConfig // nil = use full tool set
+	}
+	tsCh := make(chan toolSelectionData, 1)
+	go func() {
+		if mc.selector == nil {
+			tsCh <- toolSelectionData{}
+			return
+		}
+		tsCtx, tsCancel := context.WithTimeout(context.Background(), timeouts.Embedding)
+		defer tsCancel()
+		names, err := mc.selector.Select(tsCtx, msgText)
+		if err != nil {
+			logger.Log.Warnf("[tool-selector] selection failed, using full set: %v", err)
+			tsCh <- toolSelectionData{}
+			return
+		}
+		if names == nil {
+			tsCh <- toolSelectionData{}
+			return
+		}
+		// Build per-request tool descriptions and grammar.
+		toolIndex := toolreg.BuildSelectedToolIndex(mc.registry, names)
+		td := strings.Replace(prompts.Tools, "%TOOL_INDEX%", toolIndex, 1)
+		schemas := mc.registry.SchemasForTools(names)
+		grammarStr := grammar.BuildSubagentToolGrammar(schemas)
+		tsCh <- toolSelectionData{
+			agent: &llm.ToolAgentConfig{
+				ToolDescriptions: td,
+				Grammar:          grammarStr,
+			},
+		}
+	}()
+
 	// Phase 3: Snapshot personality/profile under the lock (microseconds),
-	// then release before the multi-second inference call so the heartbeat
-	// loop and any concurrent Telegram messages are not blocked.
+	// then release before the multi-second inference call.
 	mc.eng.Mu.Lock()
 	personalityContent := mc.eng.PersonalityContent
 	profileContent := mc.eng.ProfileContent
@@ -257,62 +293,20 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		userPrompt += "\n\n" + xml
 	}
 
-	// Phase 3.4: Inject active background job context so the 9B can route
-	// user messages to background Brain jobs via reply_to_job/cancel_job.
+	// Phase 3.4: Inject active background job context so the orchestrator can
+	// route user messages to background Brain jobs via reply_to_job/cancel_job.
 	if jobCtx := buildJobContext(mc.svc.StateMgr.GetJobs()); jobCtx != "" {
 		userPrompt += "\n\n" + jobCtx
 	}
 
-	// Phase 3.5: Check supervisor slot availability. If free, skip triage
-	// and go straight to the orchestrator — saves 3-5s of triage latency.
-	// Triage is only valuable when the supervisor is busy: it dispatches
-	// simple tool calls on a subagent slot without waiting.
-	var triageResult *dispatchResult
-	choice, gotSupervisor := mc.router.TryAcquirePrimary()
-	if !gotSupervisor {
-		// Supervisor busy — run triage (concurrent with prefetch) as fast-path.
-		triageResult, _ = runTriage(mc, msgText, history)
-	}
-
-	// Phase 3.6: Wait for prefetch (usually already done — prefetch ~2s,
-	// triage ~3-5s, so prefetch finishes while triage is running).
+	// Phase 3.5: Wait for prefetch and tool selection results.
 	pf := <-pfCh
+	ts := <-tsCh
 
-	// Build dispatch context with prefetch results.
-	dctx := dispatchContext{
-		PersonalityContent: personalityContent,
-		ProfileContent:     profileContent,
-		PrefetchContent:    pf.content,
-		TemporalCtx:        pf.temporal,
-		PrefetchIDs:        pf.ids,
-		PrefetchSummaries:  pf.summaries,
-	}
-
-	// Phase 3.7: Execute dispatch decision (needs prefetch for synthesis).
-	if triageResult != nil && triageResult.Dispatch {
-		handled, escalation := executeDispatch(mc, msg, msgText, dctx, triageResult)
-		if handled {
-			mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": "dispatch"})
-			if gotSupervisor {
-				choice.Release()
-			}
-			typingCancel()
-			return
-		}
-		if escalation != nil {
-			userPrompt += fmt.Sprintf("\n\n<escalation_context>\nA lightweight dispatch was attempted but failed.\nTool: %s\nPhase: %s\nError: %s\nDo NOT retry the same call with the same parameters. Try a different approach or explain the issue.\n</escalation_context>",
-				escalation.ToolName, escalation.Phase, escalation.Error)
-			if escalation.ToolResult != "" {
-				userPrompt += fmt.Sprintf("\n\n<prior_tool_result tool=\"%s\">\nThe tool call succeeded but synthesis failed. Use these results directly — do NOT re-call the tool.\n%s\n</prior_tool_result>",
-					escalation.ToolName, escalation.ToolResult)
-			}
-		}
-	}
-
-	// Phase 4: Acquire orchestrator slot if we don't already have one.
-	if !gotSupervisor {
-		choice = mc.router.AcquireOrFallback(context.Background(), false, engine.PriorityUser)
-	}
+	// Phase 4: Acquire orchestrator slot.
+	// Prefer 9B for all orchestration — it's the fast grammar-constrained
+	// supervisor. If it needs deep reasoning, it can call deep_think/consult_deep_thinker.
+	choice := mc.router.AcquireOrFallback(context.Background(), false, engine.PriorityUser)
 	acquired := true
 	defer func() {
 		if acquired {
@@ -320,7 +314,7 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		}
 	}()
 
-	// Progress handle for the orchestrator path — created lazily on the
+	// Progress handle for the orchestrator — created lazily on the
 	// first tool call so messages without tools don't get a stale progress msg.
 	var ph *platform.ProgressHandle
 
@@ -334,8 +328,13 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		return mc.confirmExec(ctx, raw)
 	}
 
-	// Build shared orchestrator options used by both primary and escalation calls.
-	baseOpts := llm.QueryOrchestratorOpts{
+	// Use per-request tool selection if available, otherwise fall back to full set.
+	toolAgent := mc.lb.ToolAgent
+	if ts.agent != nil {
+		toolAgent = ts.agent
+	}
+
+	opts := llm.QueryOrchestratorOpts{
 		Parts:              visionParts,
 		History:            history,
 		PersonalityContent: personalityContent,
@@ -344,7 +343,23 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		PrefetchContent:    pf.content,
 		MaxToolResultLen:   mc.cfg.MaxToolResultLen,
 		MaxWebSources:      mc.cfg.MaxWebSources,
-		ToolAgent:          mc.lb.ToolAgent,
+		ToolAgent:          toolAgent,
+		MandatedBrainTools: mandatedBrainTools,
+		FirstRoundThinking: true, // think on round 0 to improve tool routing decisions
+		OnToolStart: func(toolName string) {
+			choice.ReleaseReserved()
+			acquired = false
+			// Create or update progress handle with the tool being called.
+			status := mc.registry.GetProgressLabel(toolName)
+			if ph == nil {
+				handle, err := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, status, msg.ID)
+				if err == nil {
+					ph = handle
+				}
+			} else {
+				ph.Update(context.Background(), status)
+			}
+		},
 		OnToolEnd: func(reCtx context.Context) error {
 			if reErr := choice.Reacquire(reCtx); reErr != nil {
 				return reErr
@@ -361,61 +376,10 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 		},
 	}
 
-	primaryOpts := baseOpts
-	primaryOpts.MandatedBrainTools = mandatedBrainTools
-	primaryOpts.EscalateTools = escalateTools
-	primaryOpts.OnToolStart = func(toolName string) {
-		choice.ReleaseReserved()
-		acquired = false
-		// Create or update progress handle with the tool being called.
-		status := mc.registry.GetProgressLabel(toolName)
-		if ph == nil {
-			handle, err := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, status, msg.ID)
-			if err == nil {
-				ph = handle
-			}
-		} else {
-			ph.Update(context.Background(), status)
-		}
-	}
-
-	reply, msgs, err := llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, progressExec, mc.lb.TrimFn, &primaryOpts)
-
-	// Check for EscalationRequest — replay on Brain inline.
-	var esc *llm.EscalationRequest
-	if errors.As(err, &esc) {
-		logger.Log.Infof("[escalation] %s triggered escalation to Brain", esc.ToolName)
-		// Update or create progress handle for escalation.
-		if ph != nil {
-			ph.Update(context.Background(), "Escalating to Brain...")
-		} else {
-			handle, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, "Escalating to Brain...", msg.ID)
-			if phErr == nil {
-				ph = handle
-			}
-		}
-		choice.Release()
-		acquired = false
-
-		// Acquire Brain (preferBrain=true) at user priority.
-		choice = mc.router.AcquireOrFallback(context.Background(), true, engine.PriorityUser)
-		acquired = true
-
-		// Replay on Brain without EscalateTools (Brain handles everything directly).
-		escOpts := baseOpts
-		escOpts.OnToolStart = func(toolName string) {
-			choice.ReleaseReserved()
-			acquired = false
-			if ph != nil {
-				ph.Update(context.Background(), mc.registry.GetProgressLabel(toolName))
-			}
-		}
-		reply, msgs, err = llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, progressExec, mc.lb.TrimFn, &escOpts)
-		mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": "escalated"})
-	}
+	reply, msgs, err := llm.QueryOrchestrator(context.Background(), choice.Client, choice.Model, userPrompt, progressExec, mc.lb.TrimFn, &opts)
 
 	// Check for BackgroundJobRequest — spawn a background Brain job.
-	var bjr *llm.BackgroundJobRequest
+	var bjr *orchestrate.BackgroundJobRequest
 	if errors.As(err, &bjr) {
 		choice.Release()
 		acquired = false
@@ -444,14 +408,7 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 
 	typingCancel()
 
-	// Emit message latency (skip if escalation already recorded it).
-	if esc == nil {
-		msgPath := "brain"
-		if gotSupervisor {
-			msgPath = "direct"
-		}
-		mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": msgPath})
-	}
+	mc.svc.Metrics.Since("message.total", messageStart, map[string]string{"path": "orchestrator"})
 
 	toolCtx, toolsUsed := summarizeToolContext(msgs)
 	completeMessageHandling(mc, msg, messageResult{
@@ -471,12 +428,12 @@ func processMessage(mc messageContext, msg *platform.IncomingMessage, msgText, u
 // Shared post-processing for both Brain and dispatch paths.
 // ---------------------------------------------------------------------------
 
-// messageResult normalizes the output of both the Brain and dispatch paths so
-// that completeMessageHandling can apply identical post-processing.
+// messageResult normalizes the output of the orchestrator path so that
+// completeMessageHandling can apply identical post-processing.
 type messageResult struct {
 	Reply             string        // final text reply to send
-	Messages          []llm.Message // condensed messages for state (Brain) or [user,assistant] pair (dispatch)
-	ToolContext       string        // summarized tool usage for triage (Brain) or "[tool: X]\n" (dispatch)
+	Messages          []llm.Message // condensed messages for state
+	ToolContext       string        // summarized tool usage for triage
 	ToolsUsed         bool          // whether tools were called
 	MsgText           string        // original user message text
 	PrefetchIDs       []int64       // memory IDs from prefetch
@@ -485,9 +442,9 @@ type messageResult struct {
 	Err               error         // LLM/execution error (nil on success)
 }
 
-// completeMessageHandling runs shared post-processing after both the Brain
-// and dispatch paths: append to state, slide/archive, triage, memory
-// usefulness evaluation, error fallback, and send reply.
+// completeMessageHandling runs shared post-processing after the orchestrator:
+// append to state, slide/archive, triage, memory usefulness evaluation,
+// error fallback, and send reply.
 func completeMessageHandling(mc messageContext, msg *platform.IncomingMessage, mr messageResult) {
 	// Append messages to conversation state.
 	for _, m := range mr.Messages {

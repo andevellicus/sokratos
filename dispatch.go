@@ -5,80 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
-	"sokratos/clients"
 	"sokratos/engine"
-	"sokratos/grammar"
 	"sokratos/llm"
 	"sokratos/logger"
-	"sokratos/platform"
+	"sokratos/orchestrate"
 	"sokratos/prompts"
 	"sokratos/textutil"
-	"sokratos/timefmt"
-	"sokratos/tools"
 )
-
-// dispatchContext bundles the context strings and prefetch metadata that are
-// threaded through tryDispatch, tryMultiStepDispatch, and prompt builders.
-type dispatchContext struct {
-	PersonalityContent string
-	ProfileContent     string
-	PrefetchContent    string
-	TemporalCtx        string
-	PrefetchIDs        []int64
-	PrefetchSummaries  string
-}
-
-// dispatchResult is the parsed output from the triage grammar.
-type dispatchResult struct {
-	Dispatch  bool            `json:"dispatch"`
-	Tool      string          `json:"tool"`
-	Args      json.RawMessage `json:"args"`
-	Multi     bool            `json:"multi"`
-	Directive string          `json:"directive"`
-	Ack       string          `json:"ack"`
-}
-
-// dispatchEscalation captures context from a failed dispatch attempt so
-// the Brain can avoid repeating the same failing call.
-type dispatchEscalation struct {
-	ToolName   string // empty if triage itself failed
-	Error      string // error description
-	Phase      string // "triage" | "execution" | "synthesis" | "multi-step"
-	ToolResult string // truncated successful tool result (non-empty when synthesis failed after tool succeeded)
-}
-
-// neverDispatchTools is the set of tools that must always be escalated to the
-// Brain, even if the triage model tries to dispatch them. Defense-in-depth
-// complement to the prompt-level rule.
-var neverDispatchTools = map[string]bool{
-	"send_email":         true,
-	"create_event":       true,
-	"manage_skills":      true,
-	"manage_routines":    true,
-	"manage_personality": true,
-	"save_memory":        true,
-	"forget_topic":       true,
-	"deep_think":         true,
-	"plan_and_execute":   true,
-	"delegate_task":      true,
-	"manage_objectives":  true,
-	"reply_to_job":       true,
-	"cancel_job":         true,
-	"prompt_user":        true,
-}
-
-func init() {
-	// Auto-include tools from escalateTools and mandatedBrainTools.
-	// Defense-in-depth: even if triage tries to dispatch these, they're blocked.
-	for tool := range escalateTools {
-		neverDispatchTools[tool] = true
-	}
-	for tool := range mandatedBrainTools {
-		neverDispatchTools[tool] = true
-	}
-}
 
 // brainSessionPrompts maps task types to their Brain session system prompts.
 var brainSessionPrompts = map[string]string{
@@ -93,19 +27,9 @@ var brainSessionAcks = map[string]string{
 	"send_email":   "I'll draft that email in the background. You can keep chatting — I'll send it your way for review shortly.",
 }
 
-// escalateTools is the set of tools that trigger inline escalation from the 9B
-// to the Brain. When the 9B supervisor tries to call one of these, the request
-// is replayed on the Brain for more capable handling.
-var escalateTools = map[string]bool{
-	"run_command":  true,
-	"write_file":   true,
-	"patch_file":   true,
-	"ask_database": true,
-}
-
 // mandatedBrainTools maps tools that MUST run as background Brain jobs to their
-// task_type (used for session prompt selection). The 9B is intercepted at the
-// supervisor level if it tries to call these directly.
+// task_type (used for session prompt selection). The orchestrator is intercepted
+// at the loop level if it tries to call these directly.
 var mandatedBrainTools = map[string]string{
 	"create_skill": "create_skill",
 	"update_skill": "create_skill", // same session prompt as create_skill
@@ -116,7 +40,7 @@ var mandatedBrainTools = map[string]string{
 // ---------------------------------------------------------------------------
 
 // buildJobContext generates a system prompt injection block describing active
-// background jobs so the 9B can route user messages to them.
+// background jobs so the orchestrator can route user messages to them.
 func buildJobContext(jobs []*engine.BackgroundJob) string {
 	if len(jobs) == 0 {
 		return ""
@@ -146,7 +70,7 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 
 	// Select session prompt by TaskType, falling back to general reasoning prompt.
 	// Injected as a user message prefix — NOT as a system message — because
-	// querySupervisor prepends its own system message and Qwen3.5's Jinja
+	// the orchestrator prepends its own system message and Qwen3.5's Jinja
 	// template raises "System message must be at the beginning" if a second
 	// system message appears mid-conversation.
 	sessionPrompt := brainSessionPrompts[job.TaskType]
@@ -177,7 +101,7 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 				return "You ARE the deep thinker. Call the tools directly (create_skill, search_web, etc.) instead of deep_think.", nil
 			}
 			result, err := mc.confirmExec(execCtx, raw)
-			if err == nil && call.Name == job.Tool && !llm.IsToolSoftError(result) {
+			if err == nil && call.Name == job.Tool && !orchestrate.IsToolSoftError(result) {
 				job.SetToolSucceeded(true)
 			}
 			return result, err
@@ -238,343 +162,3 @@ func runBackgroundJob(mc messageContext, job *engine.BackgroundJob) {
 
 	mc.platform.Send(context.Background(), job.ChannelID, "Background job reached maximum rounds without completing.", "")
 }
-
-// ---------------------------------------------------------------------------
-// Subagent dispatch: lightweight triage that routes simple tool calls around
-// the Brain entirely.
-// ---------------------------------------------------------------------------
-
-// dispatchProgressInterval is how often to send a "still working..." update
-// to the user during long-running tool execution in the dispatch path.
-const dispatchProgressInterval = 20 * time.Second
-
-// runTriage performs the grammar-constrained dispatch triage decision without
-// executing any tools. Returns the parsed triage result and any error. This is
-// separated from executeDispatch so that triage can run concurrently with
-// memory prefetch — triage only needs msgText + history, not prefetch results.
-func runTriage(mc messageContext, msgText string, history []llm.Message) (*dispatchResult, error) {
-	if mc.svc.Subagent == nil {
-		return nil, fmt.Errorf("no subagent")
-	}
-
-	used, total := mc.svc.Subagent.SlotsInUse()
-	logger.Log.Debugf("[dispatch] triage starting (subagent slots: %d/%d used)", used, total)
-
-	triagePrompt := buildTriageSystemPrompt(mc.registry, timefmt.FormatNatural(time.Now()))
-	triageInput := buildTriageInput(msgText, history)
-
-	triageStart := time.Now()
-	triageCtx, triageCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchTriage)
-	raw, err := mc.svc.Subagent.TryCompleteWithGrammarThinking(triageCtx, triagePrompt, triageInput, grammar.BuildDispatchGrammar(), dispatchMaxTriageTokens)
-	triageCancel()
-	if err != nil {
-		logger.Log.Debugf("[dispatch] triage skipped (subagent slots: %d/%d): %v", used, total, err)
-		mc.svc.Metrics.Since("triage.duration", triageStart, map[string]string{"decision": "error"})
-		return nil, err
-	}
-
-	var dr dispatchResult
-	if err := json.Unmarshal([]byte(raw), &dr); err != nil {
-		logger.Log.Warnf("[dispatch] triage parse failed: %v — raw: %s", err, textutil.Truncate(raw, 200))
-		mc.svc.Metrics.Since("triage.duration", triageStart, map[string]string{"decision": "error"})
-		return nil, fmt.Errorf("triage parse: %w", err)
-	}
-
-	decision := "escalate"
-	if dr.Dispatch {
-		decision = "dispatch"
-	}
-	mc.svc.Metrics.Since("triage.duration", triageStart, map[string]string{"decision": decision})
-	return &dr, nil
-}
-
-// executeDispatch handles a pre-triaged dispatch decision: tool execution +
-// synthesis for single-tool dispatches, or SubagentSupervisor for multi-step.
-// Returns (handled, escalation). handled=true means fully handled.
-func executeDispatch(mc messageContext, msg *platform.IncomingMessage,
-	msgText string, dctx dispatchContext,
-	dr *dispatchResult) (bool, *dispatchEscalation) {
-
-	if !dr.Dispatch {
-		logger.Log.Debug("[dispatch] triage decided to escalate")
-		return false, nil
-	}
-
-	// --- Multi-step dispatch via SubagentSupervisor ---
-	if dr.Multi {
-		handled, esc, _ := tryMultiStepDispatch(mc, msg, msgText, dctx, dr.Directive)
-		return handled, esc
-	}
-
-	if !mc.registry.Has(dr.Tool) {
-		logger.Log.Warnf("[dispatch] triage returned unknown tool %q, escalating", dr.Tool)
-		return false, nil
-	}
-	if neverDispatchTools[dr.Tool] {
-		logger.Log.Warnf("[dispatch] triage tried to dispatch never-dispatch tool %q, forcing escalation", dr.Tool)
-		mc.svc.Metrics.Emit("dispatch.intercept", 1, map[string]string{"tool": dr.Tool})
-		return false, nil
-	}
-
-	used, total := mc.svc.Subagent.SlotsInUse()
-	logger.Log.Infof("[dispatch] dispatching %s (subagent slots: %d/%d used)", dr.Tool, used, total)
-
-	// Send progress label as the initial progress handle (editable in place).
-	ackText := mc.registry.GetProgressLabel(dr.Tool)
-	ph, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, ackText, msg.ID)
-	if phErr != nil {
-		logger.Log.Warnf("[dispatch] progress handle creation failed: %v", phErr)
-	} else {
-		logger.Log.Debugf("[dispatch] ack sent for %s: %q", dr.Tool, textutil.Truncate(ackText, 60))
-	}
-
-	// --- Execute tool with periodic progress updates ---
-	toolCall := tools.ToolCall{Name: dr.Tool, Arguments: dr.Args}
-	toolJSON, _ := json.Marshal(toolCall)
-
-	// Progress ticker: edits the ack message in place.
-	progressCtx, progressCancel := context.WithCancel(context.Background())
-	defer progressCancel()
-	toolStart := time.Now()
-	go func() {
-		ticker := time.NewTicker(dispatchProgressInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				elapsed := int(time.Since(toolStart).Seconds())
-				update := fmt.Sprintf("Still working on %s... (%ds)", dr.Tool, elapsed)
-				if ph != nil {
-					ph.Update(context.Background(), update)
-				}
-				logger.Log.Debugf("[dispatch] progress: %s running for %ds", dr.Tool, elapsed)
-			case <-progressCtx.Done():
-				return
-			}
-		}
-	}()
-
-	// Wire progress reporting into tool context so tools can report granular progress.
-	toolCtx, toolCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchToolExec)
-	if ph != nil {
-		toolCtx = tools.WithProgress(toolCtx, func(status string) {
-			ph.Update(context.Background(), status)
-		})
-	}
-	result, execErr := mc.registry.Execute(toolCtx, toolJSON)
-	toolCancel()
-	progressCancel() // stop progress ticker
-
-	elapsed := time.Since(toolStart)
-	logger.Log.Infof("[dispatch] %s completed in %s", dr.Tool, elapsed.Round(time.Millisecond))
-
-	if execErr != nil {
-		mc.svc.Metrics.EmitDuration("tool.exec", elapsed, map[string]string{"tool": dr.Tool, "result": "hard_error"})
-		logger.Log.Warnf("[dispatch] tool %s hard error: %v — escalating", dr.Tool, execErr)
-		return false, &dispatchEscalation{ToolName: dr.Tool, Error: execErr.Error(), Phase: "execution"}
-	}
-	if llm.IsToolSoftError(result) {
-		mc.svc.Metrics.EmitDuration("tool.exec", elapsed, map[string]string{"tool": dr.Tool, "result": "soft_error"})
-		logger.Log.Infof("[dispatch] tool %s soft error, escalating to Brain for recovery", dr.Tool)
-		return false, &dispatchEscalation{ToolName: dr.Tool, Error: result, Phase: "execution"}
-	}
-	mc.svc.Metrics.EmitDuration("tool.exec", elapsed, map[string]string{"tool": dr.Tool, "result": "ok"})
-
-	// --- Synthesize ---
-	logger.Log.Debugf("[dispatch] synthesizing response for %s (%d chars of result)", dr.Tool, len(result))
-	synthesisPrompt := buildContextualPrompt(dctx, "Present the tool results naturally as if you already knew this information. Do not mention tools, fetching, or data sources. Write like you're talking to a friend — conversational, not robotic. Highlight what's interesting or relevant to the user.")
-	truncatedResult := result
-	if len(truncatedResult) > dispatchMaxResultLen {
-		truncatedResult = truncatedResult[:dispatchMaxResultLen] + "\n... (truncated)"
-	}
-	synthesisInput := fmt.Sprintf("The user said: %s\n\nHere's what came back:\n%s", msgText, truncatedResult)
-
-	synthStart := time.Now()
-	synthCtx, synthCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchSynthesis)
-	reply, synthErr := mc.svc.Subagent.Complete(synthCtx, synthesisPrompt, synthesisInput, dispatchMaxSynthTokens)
-	synthCancel()
-
-	synthTier := "subagent"
-	if synthErr != nil {
-		// Tier 2: Try DTC CompleteNoThink as lightweight synthesis fallback.
-		if mc.svc.DTC != nil {
-			logger.Log.Infof("[dispatch] subagent synthesis failed, trying DTC fallback for %s", dr.Tool)
-			dtcCtx, dtcCancel := context.WithTimeout(context.Background(), tools.TimeoutDispatchDTCSynthesis)
-			reply, synthErr = mc.svc.DTC.CompleteNoThink(dtcCtx, synthesisPrompt, synthesisInput, dispatchMaxSynthTokens)
-			dtcCancel()
-			synthTier = "dtc"
-		}
-		// Tier 3: Both subagent and DTC failed — escalate to Brain with tool result attached.
-		if synthErr != nil {
-			mc.svc.Metrics.Since("synthesis.duration", synthStart, map[string]string{"tier": "failed"})
-			logger.Log.Warnf("[dispatch] all synthesis tiers failed for %s, escalating to Brain with tool result", dr.Tool)
-			return false, &dispatchEscalation{
-				ToolName:   dr.Tool,
-				Error:      synthErr.Error(),
-				Phase:      "synthesis",
-				ToolResult: truncatedResult,
-			}
-		}
-	}
-	mc.svc.Metrics.Since("synthesis.duration", synthStart, map[string]string{"tier": synthTier})
-	reply = textutil.StripThinkTags(reply)
-
-	// --- Post-processing + send (shared with Brain path) ---
-	completeMessageHandling(mc, msg, messageResult{
-		Reply: reply,
-		Messages: []llm.Message{
-			{Role: "user", Content: msgText},
-			{Role: "assistant", Content: reply},
-		},
-		ToolContext:       fmt.Sprintf("[tool: %s]\n", dr.Tool),
-		ToolsUsed:         true,
-		MsgText:           msgText,
-		PrefetchIDs:       dctx.PrefetchIDs,
-		PrefetchSummaries: dctx.PrefetchSummaries,
-		PipelineID:        msg.PipelineID(),
-	})
-
-	mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "handled", "tool": dr.Tool, "phase": "single"})
-	totalElapsed := time.Since(toolStart)
-	logger.Log.Infof("[dispatch] handled %q via %s in %s (subagent path)", textutil.Truncate(msgText, 60), dr.Tool, totalElapsed.Round(time.Millisecond))
-	return true, nil
-}
-
-// buildTriageSystemPrompt constructs the system prompt for dispatch triage.
-func buildTriageSystemPrompt(registry *tools.Registry, currentTime string) string {
-	prompt := strings.Replace(prompts.DispatchTriage, "%CURRENT_TIME%", currentTime, 1)
-	prompt = strings.Replace(prompt, "%TOOL_INDEX%", registry.FullToolIndex(), 1)
-	return prompt
-}
-
-// buildTriageInput constructs the user message for the triage call, including
-// a snippet of recent conversation history for context.
-func buildTriageInput(msgText string, history []llm.Message) string {
-	var sb strings.Builder
-
-	// Include up to 4 recent history messages for conversational context.
-	start := 0
-	if len(history) > 4 {
-		start = len(history) - 4
-	}
-	if start < len(history) {
-		sb.WriteString("Recent conversation:\n")
-		for _, m := range history[start:] {
-			sb.WriteString(m.Role)
-			sb.WriteString(": ")
-			sb.WriteString(textutil.Truncate(m.Content, 200))
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString("New message: ")
-	sb.WriteString(msgText)
-	return sb.String()
-}
-
-// buildContextualPrompt constructs a system prompt from a dispatchContext by
-// prepending personality, appending the instructions block, then adding
-// profile, prefetch, and temporal context sections.
-func buildContextualPrompt(dctx dispatchContext, instructions string) string {
-	var sb strings.Builder
-	if dctx.PersonalityContent != "" {
-		sb.WriteString(dctx.PersonalityContent)
-		sb.WriteString("\n\n")
-	}
-	sb.WriteString(instructions)
-	if dctx.ProfileContent != "" {
-		sb.WriteString("\n\n## About the user\n")
-		sb.WriteString(dctx.ProfileContent)
-	}
-	if dctx.PrefetchContent != "" {
-		sb.WriteString("\n\n## Relevant memories\n")
-		sb.WriteString(dctx.PrefetchContent)
-	}
-	if dctx.TemporalCtx != "" {
-		sb.WriteString("\n\n## Temporal context\n")
-		sb.WriteString(dctx.TemporalCtx)
-	}
-	return sb.String()
-}
-
-// tryMultiStepDispatch runs a multi-step dispatch using SubagentSupervisor.
-// The subagent executes 2-3 sequential tool calls and synthesizes a response.
-// Returns (handled, escalation, ack) matching tryDispatch signature.
-func tryMultiStepDispatch(mc messageContext, msg *platform.IncomingMessage,
-	msgText string, dctx dispatchContext, directive string) (bool, *dispatchEscalation, string) {
-
-	if mc.svc.Subagent == nil || mc.delegateConfig == nil {
-		logger.Log.Debug("[dispatch] multi-step: missing subagent or delegateConfig, escalating")
-		return false, nil, ""
-	}
-
-	logger.Log.Infof("[dispatch] multi-step: %q", textutil.Truncate(directive, 80))
-
-	// Ack as editable progress handle.
-	ph, phErr := platform.NewProgressHandle(context.Background(), mc.platform, msg.ChannelID, "Working on it...", msg.ID)
-	if phErr != nil {
-		logger.Log.Warnf("[dispatch] multi-step progress handle failed: %v", phErr)
-	}
-
-	systemPrompt := buildContextualPrompt(dctx, `You are a research assistant handling a multi-step request. Call the available tools as needed to gather information, then respond naturally to the user.
-
-## Rules
-- Execute the steps needed to answer the user's request.
-- When you have enough information, respond with your findings.
-- Be conversational and concise. Present results as if you already knew them.
-- Do not mention tools, fetching, or data sources in your response.
-- If a tool returns an error, try an alternative approach before giving up.`)
-	toolExec := tools.NewScopedToolExec(mc.registry, mc.delegateConfig)
-	g := mc.delegateConfig.Grammar()
-
-	ctx, cancel := context.WithTimeout(context.Background(), tools.TimeoutMultiStepDispatch)
-	defer cancel()
-
-	// Wire progress reporting into the supervisor.
-	var progressFn func(string)
-	if ph != nil {
-		progressFn = func(status string) {
-			ph.Update(context.Background(), status)
-		}
-	}
-
-	multiStart := time.Now()
-	reply, err := clients.SubagentSupervisor(ctx, mc.svc.Subagent, g, systemPrompt, directive, toolExec, maxMultiStepRounds, progressFn)
-	if err != nil {
-		logger.Log.Warnf("[dispatch] multi-step failed: %v — escalating", err)
-		mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "escalated", "phase": "multi_step"})
-		mc.svc.Metrics.Since("dispatch.multi_step", multiStart, nil)
-		return false, &dispatchEscalation{Phase: "multi-step", Error: err.Error()}, ""
-	}
-
-	reply = textutil.StripThinkTags(reply)
-
-	// Post-processing + send (shared with Brain path).
-	completeMessageHandling(mc, msg, messageResult{
-		Reply: reply,
-		Messages: []llm.Message{
-			{Role: "user", Content: msgText},
-			{Role: "assistant", Content: reply},
-		},
-		ToolContext:       "[multi-step dispatch]\n",
-		ToolsUsed:         true,
-		MsgText:           msgText,
-		PrefetchIDs:       dctx.PrefetchIDs,
-		PrefetchSummaries: dctx.PrefetchSummaries,
-		PipelineID:        msg.PipelineID(),
-	})
-
-	mc.svc.Metrics.Emit("dispatch.decision", 1, map[string]string{"result": "handled", "phase": "multi_step"})
-	mc.svc.Metrics.Since("dispatch.multi_step", multiStart, nil)
-	logger.Log.Infof("[dispatch] multi-step handled %q (subagent path)", textutil.Truncate(msgText, 60))
-	return true, nil, ""
-}
-
-// Dispatch token/result limits.
-const (
-	dispatchMaxTriageTokens = 768
-	dispatchMaxSynthTokens  = 2048
-	dispatchMaxResultLen    = 8000
-	maxMultiStepRounds      = 5
-)

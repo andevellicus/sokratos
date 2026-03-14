@@ -75,6 +75,34 @@ func ExtractThinkContent(s string) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// rootRuleRe matches a GBNF root rule definition, tolerating whitespace
+// variations around "::=". Captures the rule body (everything after "::=").
+var rootRuleRe = regexp.MustCompile(`(?m)^root\s*::=\s*(.+)$`)
+
+// WrapGrammarWithThinkBlock modifies a GBNF grammar so the root rule requires
+// a <think>...</think> prefix before the original output. This forces models
+// with chain-of-thought (e.g. Qwen3.5 with enable_thinking: true) to reason
+// before producing JSON, while still constraining the final JSON structure.
+func WrapGrammarWithThinkBlock(g string) string {
+	const thinkRules = `
+# Mandatory chain-of-thought block
+think-char ::= [^<] | "<" [^/] | "</" [^t] | "</t" [^h] | "</th" [^i] | "</thi" [^n] | "</thin" [^k] | "</think" [^>]
+think-block ::= "<think>" think-char* "</think>" ws
+`
+	loc := rootRuleRe.FindStringSubmatchIndex(g)
+	if loc == nil {
+		return g
+	}
+	// loc[0]:loc[1] = full match, loc[2]:loc[3] = capture group (rule body)
+	originalDef := g[loc[2]:loc[3]]
+
+	return g[:loc[0]] +
+		"inner-root ::= " + originalDef + "\n" +
+		"root ::= think-block ws inner-root" +
+		g[loc[1]:] +
+		thinkRules
+}
+
 // codeFenceRe matches a markdown code fence block anywhere in a string.
 // Captures: opening fence line (with optional language tag) + inner content.
 var codeFenceRe = regexp.MustCompile("(?s)```[a-zA-Z]*\\s*\n(.*?)```")

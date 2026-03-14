@@ -1,13 +1,11 @@
-package tools
+package toolreg
 
 import (
 	"sync"
 	"time"
 )
 
-// ApprovalCache is a thread-safe time-limited approval cache. Both the
-// confirmation gate (confirm.go) and the file-ops external-path check
-// share this type instead of duplicating mutex + map + TTL logic.
+// ApprovalCache is a thread-safe time-limited approval cache.
 type ApprovalCache struct {
 	mu  sync.Mutex
 	m   map[string]time.Time

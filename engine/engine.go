@@ -42,7 +42,7 @@ type WorkMonitor interface {
 type LLMConfig struct {
 	Client           *llm.Client
 	Model            string
-	ToolAgent        *llm.ToolAgentConfig // when set, enables the supervisor pattern
+	ToolAgent        *llm.ToolAgentConfig // grammar-constrained orchestrator config
 	MaxToolResultLen int                  // max chars per tool result (0 = default 2000)
 	MaxWebSources    int                  // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
 }

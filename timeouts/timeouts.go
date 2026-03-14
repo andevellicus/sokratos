@@ -37,4 +37,8 @@ const (
 	// ParadigmShift is the timeout for paradigm shift fast-path
 	// (transition memory + mini-consolidation + profile refresh).
 	ParadigmShift = 3 * time.Minute
+
+	// ToolSelectionInit is the timeout for the initial batch embedding of
+	// all tool descriptions during startup.
+	ToolSelectionInit = 10 * time.Second
 )

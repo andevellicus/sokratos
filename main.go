@@ -156,10 +156,9 @@ func initServices(cfg *config.AppConfig) *serviceBundle {
 
 // llmBundle holds LLM-related initialization results.
 type llmBundle struct {
-	Client        *llm.Client
-	ToolAgent     *llm.ToolAgentConfig
-	TriageGrammar string
-	TrimFn        func([]llm.Message) []llm.Message
+	Client    *llm.Client
+	ToolAgent *llm.ToolAgentConfig
+	TrimFn    func([]llm.Message) []llm.Message
 }
 
 func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
@@ -169,18 +168,13 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 
 	llmClient := llm.NewClient(cfg.LLMURL)
 
-	// Always create ToolAgentConfig for supervisor mode (parseToolIntent replaces
-	// the former dedicated tool agent LLM). Start with the compact index; it will
-	// be rebuilt with the full compact index + dynamic skill descriptions by
-	// rebuildGrammar() after all tools are registered.
+	// ToolAgentConfig carries tool descriptions and the GBNF grammar.
+	// Start with tool descriptions only; rebuildGrammar() will populate
+	// the grammar after all tools are registered.
 	toolDescs := strings.Replace(prompts.Tools, "%TOOL_INDEX%", registry.FullToolIndex(), 1)
 	toolAgentConfig := &llm.ToolAgentConfig{
 		ToolDescriptions: toolDescs,
-		Parser:           llm.SupervisorParser{IsKnownTool: registry.Has},
 	}
-
-	// Build triage grammar once for conversation triage via subagent.
-	triageGrammar := grammar.BuildTriageGrammar()
 
 	logger.Log.Info("Warming up LLM model...")
 	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), timeouts.LLMWarmup)
@@ -196,10 +190,9 @@ func initLLM(cfg *config.AppConfig, registry *tools.Registry) *llmBundle {
 	}
 
 	return &llmBundle{
-		Client:        llmClient,
-		ToolAgent:     toolAgentConfig,
-		TriageGrammar: triageGrammar,
-		TrimFn:        trimFn,
+		Client:    llmClient,
+		ToolAgent: toolAgentConfig,
+		TrimFn:    trimFn,
 	}
 }
 
@@ -272,10 +265,9 @@ func main() {
 
 	lb := initLLM(cfg, registry)
 
-	// Set the triage grammar now that initLLM has built it. The NewSearchEmail
-	// closure captures the pointer, so it sees the grammar when invoked.
+	// Set the triage grammar for email/conversation triage via subagent.
 	if tb.EmailTriageCfg != nil {
-		tb.EmailTriageCfg.TriageGrammar = lb.TriageGrammar
+		tb.EmailTriageCfg.TriageGrammar = grammar.BuildTriageGrammar()
 	}
 
 	// Register platform slash commands.
@@ -324,14 +316,14 @@ func main() {
 		eng:            eng,
 		lb:             lb,
 		registry:       registry,
-		triageCfg: tb.EmailTriageCfg,
+		triageCfg:      tb.EmailTriageCfg,
 		confirmExec:    confirmExec,
 		skillMtimes:    wired.skillMtimes,
 		skillDeps:      wired.skillDeps,
 		rebuildGrammar: wired.rebuildGrammar,
 		router:         router,
-		delegateConfig: tb.DelegateConfig,
 		platform:       svc.Platform,
+		selector:       wired.selector,
 	}
 
 	for msg := range svc.Platform.Messages() {

@@ -1,4 +1,4 @@
-package tools
+package skillrt
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"github.com/dop251/goja"
 
 	"sokratos/clients"
+	"sokratos/toolreg"
 )
 
 // skillSetupUtils registers the simple JS globals: btoa, atob, sleep, env,
@@ -172,6 +173,69 @@ func skillSetupKV(vm *goja.Runtime, deps SkillDeps, ctx context.Context, name st
 	}
 }
 
+// delegateInput holds parsed directive and context for a single delegate_batch task.
+type delegateInput struct {
+	directive string
+	context   string
+}
+
+// batchResult holds the outcome of a single delegate_batch task.
+type batchResult struct {
+	Result string
+	Error  string
+}
+
+// runDelegateBatch executes delegate tasks in parallel, capping concurrency to
+// available subagent slots. progressFn is called after each task completes.
+func runDelegateBatch(ctx context.Context, deps *SkillDeps, inputs []delegateInput, progressFn func(string)) []batchResult {
+	batchCtx, batchCancel := context.WithTimeout(ctx, TimeoutDelegateBatch)
+	defer batchCancel()
+
+	results := make([]batchResult, len(inputs))
+	total := len(inputs)
+
+	// Cap concurrent supervisors to available subagent slots.
+	used, slotTotal := deps.SC.SlotsInUse()
+	avail := slotTotal - used
+	if avail <= 0 {
+		avail = 1 // always allow at least one
+	}
+	concSem := make(chan struct{}, avail)
+
+	var completed atomic.Int32
+	var wg sync.WaitGroup
+	for i, inp := range inputs {
+		wg.Add(1)
+		go func(idx int, inp delegateInput) {
+			defer wg.Done()
+			concSem <- struct{}{} // wait for a concurrency slot
+			defer func() { <-concSem }()
+			directive := inp.directive
+			if inp.context != "" {
+				ctxData := inp.context
+				if len(ctxData) > toolreg.MaxDelegateContextLen {
+					ctxData = ctxData[:toolreg.MaxDelegateContextLen] + "\n... (truncated)"
+				}
+				directive = directive + "\n\n## Context\n" + ctxData
+			}
+			toolExec := toolreg.NewScopedToolExec(deps.Registry, deps.DC)
+			result, err := clients.SubagentSupervisor(batchCtx, deps.SC, deps.DC.Grammar(), toolreg.DelegateSystemPrompt, directive, toolExec, 2, nil)
+			if err != nil {
+				results[idx] = batchResult{Error: err.Error()}
+			} else {
+				results[idx] = batchResult{Result: result}
+			}
+			n := completed.Add(1)
+			if progressFn != nil {
+				progressFn(fmt.Sprintf("Completed %d/%d tasks...", n, total))
+			}
+		}(i, inp)
+	}
+	wg.Wait()
+
+	return results
+}
+
 // skillSetupDelegation registers call_tool, delegate, delegate_batch.
 // If deps lack Registry/SC/DC, registers stubs that panic with an unavailable message.
 func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context, name string) {
@@ -199,15 +263,15 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 			directive := call.Arguments[0].String()
 			if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {
 				ctxData := call.Arguments[1].String()
-				if len(ctxData) > maxDelegateContextLen {
-					ctxData = ctxData[:maxDelegateContextLen] + "\n... (truncated)"
+				if len(ctxData) > toolreg.MaxDelegateContextLen {
+					ctxData = ctxData[:toolreg.MaxDelegateContextLen] + "\n... (truncated)"
 				}
 				directive = directive + "\n\n## Context\n" + ctxData
 			}
-			toolExec := NewScopedToolExec(deps.Registry, deps.DC)
+			toolExec := toolreg.NewScopedToolExec(deps.Registry, deps.DC)
 			dCtx, dCancel := context.WithTimeout(ctx, TimeoutDelegateCall)
 			defer dCancel()
-			result, err := clients.SubagentSupervisor(dCtx, deps.SC, deps.DC.Grammar(), delegateSystemPrompt, directive, toolExec, 10, nil)
+			result, err := clients.SubagentSupervisor(dCtx, deps.SC, deps.DC.Grammar(), toolreg.DelegateSystemPrompt, directive, toolExec, 10, nil)
 			if err != nil {
 				panic(vm.NewTypeError("delegate failed: " + err.Error()))
 			}
@@ -227,11 +291,7 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 				return vm.ToValue([]interface{}{})
 			}
 
-			type taskInput struct {
-				directive string
-				context   string
-			}
-			inputs := make([]taskInput, len(tasksSlice))
+			inputs := make([]delegateInput, len(tasksSlice))
 			for i, raw := range tasksSlice {
 				obj, ok := raw.(map[string]interface{})
 				if !ok {
@@ -242,55 +302,12 @@ func skillSetupDelegation(vm *goja.Runtime, deps SkillDeps, ctx context.Context,
 					panic(vm.NewTypeError(fmt.Sprintf("delegate_batch: task[%d].directive is required", i)))
 				}
 				c, _ := obj["context"].(string)
-				inputs[i] = taskInput{directive: d, context: c}
+				inputs[i] = delegateInput{directive: d, context: c}
 			}
 
-			batchCtx, batchCancel := context.WithTimeout(ctx, TimeoutDelegateBatch)
-			defer batchCancel()
-
-			type batchResult struct {
-				Result string
-				Error  string
-			}
-			results := make([]batchResult, len(inputs))
-			total := len(inputs)
-
-			// Cap concurrent supervisors to available subagent slots.
-			used, total := deps.SC.SlotsInUse()
-			avail := total - used
-			if avail <= 0 {
-				avail = 1 // always allow at least one
-			}
-			concSem := make(chan struct{}, avail)
-
-			var completed atomic.Int32
-			var wg sync.WaitGroup
-			for i, inp := range inputs {
-				wg.Add(1)
-				go func(idx int, inp taskInput) {
-					defer wg.Done()
-					concSem <- struct{}{} // wait for a concurrency slot
-					defer func() { <-concSem }()
-					directive := inp.directive
-					if inp.context != "" {
-						ctxData := inp.context
-						if len(ctxData) > maxDelegateContextLen {
-							ctxData = ctxData[:maxDelegateContextLen] + "\n... (truncated)"
-						}
-						directive = directive + "\n\n## Context\n" + ctxData
-					}
-					toolExec := NewScopedToolExec(deps.Registry, deps.DC)
-					result, err := clients.SubagentSupervisor(batchCtx, deps.SC, deps.DC.Grammar(), delegateSystemPrompt, directive, toolExec, 10, nil)
-					if err != nil {
-						results[idx] = batchResult{Error: err.Error()}
-					} else {
-						results[idx] = batchResult{Result: result}
-					}
-					n := completed.Add(1)
-					ReportProgress(ctx, fmt.Sprintf("Completed %d/%d tasks...", n, total))
-				}(i, inp)
-			}
-			wg.Wait()
+			results := runDelegateBatch(ctx, &deps, inputs, func(status string) {
+				toolreg.ReportProgress(ctx, status)
+			})
 
 			jsResults := make([]interface{}, len(results))
 			for i, r := range results {

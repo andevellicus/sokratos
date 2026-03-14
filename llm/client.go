@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
 	"sokratos/httputil"
+	"sokratos/orchestrate"
 	"sokratos/prompts"
 	"sokratos/timeouts"
 )
@@ -177,65 +177,13 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (ChatResult, error) 
 }
 
 
-const maxToolRounds = 15
-const defaultMaxToolResultLen = 8000 // truncate individual tool results to stay within context
-
-// resolveToolResultLen returns the effective max tool result length, respecting
-// the per-session override in opts when set.
-func resolveToolResultLen(opts *QueryOrchestratorOpts) int {
-	if opts != nil && opts.MaxToolResultLen > 0 {
-		return opts.MaxToolResultLen
-	}
-	return defaultMaxToolResultLen
-}
-
-// FallbackDef describes a deterministic fallback tool to invoke when a primary
-// tool fails. ArgsTransform builds new args from the original call context.
-// TriggerPattern, when non-nil, restricts fallback to failures matching the
-// pattern; nil means trigger on any failure.
-type FallbackDef struct {
-	FallbackTool   string
-	ArgsTransform  func(toolName string, originalArgs json.RawMessage, failureMsg string) json.RawMessage
-	TriggerPattern *regexp.Regexp // nil = trigger on any failure
-}
-
-// FallbackMap maps primary tool names to their fallback definitions.
-type FallbackMap map[string]FallbackDef
-
 var systemPromptBase = strings.TrimSpace(prompts.System)
 
-// ToolAgentConfig holds the configuration for the supervisor pattern. When set,
-// the orchestrator produces free-form text with <TOOL_INTENT> tags, and
-// parseToolIntent translates intents into structured JSON.
+// ToolAgentConfig holds the configuration for the grammar-constrained
+// orchestrator. Grammar constrains model output to tool-call or respond JSON.
 type ToolAgentConfig struct {
-	ToolDescriptions string          // full tool descriptions for system prompt (static + dynamic skills)
-	Parser           ToolIntentParser // nil defaults to SupervisorParser{}
-}
-
-// BackgroundJobRequest is a sentinel error returned when the supervisor detects
-// a tool call that should be handled by a background Brain session instead.
-// Returned by both mandatory intercepts (create_skill, update_skill) and the
-// deep_think tool when called with background=true.
-type BackgroundJobRequest struct {
-	Tool             string // triggering tool ("create_skill") or "deep_think"
-	UserGoal         string // original user message (from supervisor's prompt param)
-	TaskType         string // maps to session prompt; "" = general
-	ProblemStatement string // for reason tool: the problem_statement arg
-}
-
-func (e *BackgroundJobRequest) Error() string {
-	return "background job requested for " + e.Tool
-}
-
-// EscalationRequest is a sentinel error returned when the supervisor detects a
-// tool call that requires a more capable model (e.g. Brain). The caller should
-// release the current slot, acquire the target model, and replay the request.
-type EscalationRequest struct {
-	ToolName string // the tool that triggered escalation
-}
-
-func (e *EscalationRequest) Error() string {
-	return "escalation requested for tool: " + e.ToolName
+	ToolDescriptions string // full tool descriptions for system prompt (static + dynamic skills)
+	Grammar          string // GBNF grammar constraining output to tool/respond JSON
 }
 
 // QueryOrchestratorOpts holds optional parameters for QueryOrchestrator.
@@ -246,23 +194,28 @@ type QueryOrchestratorOpts struct {
 	ProfileContent     string           // identity profile JSON — injected into system prompt if non-empty
 	TemporalContext    string           // XML temporal context — injected after profile
 	PrefetchContent    string           // retrieved memories XML — injected into system prompt at end
-	MaxToolResultLen   int              // max chars per tool result (0 = default 2000)
+	MaxToolResultLen   int              // max chars per tool result (0 = default 8000)
 	MaxWebSources      int              // replaces %MAX_WEB_SOURCES% in system prompt (0 = default 2)
-	ToolAgent          *ToolAgentConfig // when set, enables the supervisor pattern
-	Fallbacks          FallbackMap      // deterministic fallback chains for failed tools
+	ToolAgent          *ToolAgentConfig // when set, provides tool descriptions and grammar
+	Fallbacks          orchestrate.FallbackMap // deterministic fallback chains for failed tools
 	MandatedBrainTools map[string]string // tools that trigger a background Brain job (key=tool, value=task_type)
-	EscalateTools      map[string]bool   // tools that trigger inline escalation to a more capable model
 	OnToolStart    func(toolName string)                           // called before tool execution with tool name (nil = no-op)
 	OnToolEnd      func(ctx context.Context) error                // reacquire slot after tool execution (nil = no-op)
 	OnToolExec     func(toolName string, dur time.Duration, err error) // called after tool execution with timing (nil = no-op)
-	EnableThinking bool // when true, enables chain-of-thought reasoning (for Brain background jobs)
+	EnableThinking     bool // when true, enables chain-of-thought reasoning for ALL rounds (Brain background jobs)
+	FirstRoundThinking bool // when true, enables thinking on round 0 only (interactive orchestrator)
 }
 
 // QueryOrchestrator sends a prompt to the given model, executing tool calls as
 // needed, and returns the final human-readable response text along with the
 // NEW messages produced during this call (excluding history). An optional
 // trimFn is applied to the full message slice before each LLM call to keep the
-// context window within limits.
+// context window within limits. The model's output is grammar-constrained to
+// produce either tool-call or respond JSON.
 func QueryOrchestrator(ctx context.Context, client *Client, model, prompt string, toolExec func(context.Context, json.RawMessage) (string, error), trimFn func([]Message) []Message, opts *QueryOrchestratorOpts) (string, []Message, error) {
-	return querySupervisor(ctx, client, model, prompt, toolExec, trimFn, opts)
+	var grammarStr string
+	if opts != nil && opts.ToolAgent != nil {
+		grammarStr = opts.ToolAgent.Grammar
+	}
+	return runGrammarOrchestrator(ctx, client, model, grammarStr, prompt, toolExec, trimFn, opts)
 }

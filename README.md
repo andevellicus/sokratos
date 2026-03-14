@@ -31,7 +31,7 @@ Sokratos is designed to run unattended for days:
 
 ## Architecture
 
-Sokratos uses a **three-tier dispatch architecture** with two LLM backends and a **supervisor pattern with regex-based tool parsing**. Three llama-server instances run on a separate Mac (M3 Ultra):
+Sokratos uses a **grammar-constrained orchestrator architecture** with two LLM backends. Three llama-server instances run on a separate Mac (M3 Ultra):
 
 | Service | Port | Model | Purpose |
 |---------|------|-------|---------|
@@ -41,17 +41,11 @@ Sokratos uses a **three-tier dispatch architecture** with two LLM backends and a
 
 ### Message Flow
 
-Every user message goes through the 9B for **grammar-constrained triage**, which decides one of three paths:
+Every user message is handled by a **grammar-constrained orchestrator** that produces structured JSON: either `{"action":"tool","name":"...","arguments":{...}}` for tool calls or `{"action":"respond","text":"..."}` for final responses. The orchestrator loop runs up to 15 tool rounds, injecting results back as user messages.
 
-1. **Dispatch (single tool)** — 9B sends an ack, executes the tool, and synthesizes the response. Fully handled by the 9B.
-2. **Dispatch (multi-step)** — 9B sends an ack, then a `SubagentSupervisor` loop runs 2-5 tool rounds with grammar-constrained decisions.
-3. **Escalate to orchestrator** — the 9B orchestrator handles the request directly (including tool calls). For complex reasoning, the orchestrator can invoke the `deep_think` tool to escalate to the Brain (122B). A "Thinking..." notification is sent to the user during Brain calls.
+The 9B serves as the primary orchestrator. When deep reasoning is needed, it invokes the `deep_think` tool to escalate to the Brain (122B). A "Thinking..." notification is sent during Brain calls.
 
-A **slot router** manages backend allocation — Brain preferred for interactive messages (accuracy), 9B preferred for background work (throughput). During tool execution, slots are released and reacquired after, preventing long-running tools from blocking LLM access. See [docs/dispatch.md](docs/dispatch.md) for the full technical reference.
-
-### Supervisor Pattern
-
-The orchestrator runs without grammar constraints, emitting `<TOOL_INTENT>tool: {params}</TOOL_INTENT>` tags. `parseToolIntent()` extracts the tool name and JSON arguments using regex. The tool executes, the result is injected back, and the loop repeats (max 15 rounds). The Brain's system prompt ensures intermediate prose is discarded — only the final message reaches the user.
+A **slot router** manages backend allocation — 9B preferred for all orchestration (interactive + background), Brain serves as fallback when 9B slots are busy and handles background Brain jobs. During tool execution, slots are released and reacquired after, preventing long-running tools from blocking LLM access. See [docs/dispatch.md](docs/dispatch.md) for the full technical reference.
 
 ### Client Hierarchy
 
@@ -243,7 +237,7 @@ See [docs/dispatch.md](docs/dispatch.md) for the full technical reference on mes
 
 Complex tasks (skill creation, research, multi-step analysis) can be offloaded to background Brain sessions that run concurrently while the 9B continues serving the user. Two paths converge:
 
-1. **Mandatory intercept** — `create_skill` and `update_skill` are intercepted at the supervisor level and always routed to a background Brain session.
+1. **Mandatory intercept** — `create_skill` and `update_skill` are intercepted at the orchestrator level and always routed to a background Brain session.
 2. **Voluntary** — The 9B calls `deep_think(background=true, task_type="...")` to spawn a background Brain session for any complex task.
 
 Background jobs support multi-round tool execution and can ask the user clarifying questions (the job parks until input arrives via `reply_to_job`). Jobs can be cancelled via `cancel_job`. Session prompts are selected by `task_type` (e.g. `"create_skill"` uses a skill-creation prompt, general tasks use a reasoning prompt).
@@ -374,9 +368,14 @@ sokratos/
     args.go            # ExpandArgs, ExpandAndMarshal (template expansion)
     file.go            # FileWriter interface, FileAdapter, LoadFile
     sync.go            # SyncFromFile, SyncIfChanged, Upsert, Delete, QueryDue, AdvanceTimer
-  llm/                 # LLM client, supervisor pattern, tool intent extraction
-    client.go          # Chat API, QueryOrchestrator, BackgroundJobRequest, FallbackMap
-    supervisor.go      # Supervisor loop with regex-based tool parsing
+  orchestrate/         # Unified grammar-constrained orchestrator loop (shared by llm/ and clients/)
+    orchestrate.go     # Message, ChatFunc, LoopConfig, FallbackMap, BackgroundJobRequest
+    loop.go            # RunLoop — grammar-constrained tool-call loop
+    tools.go           # IsToolSoftError, matchFallback, buildToolJSON, toolHint
+    thinking.go        # processThinking, prepareThinking
+  llm/                 # LLM client, orchestrator adapter
+    client.go          # Chat API, QueryOrchestrator
+    orchestrator.go    # Thin adapter: builds system prompt, delegates to orchestrate.RunLoop
   memory/              # Embedding, storage, scoring, decay, synthesis
     save.go            # SaveToMemoryAsync, SaveToMemoryWithSalienceAsync, identity profile
     embedding.go       # Embed + chunk helpers

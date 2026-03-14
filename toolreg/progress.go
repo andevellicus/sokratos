@@ -1,4 +1,4 @@
-package tools
+package toolreg
 
 import "context"
 
@@ -13,7 +13,6 @@ func WithProgress(ctx context.Context, fn ProgressFunc) context.Context {
 }
 
 // ReportProgress calls the progress function attached to the context, if any.
-// No-op if no progress function is set.
 func ReportProgress(ctx context.Context, status string) {
 	if fn, ok := ctx.Value(progressKey{}).(ProgressFunc); ok && fn != nil {
 		fn(status)

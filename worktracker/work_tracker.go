@@ -1,4 +1,4 @@
-package tools
+package worktracker
 
 import (
 	"context"
@@ -10,9 +10,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	objpkg "sokratos/objectives"
 	"sokratos/logger"
 	"sokratos/memory"
+	objpkg "sokratos/objectives"
 	"sokratos/textutil"
 )
 
@@ -24,22 +24,19 @@ type ObjectiveTaskResult struct {
 	Result      string // formatted step results
 }
 
-// WorkTracker manages async task execution with DB-backed state. It tracks
-// background plans, routine executions, and scheduled tasks in the unified
-// work_items table. Cancel funcs for all running work are held in memory
-// for watchdog-based killing of hung work.
+// WorkTracker manages async task execution with DB-backed state.
 type WorkTracker struct {
-	db         *pgxpool.Pool
-	sendFunc   func(string)
-	OnComplete              func(directive, status string)     // called after a background task finishes (nil = no-op)
-	OnObjectiveTaskComplete func(ObjectiveTaskResult)          // called when an objective-linked task finishes (nil = no-op)
-	ShareGate               func(directive, result string)     // quality gate for proactive sharing (nil = disabled)
-	mu         sync.Mutex
-	active     map[int64]context.CancelFunc // cancel funcs for all running work
-	sem        chan struct{}                 // concurrency limiter for background plans (cap 3)
+	db                      *pgxpool.Pool
+	sendFunc                func(string)
+	OnComplete              func(directive, status string)
+	OnObjectiveTaskComplete func(ObjectiveTaskResult)
+	ShareGate               func(directive, result string)
+	mu                      sync.Mutex
+	active                  map[int64]context.CancelFunc
+	sem                     chan struct{}
 }
 
-// NewWorkTracker creates a tracker with the given DB pool and Telegram send function.
+// NewWorkTracker creates a tracker with the given DB pool and send function.
 func NewWorkTracker(db *pgxpool.Pool, sendFunc func(string)) *WorkTracker {
 	return &WorkTracker{
 		db:       db,
@@ -50,14 +47,12 @@ func NewWorkTracker(db *pgxpool.Pool, sendFunc func(string)) *WorkTracker {
 }
 
 // Start creates a DB row for a background plan, launches a goroutine, and
-// returns the task ID. Planning must complete before calling this.
-// objectiveID links the task to an objective (0 = no objective).
-func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, steps []planStep,
+// returns the task ID.
+func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, steps []PlanStep,
 	deps PlanExecDeps) (int64, error) {
 
 	ctx := context.Background()
 
-	// Use NULLIF to set objective_id only when > 0 (single query, nullable param).
 	var taskID int64
 	err := wt.db.QueryRow(ctx,
 		`INSERT INTO work_items (type, directive, status, steps_total, priority, started_at, timeout_at, objective_id)
@@ -69,7 +64,6 @@ func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, 
 		return 0, fmt.Errorf("create background task: %w", err)
 	}
 
-	// Update objective status when linked.
 	if objectiveID > 0 {
 		objpkg.UpdateStatus(ctx, wt.db, objectiveID, "in_progress")
 		objpkg.IncrementAttempts(ctx, wt.db, objectiveID)
@@ -89,7 +83,6 @@ func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, 
 			wt.mu.Unlock()
 		}()
 
-		// Acquire concurrency slot.
 		select {
 		case wt.sem <- struct{}{}:
 		case <-bgCtx.Done():
@@ -142,7 +135,6 @@ func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, 
 			wt.OnComplete(directive, status)
 		}
 
-		// Fire objective-linked callback for initiative chaining.
 		if objectiveID > 0 && wt.OnObjectiveTaskComplete != nil {
 			wt.OnObjectiveTaskComplete(ObjectiveTaskResult{
 				ObjectiveID: objectiveID,
@@ -152,7 +144,6 @@ func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, 
 			})
 		}
 
-		// Fire proactive sharing gate.
 		if wt.ShareGate != nil && succeeded > 0 {
 			wt.ShareGate(directive, formatted)
 		}
@@ -161,9 +152,7 @@ func (wt *WorkTracker) Start(directive string, priority int, objectiveID int64, 
 	return taskID, nil
 }
 
-// TrackStart inserts a running work_items row and returns its ID. The caller
-// is responsible for calling SetCancel and TrackEnd. Used by routine and
-// scheduled task execution to make their work visible to the watchdog.
+// TrackStart inserts a running work_items row and returns its ID.
 func (wt *WorkTracker) TrackStart(workType, directive string, timeout time.Duration) int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanProgressDB)
 	defer cancel()
@@ -182,8 +171,7 @@ func (wt *WorkTracker) TrackStart(workType, directive string, timeout time.Durat
 	return id
 }
 
-// SetCancel stores a cancel func for a tracked work item, enabling the
-// watchdog to kill it if it hangs past timeout_at.
+// SetCancel stores a cancel func for a tracked work item.
 func (wt *WorkTracker) SetCancel(id int64, cancelFn context.CancelFunc) {
 	if id == 0 {
 		return
@@ -193,8 +181,7 @@ func (wt *WorkTracker) SetCancel(id int64, cancelFn context.CancelFunc) {
 	wt.mu.Unlock()
 }
 
-// TrackEnd marks a tracked work item as completed/failed and removes its
-// cancel func from the active map.
+// TrackEnd marks a tracked work item as completed/failed.
 func (wt *WorkTracker) TrackEnd(id int64, status, errMsg string) {
 	if id == 0 {
 		return
@@ -207,8 +194,7 @@ func (wt *WorkTracker) TrackEnd(id int64, status, errMsg string) {
 }
 
 // KillHungWork queries work_items past their timeout_at, cancels their
-// contexts, marks them as failed, and logs to failed_operations. Returns
-// the number of items killed.
+// contexts, marks them as failed, and logs to failed_operations.
 func (wt *WorkTracker) KillHungWork() int {
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutPlanProgressDB)
 	defer cancel()
@@ -230,7 +216,6 @@ func (wt *WorkTracker) KillHungWork() int {
 			continue
 		}
 
-		// Cancel the context if we have it.
 		wt.mu.Lock()
 		if cancelFn, ok := wt.active[id]; ok {
 			cancelFn()
@@ -363,7 +348,7 @@ func (wt *WorkTracker) CleanupOldTasks() {
 	}
 }
 
-// List returns a summary of running and recently completed work items (all types).
+// List returns a summary of running and recently completed work items.
 func (wt *WorkTracker) List(ctx context.Context) (string, error) {
 	rows, err := wt.db.Query(ctx,
 		`SELECT id, type, directive, status, COALESCE(priority, 5), steps_total, steps_completed
@@ -403,8 +388,7 @@ func (wt *WorkTracker) List(ctx context.Context) (string, error) {
 }
 
 // LaunchBackgroundPlan decomposes a directive via DTC and launches it as a
-// background work item. Returns the task ID. Used by the curiosity engine.
-// objectiveID links the task to an objective (0 = no objective).
+// background work item. Returns the task ID.
 func LaunchBackgroundPlan(wt *WorkTracker, deps PlanExecDeps,
 	directive string, priority int, objectiveID int64) (int64, error) {
 
@@ -420,7 +404,7 @@ func LaunchBackgroundPlan(wt *WorkTracker, deps PlanExecDeps,
 
 // NewCheckBackgroundTask returns a ToolFunc for listing, checking status, or
 // cancelling work items.
-func NewCheckBackgroundTask(wt *WorkTracker) ToolFunc {
+func NewCheckBackgroundTask(wt *WorkTracker) func(ctx context.Context, args json.RawMessage) (string, error) {
 	return func(ctx context.Context, args json.RawMessage) (string, error) {
 		var a struct {
 			TaskID int64  `json:"task_id"`

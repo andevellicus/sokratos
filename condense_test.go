@@ -7,12 +7,35 @@ import (
 	"sokratos/llm"
 )
 
+func TestExtractToolName(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"clean JSON", `{"action":"tool","name":"search_web","arguments":{}}`, "search_web"},
+		{"with reasoning prefix", `[Reasoning: thinking about it]
+{"action":"tool","name":"search_email","arguments":{}}`, "search_email"},
+		{"respond action", `{"action":"respond","text":"hello"}`, "unknown"},
+		{"garbage", "not json at all", "unknown"},
+		{"empty", "", "unknown"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractToolName(tc.content)
+			if got != tc.want {
+				t.Errorf("extractToolName(%q) = %q, want %q", tc.content, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCondenseToolResults_ShortResultPreserved(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: "What's the weather?"},
-		{Role: "assistant", Content: "Let me check. <TOOL_INTENT>search_web: {\"query\": \"weather\"}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_web","arguments":{"query":"weather"}}`},
 		{Role: "user", Content: "Tool result: Current weather in Berlin: 15°C, partly cloudy."},
-		{Role: "assistant", Content: "The weather in Berlin is 15°C and partly cloudy."},
+		{Role: "assistant", Content: `{"action":"respond","text":"The weather in Berlin is 15°C and partly cloudy."}`},
 	}
 
 	condensed := condenseToolResults(msgs)
@@ -31,9 +54,9 @@ func TestCondenseToolResults_LongResultCondensed(t *testing.T) {
 		"5. Lana Del Rey - Discography\n   https://example.com/lana\n   American singer known for cinematic pop...\n"
 	msgs := []llm.Message{
 		{Role: "user", Content: "Search for it"},
-		{Role: "assistant", Content: "<TOOL_INTENT>search_web: {\"query\": \"The Fate of Ophelia\"}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_web","arguments":{"query":"The Fate of Ophelia"}}`},
 		{Role: "user", Content: "Tool result: " + longBody},
-		{Role: "assistant", Content: "I found several results about The Fate of Ophelia."},
+		{Role: "assistant", Content: `{"action":"respond","text":"I found several results about The Fate of Ophelia."}`},
 	}
 
 	condensed := condenseToolResults(msgs)
@@ -45,14 +68,12 @@ func TestCondenseToolResults_LongResultCondensed(t *testing.T) {
 	if !strings.HasSuffix(result, "...") {
 		t.Errorf("expected truncation suffix, got: %s", result)
 	}
-	// Should contain enough to capture multiple search result titles.
 	if !strings.Contains(result, "Ophelia (2018 film)") {
 		t.Error("condensed result should contain first result title")
 	}
 	if !strings.Contains(result, "The Fate of Ophelia") {
 		t.Error("condensed result should contain second result title")
 	}
-	// But should be shorter than original.
 	if len(result) >= len(msgs[2].Content) {
 		t.Error("condensed result should be shorter than original")
 	}
@@ -62,7 +83,7 @@ func TestCondenseToolResults_PreservesLastToolResult(t *testing.T) {
 	longBody := strings.Repeat("x", 500)
 	msgs := []llm.Message{
 		{Role: "user", Content: "Search for news"},
-		{Role: "assistant", Content: "<TOOL_INTENT>search_web: {\"query\": \"news\"}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_web","arguments":{"query":"news"}}`},
 		{Role: "user", Content: "Tool result: " + longBody},
 	}
 
@@ -77,9 +98,9 @@ func TestCondenseToolResults_PreservesLastToolResult(t *testing.T) {
 func TestCondenseToolResults_PreservesToolErrors(t *testing.T) {
 	msgs := []llm.Message{
 		{Role: "user", Content: "Check email"},
-		{Role: "assistant", Content: "<TOOL_INTENT>search_email: {}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_email","arguments":{}}`},
 		{Role: "user", Content: "Tool error: connection timeout"},
-		{Role: "assistant", Content: "Sorry, I couldn't check your email due to a timeout."},
+		{Role: "assistant", Content: `{"action":"respond","text":"Sorry, I couldn't check your email due to a timeout."}`},
 	}
 
 	condensed := condenseToolResults(msgs)
@@ -95,11 +116,11 @@ func TestCondenseToolResults_MultipleRoundsLong(t *testing.T) {
 	longCal := "Tool result: " + strings.Repeat("Meeting with team to discuss goals. ", 20)
 	msgs := []llm.Message{
 		{Role: "user", Content: "Brief me"},
-		{Role: "assistant", Content: "<TOOL_INTENT>search_email: {}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_email","arguments":{}}`},
 		{Role: "user", Content: longEmail},
-		{Role: "assistant", Content: "<TOOL_INTENT>search_calendar: {}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_calendar","arguments":{}}`},
 		{Role: "user", Content: longCal},
-		{Role: "assistant", Content: "Here's your briefing."},
+		{Role: "assistant", Content: `{"action":"respond","text":"Here's your briefing."}`},
 	}
 
 	condensed := condenseToolResults(msgs)
@@ -144,9 +165,9 @@ func TestCondenseToolResults_EmptySlice(t *testing.T) {
 
 func TestSummarizeToolContext_WithTools(t *testing.T) {
 	msgs := []llm.Message{
-		{Role: "assistant", Content: "<TOOL_INTENT>search_web: {\"query\": \"Taylor Swift Fate of Ophelia album\"}</TOOL_INTENT>"},
-		{Role: "user", Content: "Tool result: \"The Fate of Ophelia\" is a song by Taylor Swift, lead single from The Life of a Showgirl (2025)."},
-		{Role: "assistant", Content: "It's from The Life of a Showgirl."},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_web","arguments":{"query":"Taylor Swift Fate of Ophelia album"}}`},
+		{Role: "user", Content: `Tool result: "The Fate of Ophelia" is a song by Taylor Swift, lead single from The Life of a Showgirl (2025).`},
+		{Role: "assistant", Content: `{"action":"respond","text":"It's from The Life of a Showgirl."}`},
 	}
 
 	ctx, used := summarizeToolContext(msgs)
@@ -183,9 +204,9 @@ func TestSummarizeToolContext_NoTools(t *testing.T) {
 func TestSummarizeToolContext_PreservesFullResults(t *testing.T) {
 	longResult := "Tool result: " + strings.Repeat("important fact. ", 50)
 	msgs := []llm.Message{
-		{Role: "assistant", Content: "<TOOL_INTENT>search_web: {}</TOOL_INTENT>"},
+		{Role: "assistant", Content: `{"action":"tool","name":"search_web","arguments":{}}`},
 		{Role: "user", Content: longResult},
-		{Role: "assistant", Content: "Done."},
+		{Role: "assistant", Content: `{"action":"respond","text":"Done."}`},
 	}
 
 	ctx, used := summarizeToolContext(msgs)
@@ -193,7 +214,6 @@ func TestSummarizeToolContext_PreservesFullResults(t *testing.T) {
 	if !used {
 		t.Fatal("expected toolsUsed=true")
 	}
-	// Full result should be preserved — no artificial truncation.
 	if !strings.Contains(ctx, "important fact") {
 		t.Error("should contain full result content")
 	}

@@ -32,8 +32,8 @@ var episodeSynthesisPrompt = strings.TrimSpace(prompts.EpisodeSynthesis)
 // SynthesizeFunc is the function signature for calling an LLM to synthesize text.
 type SynthesizeFunc func(ctx context.Context, systemPrompt, content string) (string, error)
 
-// cosineSimilarity returns the cosine similarity between two vectors.
-func cosineSimilarity(a, b []float32) float64 {
+// CosineSimilarity returns the cosine similarity between two vectors.
+func CosineSimilarity(a, b []float32) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0
 	}
@@ -81,7 +81,7 @@ func jaccardSimilarity(a, b []string) float64 {
 // (entity overlap). Entity overlap pulls the distance down, making memories
 // about the same entities more likely to cluster together.
 func compositeDistance(a, b EpisodeMemory) float64 {
-	cosineDist := 1.0 - cosineSimilarity(a.Embedding, b.Embedding)
+	cosineDist := 1.0 - CosineSimilarity(a.Embedding, b.Embedding)
 	entitySim := jaccardSimilarity(a.Entities, b.Entities)
 	return cosineDist*0.7 - entitySim*0.3
 }

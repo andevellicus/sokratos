@@ -18,7 +18,7 @@ ABSOLUTE RULES:
 - Do NOT offer unsolicited help ("Would you like me to...", "I can also...").
 
 CRITICAL: You MUST respond with exactly ONE of these two formats — anything else will be sent directly to the user as a Telegram message:
-- If no action is needed: <NO_ACTION_REQUIRED>
-- If action is needed: <TOOL_INTENT>describe the exact action to take</TOOL_INTENT>
+- If no action is needed: {"action":"respond","text":"<NO_ACTION_REQUIRED>"}
+- If action is needed: call a tool using the grammar-constrained JSON format.
 
-Do NOT output status words like "idle", acknowledgements, or commentary. Your entire response must be one of the two tags above.
+Do NOT output status words like "idle", acknowledgements, or commentary.
